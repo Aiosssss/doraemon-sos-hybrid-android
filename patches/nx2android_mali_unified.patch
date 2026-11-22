@@ -1,0 +1,278 @@
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=01008EE0177A8000' tools/nx2android/nxnative/dm/android/front_android.c hybrid_port/runtime_src/nxnative/dm/android/front_android.c
+--- tools/nx2android/nxnative/dm/android/front_android.c	2026-11-21 23:36:03.952365154 +0800
++++ hybrid_port/runtime_src/nxnative/dm/android/front_android.c	2026-11-22 09:24:41.862380574 +0800
+@@ -1400,17 +1400,29 @@
+     if (activity_class) g_audio_menu_method = (*env)->GetMethodID(env, activity_class, "openAudioMenu", "()V");
+     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+     if (activity_class) (*env)->DeleteLocalRef(env, activity_class);
+-    snprintf(g_root, sizeof g_root, "%s", act->externalDataPath ? act->externalDataPath : act->internalDataPath);
++    // Hybrid APK internal storage auto-detection: prefer DM_HYBRID_ROOT, else <internalDataPath>/game_data when .ready.json exists (no manual /Android/data copy needed).
++    {
++        const char *hr = getenv("DM_HYBRID_ROOT");
++        char hprobe[700];
++        if (hr && *hr) snprintf(g_root, sizeof g_root, "%s", hr);
++        else if (act->internalDataPath && snprintf(hprobe, sizeof hprobe, "%s/game_data/.ready.json", act->internalDataPath) < (int)sizeof hprobe && access(hprobe, R_OK) == 0)
++            snprintf(g_root, sizeof g_root, "%s/game_data", act->internalDataPath);
++        else snprintf(g_root, sizeof g_root, "%s", act->externalDataPath ? act->externalDataPath : act->internalDataPath);
++    }
+     char p[700];
+     snprintf(p, sizeof p, "%s/log.txt", g_root); char prev[720]; snprintf(prev, sizeof prev, "%s/log.prev.txt", g_root); rename(p, prev);
+     if (!freopen(p, "w", stderr)) __android_log_print(ANDROID_LOG_ERROR, "dmhost", "cannot write %s", p);
+     setvbuf(stderr, NULL, _IOLBF, 0);
+     setenv("DM_ROOT", g_root, 1);
+     snprintf(p, sizeof p, "%s/RomFS", g_root); setenv("DM_ROMFS", p, 0);
++    snprintf(p, sizeof p, "%s/aoc", g_root); setenv("DM_AOC_DIR", p, 0);
+     snprintf(p, sizeof p, "%s/save", act->internalDataPath); mkdir(p, 0700); setenv("DM_SAVE", p, 0);
+     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
+     snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
+     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
++    LOG("[hybrid] Doraemon Hybrid Runtime (nx2android + nx2android-mali unified): root=%s romfs=%s aoc=%s shaders=%s save=%s",
++        g_root, getenv("DM_ROMFS") ? getenv("DM_ROMFS") : "(unset)", getenv("DM_AOC_DIR") ? getenv("DM_AOC_DIR") : "(unset)",
++        getenv("DM_VK_SHADERS") ? getenv("DM_VK_SHADERS") : "(unset)", getenv("DM_SAVE") ? getenv("DM_SAVE") : "(unset)");
+     { const char *e = getenv("DM_MENU_BUTTON"); if (e && *e && !atoi(e)) { atomic_store(&g_menu_btn, 0); LOG("[overlay] DM_MENU_BUTTON=0: no menu button (Back opens the menu)"); } }
+ #ifdef DM_RELEASE
+     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=01008EE0177A8000' tools/nx2android/nxnative/dm/android/gfx_vk_core.c hybrid_port/runtime_src/nxnative/dm/android/gfx_vk_core.c
+--- tools/nx2android/nxnative/dm/android/gfx_vk_core.c	2026-11-21 19:56:36.230365051 +0800
++++ hybrid_port/runtime_src/nxnative/dm/android/gfx_vk_core.c	2026-11-22 09:30:25.423764019 +0800
+@@ -349,6 +349,15 @@
+     VKLOG("%s, Vulkan %u.%u, driver %#x; timeline semaphores %s, BC %s, ASTC %s, geometry shaders %s, nullDescriptor %s, custom border colours %s, depth clip control %s, transform feedback %s; pipeline cache %zu bytes",
+           V.props.deviceName, VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion), V.props.driverVersion, V.has_timeline ? "yes" : "no (fences)",
+           V.has_bc ? "yes" : "no (decoded on the CPU)", V.has_astc ? "yes" : "no", V.has_gs ? "yes" : "no", V.has_robust2 ? "yes" : "no", V.has_custom_border ? "yes" : "no", V.has_depth_clip_ctl ? "yes" : "no", V.has_xfb ? "yes" : "no", dn);
++    {
++        const char *ec = getenv("DM_VK_POOL_CACHED"), *er = getenv("DM_VK_POOL_READBACK_RANGES");
++        int mali_zc_off = vk_quirk(VQ_NO_ZEROCOPY);
++        int pool_cached = ec ? atoi(ec) : mali_zc_off;
++        int rb_ranges = er ? atoi(er) : mali_zc_off;
++        VKLOG("unified Mali+Adreno policy: vendor=%#x (%s), bc_path=%s, zerocopy=%s, pool_cached=%d, readback_ranges=%d",
++              V.props.vendorID, vk_driver_kind(), V.has_bc ? "hardware-native (per-format verified)" : "cpu-bcdec+disk-cache",
++              (getenv("DM_VK_NO_ZEROCOPY") || mali_zc_off) ? "disabled (copied pools)" : "enabled", pool_cached, rb_ranges);
++    }
+     if (mem_diag_on()) VKLOG("[memdiag] enabled storage-image features: extended-formats %s, read-without-format %s, write-without-format %s",
+         en.shaderStorageImageExtendedFormats ? "yes" : "no", en.shaderStorageImageReadWithoutFormat ? "yes" : "no", en.shaderStorageImageWriteWithoutFormat ? "yes" : "no");
+     slots_init();
+@@ -795,7 +804,7 @@
+ // DM_VK_ZEROCOPY_MAX_MB=<n>: pools bigger than n MB are copied, not zero-copy, and kept whole (a copied pool takes no hardware buffer, so no chunks). The Legion Y700
+ // 2023's gralloc aborts the process (no error returned) allocating a hardware buffer for Unicorn Overlord's 860 MB pool, while its pools up to 250 MB are fine
+ static int zc_over(uint64_t size) { static uint64_t m = 1; if (m == 1) { const char *e = getenv("DM_VK_ZEROCOPY_MAX_MB"); m = e && atoi(e) > 0 ? (uint64_t)atoi(e) << 20 : 0; } return m && size > m; }
+-static int zc_off(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_NO_ZEROCOPY") != NULL; return v; }   // DM_VK_NO_ZEROCOPY (set at all): every pool copied
++static int zc_off(void) { static int v = -1; if (v < 0) v = (getenv("DM_VK_NO_ZEROCOPY") != NULL) || vk_quirk(VQ_NO_ZEROCOPY); return v; }   // DM_VK_NO_ZEROCOPY or ARM Mali VQ_NO_ZEROCOPY: every pool copied
+ void mtl_pool_add(const void *mem, uint64_t size) {
+     vk_init();
+     if (!size) return;
+@@ -859,10 +868,14 @@
+     for (int j = 0; j < g_npool && !inner; j++) inner = g_pool[j].zero_copy && g_pool[j].base != base && g_pool[j].lo < p->hi && g_pool[j].hi > p->lo;
+     pthread_rwlock_unlock(&g_pool_mu);
+     if (!inner) pthread_mutex_unlock(&g_nest_mu);
+-    int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : zc_off() ? -4 : zc_over(end - base) ? -5 : lazy ? (p->lazy = 1, 0) : pool_zero_copy(p, (uint8_t *)mem, size, 0, NULL);
++    int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : vk_quirk(VQ_NO_ZEROCOPY) ? -6 : zc_off() ? -4 : zc_over(end - base) ? -5 : lazy ? (p->lazy = 1, 0) : pool_zero_copy(p, (uint8_t *)mem, size, 0, NULL);
+     if (zc) {
+-        static int said; if (!said++) VKLOG("[RED] memory pool %p +%#llx could not be zero-copy (%d): a GPU copy is refreshed before each submission (slow)", mem, (unsigned long long)size, zc);
+-        const char *e = getenv("DM_VK_POOL_CACHED"); int cached = e && atoi(e);
++        static int said;
++        if (!said++) {
++            if (zc == -6) VKLOG("memory pool %p +%#llx: ARM Mali quirk VQ_NO_ZEROCOPY active (copied pool + cached/range-readback defaults)", mem, (unsigned long long)size);
++            else VKLOG("[RED] memory pool %p +%#llx could not be zero-copy (%d): a GPU copy is refreshed before each submission (slow)", mem, (unsigned long long)size, zc);
++        }
++        const char *e = getenv("DM_VK_POOL_CACHED"); int cached = e ? atoi(e) : vk_quirk(VQ_NO_ZEROCOPY);
+         VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
+         if (cached && vkFlushMappedMemoryRanges && vkInvalidateMappedMemoryRanges) r = pool_copied_alloc(p, size, 1);
+         if (r == VK_ERROR_DEVICE_LOST) VKCHK(r);
+@@ -1453,7 +1466,7 @@
+     static int next; g_cur = next; next = (next + 1) % NSLOT; vksub_t *s = &g_slot[g_cur];
+     slot_recycle(s);
+     s->npost = 0; s->up_used = 0; s->ngw = 0;
+-    { const char *e = getenv("DM_VK_POOL_READBACK_RANGES"); s->readback_ranges = e && atoi(e); }
++    { const char *e = getenv("DM_VK_POOL_READBACK_RANGES"); s->readback_ranges = e ? atoi(e) : vk_quirk(VQ_NO_ZEROCOPY); }
+     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+     s->main = s->mains[0]; s->nmain_used = 1; s->cb_err = 0; s->up = s->ups[0]; s->nup_used = 1; s->nmain_sent = 0;
+     VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++;
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=01008EE0177A8000' tools/nx2android/nxnative/dm/android/gfx_vk_quirks.c hybrid_port/runtime_src/nxnative/dm/android/gfx_vk_quirks.c
+--- tools/nx2android/nxnative/dm/android/gfx_vk_quirks.c	2026-11-21 19:56:36.235365031 +0800
++++ hybrid_port/runtime_src/nxnative/dm/android/gfx_vk_quirks.c	2026-11-22 09:23:16.315779013 +0800
+@@ -11,6 +11,7 @@
+ vk_gpu g_vk_gpu;
+ 
+ static int adreno(const vk_gpu *g) { return g->vendor == VENDOR_QUALCOMM; }   // both drivers: Qualcomm's own and Mesa's Turnip
++static int mali(const vk_gpu *g) { return g->vendor == VENDOR_ARM; }         // ARM Mali / Immortalis (0x13B5)
+ 
+ static const struct {
+     enum vk_quirk q; const char *name, *setting; int (*match)(const vk_gpu *); const char *why;
+@@ -21,6 +22,9 @@
+     // written for NieR:Automata
+     {VQ_GS_SPLIT, "gs_split", "DM_VK_QUIRK_GS_SPLIT", adreno,
+      "geometry-shader draws split into vertex and fragment passes: written and checked on Adreno only"},
++    // integrated from nx2android-mali (gfx_vk_core.c vendorID == 0x13b5)
++    {VQ_NO_ZEROCOPY, "no_zerocopy", "DM_VK_QUIRK_NO_ZEROCOPY", mali,
++     "ARM Mali gralloc AHardwareBuffer zero-copy causes faults/aborts; use cached copied pools with range readback instead"},
+ };
+ _Static_assert(sizeof ROWS / sizeof *ROWS == VQ_COUNT, "one row a quirk");
+ 
+@@ -32,7 +36,10 @@
+     case VK_DRIVER_ID_MESA_PANVK: return "panvk";
+     case VK_DRIVER_ID_SAMSUNG_PROPRIETARY: return "xclipse";
+     case VK_DRIVER_ID_IMAGINATION_PROPRIETARY: return "powervr";
+-    default: return g_vk_gpu.vendor == VENDOR_QUALCOMM ? "adreno (driver not named)" : "unknown";
++    default:
++        if (g_vk_gpu.vendor == VENDOR_QUALCOMM) return "adreno (driver not named)";
++        if (g_vk_gpu.vendor == VENDOR_ARM) return "mali (driver not named)";
++        return "unknown";
+     }
+ }
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=01008EE0177A8000' tools/nx2android/nxnative/dm/android/gfx_vk_quirks.h hybrid_port/runtime_src/nxnative/dm/android/gfx_vk_quirks.h
+--- tools/nx2android/nxnative/dm/android/gfx_vk_quirks.h	2026-11-21 19:56:36.235365031 +0800
++++ hybrid_port/runtime_src/nxnative/dm/android/gfx_vk_quirks.h	2026-11-22 09:23:14.424787820 +0800
+@@ -9,6 +9,7 @@
+ enum vk_quirk {
+     VQ_LRZ_TOUCH,    // Adreno LRZ: one-texel depth reads around passes that load depth (gfx_vk_exec_passes.inc lrz_touch); default of DM_VK_LRZ_TOUCH
+     VQ_GS_SPLIT,     // geometry-shader split draws (gfx_vk_gs_split.c) run on this GPU when a profile asks (DM_VK_GS_SPLIT=1)
++    VQ_NO_ZEROCOPY,  // ARM Mali (0x13B5): disable AHardwareBuffer zero-copy pools (nx2android-mali integration) and enable cached copied pools + range readback by default
+     VQ_COUNT
+ };
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=01008EE0177A8000' tools/nx2android/nxnative/dm/android/gfx_vk_tex.c hybrid_port/runtime_src/nxnative/dm/android/gfx_vk_tex.c
+--- tools/nx2android/nxnative/dm/android/gfx_vk_tex.c	2026-11-21 22:58:52.583376979 +0800
++++ hybrid_port/runtime_src/nxnative/dm/android/gfx_vk_tex.c	2026-11-22 09:30:29.866741702 +0800
+@@ -10,6 +10,9 @@
+ #include "nvn_hmap.h"
+ #include <string.h>
+ #include <math.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
+ #include "../gfx/tex/nvn_bc.h"
+ 
+ int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp);
+@@ -77,6 +80,31 @@
+     default: o->dec = 11; o->vk = rgba; o->dbpp = 4; break;   // BC7
+     }
+ }
++// Persistent disk cache for CPU-decoded BC1-BC7 textures on GPUs without BC sampling (e.g. ARM Mali 0x13B5).
++// Keyed by FNV-1a 64-bit digest of (format, w, h, z, raw BC bytes); writes atomically (.tmp -> rename), capped at 512 MiB.
++static uint64_t bc_cache_fnv(uint8_t fmt, uint32_t w, uint32_t h, uint32_t z, const uint8_t *src, size_t n) {
++    uint64_t k = 14695981039346656037ull;
++    uint32_t hdr[4] = {fmt, w, h, z};
++    const uint8_t *hp = (const uint8_t *)hdr;
++    for (size_t i = 0; i < sizeof hdr; i++) { k ^= hp[i]; k *= 1099511628211ull; }
++    for (size_t i = 0; i < n; i++) { k ^= src[i]; k *= 1099511628211ull; }
++    return k;
++}
++static int bc_cache_dir(char *out, size_t cap) {
++    static int mode = -1;
++    if (mode < 0) { const char *e = getenv("DM_VK_BC_CACHE"); mode = (!e || atoi(e) != 0) ? 1 : 0; }
++    if (!mode) return 0;
++    const char *root = getenv("DM_ROOT");
++    if (!root || !*root) return 0;
++    int n = snprintf(out, cap, "%s/bc_cache", root);
++    if (n <= 0 || (size_t)n >= cap) return 0;
++    static int made;
++    if (!made) { mkdir(out, 0700); made = 1; }
++    return 1;
++}
++static uint64_t g_bc_cache_hits, g_bc_cache_misses, g_bc_cache_bytes;
++static const uint64_t BC_CACHE_MAX_BYTES = 512ull << 20;
++
+ // Decodes BC blocks (rows of whole blocks pitch bytes apart, (h + 3) / 4 rows a slice, z slices) into w x h x z texels of f->vk, rows of w * f->dbpp bytes
+ static void bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst) {
+     // Retain the renderer's tight-output interface; the shared decoder also
+@@ -89,8 +117,46 @@
+         (size_t)w > SIZE_MAX / f->dbpp || (size_t)w * f->dbpp > SIZE_MAX / h ||
+         (size_t)w * f->dbpp * h > SIZE_MAX / z) die("[vk] CPU BC decode size overflow");
+     size_t row = (size_t)w * f->dbpp, slice = pitch * rows;
+-    if (nvn_bc_decode(formats[f->dec], w, h, z, src, slice * z, pitch, slice,
+-                      dst, row * h * z, row, row * h)) die("[vk] invalid CPU BC decode layout");
++    size_t src_bytes = slice * z, dst_bytes = row * h * z;
++    char cdir[600], cpath[720];
++    uint64_t key = 0;
++    int use_cache = (dst_bytes >= 16384 && dst_bytes <= (32u << 20)) && bc_cache_dir(cdir, sizeof cdir);
++    if (use_cache) {
++        key = bc_cache_fnv(formats[f->dec], w, h, z, src, src_bytes);
++        snprintf(cpath, sizeof cpath, "%s/%016llx_%u.bc", cdir, (unsigned long long)key, (unsigned)dst_bytes);
++        int fd = open(cpath, O_RDONLY);
++        if (fd >= 0) {
++            size_t got = 0;
++            while (got < dst_bytes) { ssize_t r = read(fd, dst + got, dst_bytes - got); if (r <= 0) break; got += (size_t)r; }
++            close(fd);
++            if (got == dst_bytes) {
++                uint64_t hits = __atomic_add_fetch(&g_bc_cache_hits, 1, __ATOMIC_RELAXED);
++                if (hits == 1 || (hits <= 512 && !(hits & (hits - 1))))
++                    VKLOG("BC disk cache hit #%llu (misses=%llu, written=%.1f MB)", (unsigned long long)hits, (unsigned long long)__atomic_load_n(&g_bc_cache_misses, __ATOMIC_RELAXED), __atomic_load_n(&g_bc_cache_bytes, __ATOMIC_RELAXED) / 1048576.0);
++                return;
++            }
++        }
++    }
++    if (nvn_bc_decode(formats[f->dec], w, h, z, src, src_bytes, pitch, slice,
++                      dst, dst_bytes, row, row * h)) die("[vk] invalid CPU BC decode layout");
++    if (use_cache) {
++        uint64_t misses = __atomic_add_fetch(&g_bc_cache_misses, 1, __ATOMIC_RELAXED);
++        uint64_t cur = __atomic_load_n(&g_bc_cache_bytes, __ATOMIC_RELAXED);
++        if (cur + dst_bytes <= BC_CACHE_MAX_BYTES) {
++            char tmp[760];
++            snprintf(tmp, sizeof tmp, "%s.%d.tmp", cpath, (int)getpid());
++            int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++            if (fd >= 0) {
++                size_t put = 0;
++                while (put < dst_bytes) { ssize_t r = write(fd, dst + put, dst_bytes - put); if (r <= 0) break; put += (size_t)r; }
++                close(fd);
++                if (put == dst_bytes && rename(tmp, cpath) == 0) __atomic_add_fetch(&g_bc_cache_bytes, dst_bytes, __ATOMIC_RELAXED);
++                else unlink(tmp);
++            }
++        }
++        if (misses == 1 || (misses <= 512 && !(misses & (misses - 1))))
++            VKLOG("BC disk cache miss #%llu (hits=%llu, written=%.1f MB)", (unsigned long long)misses, (unsigned long long)__atomic_load_n(&g_bc_cache_hits, __ATOMIC_RELAXED), __atomic_load_n(&g_bc_cache_bytes, __ATOMIC_RELAXED) / 1048576.0);
++    }
+ }
+ void vk_bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst) { bc_decode(f, src, pitch, w, h, z, dst); }
+ static pthread_mutex_t g_fmt_mu = PTHREAD_MUTEX_INITIALIZER;
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=01008EE0177A8000' tools/nx2android/nxnative/dm/host/hle_audio.c hybrid_port/runtime_src/nxnative/dm/host/hle_audio.c
+--- tools/nx2android/nxnative/dm/host/hle_audio.c	2026-11-21 19:56:37.475360143 +0800
++++ hybrid_port/runtime_src/nxnative/dm/host/hle_audio.c	2026-11-22 09:24:43.239374161 +0800
+@@ -113,8 +113,10 @@
+         }
+     }
+     uint32_t vb = atomic_load_explicit(&a->vol, memory_order_relaxed);
+-    if (vb != 0x3f800000u) {   // the output's volume (SetAudioOutVolume), as the audout session applies it to the PCM16 it plays; saturating
+-        float v; memcpy(&v, &vb, 4);
++    float mv = 1.0f;
++    { const char *ev = getenv("DM_AUDIO_VOLUME"); if (ev && *ev) { mv = strtof(ev, NULL); if (mv < 0.0f) mv = 0.0f; if (mv > 1.0f) mv = 1.0f; } }
++    if (vb != 0x3f800000u || mv != 1.0f) {   // output volume (SetAudioOutVolume) * master DM_AUDIO_VOLUME; saturating
++        float v; memcpy(&v, &vb, 4); v *= mv;
+         for (uint64_t i = 0; i < ns; i++) { float x = s16[i] * v; s16[i] = (int16_t)(x > 32767.f ? 32767.f : x < -32768.f ? -32768.f : x); }
+     }
+     if (released) {
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=01008EE0177A8000' tools/nx2android/nxnative/dm/settings.tsv hybrid_port/runtime_src/nxnative/dm/settings.tsv
+--- tools/nx2android/nxnative/dm/settings.tsv	2026-11-21 19:56:37.488610644 +0800
++++ hybrid_port/runtime_src/nxnative/dm/settings.tsv	2026-11-22 09:25:15.992221609 +0800
+@@ -12,6 +12,7 @@
+ DM_AUDIO	int		debug	start	hle_audio.c	silent sink (Android defaults to real output)
+ DM_AUDIO_DUMP	str		debug	?	hle_audio.c	
+ DM_AUDIO_MUTE	bool		debug	?	hle_audio.c	diagnostic: the whole real-output path (AudioUnit callback pacing, background take-over) but with the output silenced (lifecycle tests on the Mac without noise)
++DM_AUDIO_VOLUME	float	1.0	app	live	hle_audio.c	master output volume multiplier (0.0 to 1.0) controlled by the Hybrid Launcher
+ DM_AUDREN_CATCHUP_FRAMES	int		profile	start	hle_audren.c	catch-up frames (a frame rendered on the updating thread when nothing was rendered since the last update) only while fewer than this many frames have been rendered; unset: always. For games that update several times per renderer event and stream from looping voice buffers (Fire Emblem: Three Houses: 200)
+ DM_AUDREN_DUMP	str		debug	start	hle_audren.c	writes every block the renderer hands to the output, in play order (stereo int16, 48 kHz), to this file; logs the blocks that rendered nothing and those from the catch-up queue (`audren dump:`); devtools/pcm_glitches.py finds clicks, gaps and clipping in it
+ DM_AUDREN_TRACE	str		debug	live	hle_audren.c	logs the first 200 renderer updates with the frames rendered since the previous one, and the next 300 catch-up frames (`audren: catch-up at update …`): the calling thread, the time since the previous update and the frames queued ahead. Animal Crossing: New Horizons: 14-25 catch-ups a second with or 
+@@ -48,6 +49,7 @@
+ DM_GPU_TURBO	str		profile	live	perf_android.c	"auto" or 1: ask the GPU for its high clocks while the game is GPU-bound; unset or 0 = no
+ DM_GUEST_SPAWN_TEST	int		debug	?	hle_guestthread.c	
+ DM_HLECOUNT	str		debug	start	hle_count.c	count every HLE call and write a TSV (category, name, count) at exit; the `ctl.txt` line `hlecount <file>` writes the counts so far, so two dumps around one action show the calls it made
++DM_HYBRID_ROOT	str		app	start	front_android.c	override DM_ROOT to the Hybrid APK internal extracted game_data directory
+ DM_IMPORTS	str		debug	?	main.c	
+ DM_KBD	str		debug	?	hle_swkbd.c	
+ DM_KBD_PLAYER	str		debug,ios	?	front_mac.m	
+@@ -237,6 +239,7 @@
+ DM_TOUCH_LOG	str		debug	?	hle_touch.c	DM_TOUCH_LOG=1 also logs each gesture entry (up to 500 lines)
+ DM_UDC_SELFTEST	str		debug,ios	?	nvn_mtl.m	
+ DM_VK_ASYNC_PIPE	bool	1	profile	live	gfx_vk_exec.c	0 = new pipelines are built on the replay thread, not in the background
++DM_VK_BC_CACHE	bool	1	profile	start	gfx_vk_tex.c	1 = persistent disk cache ($DM_ROOT/bc_cache) for CPU-decoded BC1-BC7 textures on non-BC GPUs (ARM Mali)
+ DM_VK_BC_DRAW	int	0	profile	start	gfx_vk_tex.c	BC texture stand-in mode for drivers without BC: 0 = off
+ DM_VK_BIND_DUMP	str		debug	start	gfx_vk_exec.c	writes the storage of the texture that binding of that pixel shader really resolved to (at most 8 files) to `$DM_ROOT/bind_<fs>_b<binding>_<w>x<h>_f<format>_s<serial>.bin` (the current folder when `DM_ROOT` is unset); slots alone are polluted by stale entries of earlier draws
+ DM_VK_CAPTURE	str		debug,ios	?	hle_vk.m	
+@@ -303,6 +306,7 @@
+ DM_VK_PROF_TID	bool		debug	start	gfx_vk_exec.c	sample that thread of the process instead of the replay thread, and append the raw samples (leaf pc, lr, six frame-chain returns) to the file. **Host threads only: sampling Xenoblade Chronicles 3's render thread crashed the game in its own code** (use `DM_NVN_ASYNC=1` to profile the replay on a host
+ DM_VK_QUIRK_GS_SPLIT	bool		debug	start	gfx_vk_quirks.c	force the gs_split quirk row (gfx_vk_quirks.c): 1 lets profiles' geometry-shader splits run on a GPU other than Adreno, 0 stops them
+ DM_VK_QUIRK_LRZ_TOUCH	bool		debug	start	gfx_vk_quirks.c	force the lrz_touch quirk row (gfx_vk_quirks.c): the default of DM_VK_LRZ_TOUCH (on for Adreno)
++DM_VK_QUIRK_NO_ZEROCOPY	bool		debug	start	gfx_vk_quirks.c	force the no_zerocopy quirk row (gfx_vk_quirks.c): disables AHardwareBuffer zero-copy and defaults to cached copied pools + range readback (on for ARM Mali 0x13B5)
+ DM_VK_RD_TOUCH	bool		debug	live	gfx_vk_exec.c	no transfer read of the memory a run of rasterizer-discard draws wrote, where the run ends: Xenoblade Chronicles 3's grass then flickers (whole blades black in some frames: the G-buffer's grass cards, depth EQUAL against the pre-pass, meet sway records not yet written)
+ DM_VK_ROBUST	bool		debug	start	gfx_vk_core.c	robust buffer access on (A/B for a device lost): a buffer, texel buffer or vertex read past its range reads 0 and a write past it is dropped, instead of faulting the GPU
+ DM_VK_RP	bool		debug	start	gfx_vk_exec.c	dynamic rendering instead of cached `VkRenderPass` objects with imageless framebuffers (Adreno's `vkCmdBeginRendering` cost about 40 µs a pass)

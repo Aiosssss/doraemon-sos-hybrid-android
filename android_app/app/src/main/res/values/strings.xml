@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Doraemon SoS Hybrid</string>
+    <string name="app_subtitle">Friends of the Great Kingdom • Native ARM64 Hybrid Port</string>
+    <string name="notif_channel_extract">Game Asset Extraction</string>
+    <string name="notif_channel_extract_desc">Progress notifications while extracting Nintendo Switch game files</string>
+</resources>

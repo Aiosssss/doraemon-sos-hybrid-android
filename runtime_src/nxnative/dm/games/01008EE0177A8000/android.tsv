@@ -1,0 +1,12 @@
+# Android profile for DORAEMON STORY OF SEASONS: Friends of the Great Kingdom (01008EE0177A8000, v262144 / 1.1.2).
+# Unified ARM Mali (0x13B5) + Qualcomm Adreno (0x5143) build: intentionally omits `requires bcn` (M4).
+status	experimental
+tested	hybrid-gate2 host-offline-only
+package	org.nx2a.doraemon
+orientation	landscape
+pacing	fixed30
+setting	overlay=1
+setting	opacity=60
+setting	docked=0
+setting	rumble=1
+env	DM_VK_BC_CACHE=1

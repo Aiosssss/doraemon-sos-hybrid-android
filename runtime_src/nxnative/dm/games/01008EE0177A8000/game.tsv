@@ -1,0 +1,38 @@
+# Game profile of DORAEMON STORY OF SEASONS: Friends of the Great Kingdom (Switch, update 1.1.2 = v262144).
+# Unity 2020.3.33f1 (IL2CPP v27), Nintendo SDK 13.3.5 (NVN), CRIWARE ADX2 (.acb/.awb) + Sofdec2 (movie_000.usm).
+# subsdk0 is NintendoSDK_movie-13_3_5-Release (d0f13015e5badf2243d60a2bc9b978dd) and sdk is 3644a6760469451cabc99f00c540acc2 (already in sdk_patches.py).
+# Shaders are Unity 2020.3 Shader & ComputeShader objects in Addressables bundles under Data/StreamingAssets/aa/Switch/ and Data/Resources/.
+
+# ---- Identity ----
+title_id	01008EE0177A8000
+program_id	01008EE0177A8000
+
+# ---- App ----
+name	DORAEMON STORY OF SEASONS: Friends of the Great Kingdom
+ipa	DoraemonSoSFGK.ipa
+app_category	public.app-category.simulation-games
+pad_layout	full
+fps_target	30
+
+# ---- Versions ----
+build	v262144	1.1.2	main=306dfcfc9eba4a1a7d0ae7ffcee4b9e4	subsdk0=d0f13015e5badf2243d60a2bc9b978dd	sdk=3644a6760469451cabc99f00c540acc2
+package	v262144
+shader_versions	v262144
+
+# ---- Files ----
+modules	main subsdk0 sdk
+romfs_marker	Data/StreamingAssets/aa/settings.json
+zip_store	.assets:.bundle:.dat:.json:.resource:.ress:.acb:.awb:.usm:.metallib
+
+# ---- Memory ----
+# NPDM declares SystemResourceSize = 0x1000000 (16 MB), matching twin Unity 2020.3 + SDK 13.3.5 profile 0100713016CCC000.
+# Virtual address memory enabled; sdk_patches.py shrinks AddressRegionManager node area to 62 MB for sdk=3644a6760469451cabc99f00c540acc2.
+sys_resource	0x1000000
+mem_reserve	0x140000000
+mem_alias	0x118000000
+mem_stack	0x10000000
+app_pool	0x40000000
+
+# ---- Shader split (shader_split.py; Unity 2020.3 Shader & ComputeShader via unityfs.py) ----
+shader_groups	_unitybuiltinshaders_=engine /Resources/=engine /StreamingAssets/=assets /Data/=data
+shader_note	DORAEMON STORY OF SEASONS: Friends of the Great Kingdom shaders

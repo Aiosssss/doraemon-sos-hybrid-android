@@ -1,0 +1,71 @@
+{
+  "game_name": "DORAEMON STORY OF SEASONS: Friends of the Great Kingdom",
+  "package_name": "org.nx2a.doraemon",
+  "pipeline": "nx2android + nx2android-mali (unified)",
+  "engine": "Unity 2020.3.33f1 (IL2CPP v27, NVN)",
+  "base_title_id": "01008EE0177A8000",
+  "update_title_id": "01008EE0177A8800",
+  "update_version": 262144,
+  "display_version": "1.1.2",
+  "required_modules": [
+    "main",
+    "subsdk0",
+    "sdk"
+  ],
+  "all_exefs_modules": {
+    "rtld": {
+      "build_id": "567cdd4c5251494c5cd70822e3ccc740",
+      "raw_sha256": "8e08c8cf2e4d6b39d69643af10ce765d39c06860878224c68f8cafc45a2636aa",
+      "patched_sha256": "f34d4b6713b5c14b88440ad951a1ea9a7224024023975e9085b08ed200481c06"
+    },
+    "main": {
+      "build_id": "306dfcfc9eba4a1a7d0ae7ffcee4b9e4",
+      "raw_sha256": "efbdbc5e5e43c9316c74ae0bbaac45bbb001b71cda883872e8e0d0cd44785302",
+      "patched_sha256": "2eff52fb98c001c57f92e97c2eda02849bfef14844ded53b832d77587744f118"
+    },
+    "subsdk0": {
+      "build_id": "d0f13015e5badf2243d60a2bc9b978dd",
+      "raw_sha256": "366a266d8be18489795831224d6837884ac8ab1edf5c120754960bbfe9ac6664",
+      "patched_sha256": "b1703c604c63ad5b473d8a27916f9bbdfe450eb6d94fd83b31fd84d0ae0c1999"
+    },
+    "sdk": {
+      "build_id": "3644a6760469451cabc99f00c540acc2",
+      "raw_sha256": "d30e3b441f4cfce2722eac09474354cad82d56741c86240fe4ae0cc4b7fd7df2",
+      "patched_sha256": "15715950c77b16d4bb46f5569f435b078769702503df463a9f0162f0d24978f3"
+    }
+  },
+  "supported_aoc": [
+    {
+      "title_id": "01008EE0177A9001",
+      "aoc_index": 1,
+      "name": "DLC 1"
+    },
+    {
+      "title_id": "01008EE0177A900B",
+      "aoc_index": 11,
+      "name": "Premium Crops Seed Set"
+    },
+    {
+      "title_id": "01008EE0177A90C9",
+      "aoc_index": 201,
+      "name": "Seasonal Veggies Seeds Set"
+    }
+  ],
+  "romfs_expected_files": 13720,
+  "romfs_expected_bytes": 2351273216,
+  "min_free_space_bytes": 3221225472,
+  "shader_bundle": {
+    "file": "shaders.dmsv",
+    "version": 2,
+    "count": 5613,
+    "spirv_val_passed": 5613,
+    "sha256": "3315012d0adaa568b2dfd789c9c6ab1ec09c7d3315d87021e707fdb946346f2c"
+  },
+  "core_runtime": {
+    "file": "libdmhost.so",
+    "abi": "arm64-v8a",
+    "page_align": 16384,
+    "sha256": "afc14a374b28a6eb1e9ecbcc9180b5be146bc42d06ab7613d1496c2bc0599fd4"
+  },
+  "hybrid_release": "1.1.2-hybrid7"
+}

@@ -1,0 +1,44 @@
+# ---- Legal & Copyrighted Game Data (NEVER commit) ----
+ref_extract/
+gate1_probe/
+l10n_id/
+*.nsp
+*.xci
+*.nca
+*.nso
+*.nro
+*.romfs
+*.patched.bin
+prod.keys
+title.keys
+
+# ---- Private Signing Keys & Secrets (NEVER commit) ----
+release_signing/
+*.jks
+*.keystore
+*.p12
+*.pem
+keystore.properties
+
+# ---- Build Outputs & Caches ----
+build_core/
+dist/
+*.apk
+*.aab
+*.idsig
+android_app/.gradle/
+android_app/build/
+android_app/app/build/
+android_app/local.properties
+native_extractor/build/
+tools/nxpatch_apply
+*.o
+*.d
+*.a
+*.pyc
+__pycache__/
+.DS_Store
+
+# ---- Keep only Doraemon SoS (01008EE0177A8000) + top-level helper scripts under dm/games/ ----
+runtime_src/nxnative/dm/games/*/
+!runtime_src/nxnative/dm/games/01008EE0177A8000/
