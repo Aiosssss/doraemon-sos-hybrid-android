@@ -2,6 +2,7 @@
 static struct {
     const prog_t *prog; vkshader_t *sh[6]; int prog_ok;
     p_bind_buf ubo[6][16], ssbo[6][16];
+    uint16_t ssbo_mask[6];   // bit r set when S.ssbo[st][r].addr != 0 || size != 0 (fast-path drv_shared)
     uint64_t tex[6][256], samp[6][128], img[6][32], tex_sseq[6][256], samp_sseq[6][128];   // *_sseq: the sampler registrations made before the bind (gfx_vk_tex.c vk_samp_at)
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
     uint32_t vattr[16]; vs_st vstream[16]; NVNbufferRange vbuf[16];
@@ -11,7 +12,7 @@ static struct {
     tex_t rt_col[8], rt_dep; view_t rt_cview[8], rt_dview; uint8_t rt_has_col[8], rt_has_cview[8], rt_has_dep, rt_has_dview; int rt_n; uint32_t rt_bad[8];   // rt_bad: the first word of a colour slot that is not a texture object (traces)
     int64_t row_stride, image_stride;
     // the open render pass
-    int pass_open; uint32_t pass_w, pass_h; VkFormat cfmt[8], dfmt; VkImageAspectFlags daspect; uint32_t samples; int ncol;
+    int pass_open; uint32_t pass_w, pass_h, pass_orig_w, pass_orig_h; VkFormat cfmt[8], dfmt; VkImageAspectFlags daspect; uint32_t samples, pass_res_mask; int ncol, skip_tiny_pp;
     VkPipeline bound_pipe; int rp_pass;   // rp_pass: the open pass began with vkCmdBeginRenderPass
 } S;
 static p_tf_bind g_tf[4]; static uint64_t g_tf_off[4]; static int g_tf_on, g_tf_in_pass; static uint32_t g_tf_verts;   // transform feedback: buffers, bytes written into each, capture on, a capture in the open pass (xfb_begin), vertices captured since Begin
@@ -74,6 +75,7 @@ static int g_gs_split;      // DM_VK_GS_SPLIT=1 (a profile env row; live, read i
 enum { LRZ_READ = 2, LRZ_SWITCH = 4, LRZ_CUT = 8, LRZ_ALL = 14, LRZ_CUT_RD = 16, LRZ_CORNER = 32 };   /* LRZ_CUT_RD: only read at a cut; LRZ_CORNER: the last texel, not the first (tests) */   // DM_VK_LRZ_TOUCH bits: the read before a load pass, the write-back on a depth switch, the write-back at a cut
 static int g_x_nosetc, g_x_nodrvc, g_x_landcut, g_x_nokeep, g_x_nobc, g_x_cutany, g_lrz_touch, g_xfb_on = 1, g_x_nogs, g_spv_alt, g_x_nodispbar; int g_x_noshc;   // g_xfb_on: DM_VK_XFB=0 captures no transform feedback (A/B)
 static int g_strict_barriers, g_emu_first_instance = 1, g_no_a2c;   // DM_VK_STRICT_BARRIERS, DM_VK_EMU_FIRST_INSTANCE, DM_VK_NO_A2C (hybrid6)
+static uint32_t g_fi_expand_mask;   // per-draw bitmask of vertex streams expanded to divisor=1 in vk_scratch by emulate_first_instance()
 static int g_x_nosetmemo, g_x_setverify;   // DM_VK_X_NOSETMEMO=1 (live, A/B): no per-stage set memo; DM_VK_X_SETVERIFY=1 (live): one memo hit in 64 checked (see stage_set)
 static int g_vbound = 1;   // DM_VK_VBOUND (see vbuf_bound)
 // DM_VK_PROF_SLOW=1 (live): a submission whose replay took over 40 ms logs where it went: pipelines built on the replay thread, textures (vk_tex: images made and
@@ -147,11 +149,11 @@ static void cpu_ready_config(void) {
     g_vk_cpu_ready = !(e && !atoi(e));   // live A/B: =0 leaves CPU reads unsynchronized
 }
 static int g_dbg_draw_live; static uint64_t g_skip_ops_live;   // DM_VK_DBG_DRAW, DM_VK_SKIP_OPS: read with the other live switches, once a submission (bisection at a chosen moment)
-static void x_read(void) { cpu_ready_config(); { const char *e = getenv("DM_VK_DBG_DRAW"); g_dbg_draw_live = e ? atoi(e) : 0; } { uint64_t s = 0; const char *e = getenv("DM_VK_SKIP_OPS"); for (const char *q = e; q && *q;) { char *n; long v = strtol(q, &n, 10); if (n == q) break; if (v > 0 && v < 64) s |= 1ull << v; q = *n ? n + 1 : n; } g_skip_ops_live = s; } const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws = (c && *c) ? atoi(c) : (vk_quirk(VQ_NO_CB_SPLIT) ? 0 : 128); g_sub_pass = 0;
+static void x_read(void) { cpu_ready_config(); { const char *e = getenv("DM_VK_DBG_DRAW"); g_dbg_draw_live = e ? atoi(e) : 0; } { uint64_t s = 0; const char *e = getenv("DM_VK_SKIP_OPS"); for (const char *q = e; q && *q;) { char *n; long v = strtol(q, &n, 10); if (n == q) break; if (v > 0 && v < 64) s |= 1ull << v; q = *n ? n + 1 : n; } g_skip_ops_live = s; } const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws = (c && *c) ? atoi(c) : ((vk_quirk(VQ_NO_CB_SPLIT) || vk_pool_overlap()) ? 0 : 128); g_sub_pass = 0;
     const char *fy = getenv("DM_VK_FLIPY"); g_flipy = !(fy && !atoi(fy));   // on unless DM_VK_FLIPY=0
     if (g_x_listpasses) { g_x_listpasses = 0; setenv("DM_VK_TRACE_PASS", "-1", 1); }
     const char *tp = getenv("DM_VK_TRACE_PASS"); g_x_tracepass = tp ? atoi(tp) : -1;
-    { const char *e = getenv("DM_VK_ORDER_KEEP"); g_order_keep = e ? atoi(e) != 0 : DM_GAME_ORDER_KEEP; g_order_pending = g_order_check = 0; }
+    { const char *e = getenv("DM_VK_ORDER_KEEP"); g_order_keep = (e && *e) ? (atoi(e) != 0) : !vk_mali_bifrost_legacy(); g_order_pending = g_order_check = 0; }
     { static uint64_t until; static int done; const char *la = getenv("DM_VK_LIST_AT");   // DM_VK_LIST_AT=<present>[#n]: the pass list of every submission over n (2) presents from there; now[#n] from the current one
       if (la && !done && (!strncmp(la, "now", 3) || g_tex_frame >= (uint64_t)atoll(la))) { const char *h = strchr(la, '#'); done = 1; until = g_tex_frame + (h && atoi(h + 1) > 0 ? (uint64_t)atoi(h + 1) : 2); }
       if (until && g_tex_frame < until) { g_x_tracepass = -2; g_x_listpasses = 1; g_lst_nrd = 0; VKLOG("--- submission at present %llu", (unsigned long long)g_tex_frame); } }
@@ -186,11 +188,14 @@ static void x_read(void) { cpu_ready_config(); { const char *e = getenv("DM_VK_D
     } }
 
 // ---- 1-Shot 3D Frame Render-Graph Dumper (DM_VK_DUMP_3D_FRAME=0/1) ----
-// Arms automatically on the first present after a 3D frame (dispatches > 50 && draws > 80), dumps
-// EXACTLY ONE complete frame of compute dispatches, render passes, and fullscreen/post-process or
-// instanced draws (with bound FS texture VkFormat + swizzle), then disarms permanently for the run.
+// Arms automatically on the first present after a 3D frame (draws_in_frame >= 100; does not require
+// >50 dispatches since Unity 2020.3 Doraemon SoS runs ~1-2 compute dispatches/frame), dumps EXACTLY ONE
+// complete frame of compute dispatches, render passes (dims, VkFormat, samples, load/store ops), and
+// fullscreen/post-process or instanced draws (VS/FS hash, blend, color mask, bound texture VkFormat + swizzle).
 static int g_d3d_state;   // 0=idle/waiting, 1=dumping this 1 frame, 2=done
 static uint32_t g_d3d_fdisp, g_d3d_fdraws, g_d3d_passes, g_d3d_dumped_draws, g_d3d_dumped_disp;
+static const uint8_t *g_cur_op_p;   // current NVN record pointer (used by pass_commit for explicit Discard lookahead)
+static vkimg_t *P_res_im; static VkImageView P_res_view; static VkImageUsageFlags P_res_usage; static uint32_t P_res_layers; static const uint8_t *P_res_op, *g_inline_resolved_op;
 void vk_dump_3d_frame_present(void) {
     if (g_d3d_state == 2) return;
     if (!vk_dump_3d_frame()) { g_d3d_state = 2; return; }
@@ -200,11 +205,11 @@ void vk_dump_3d_frame_present(void) {
         g_d3d_state = 2;
         return;
     }
-    if (g_d3d_fdisp > 50 && g_d3d_fdraws > 80) {
+    if (g_d3d_fdraws >= 100) {
         g_d3d_state = 1;
         g_d3d_passes = g_d3d_dumped_draws = g_d3d_dumped_disp = 0;
-        VKLOG("[3D-DUMP] === BEGIN 1-SHOT 3D FRAME DUMP (next present after %llu; prev_dispatches=%u prev_draws=%u) ===",
-              (unsigned long long)g_tex_frame, g_d3d_fdisp, g_d3d_fdraws);
+        VKLOG("[3D-DUMP] === BEGIN 1-SHOT 3D FRAME DUMP (next present after %llu; prev_draws=%u prev_dispatches=%u) ===",
+              (unsigned long long)g_tex_frame, g_d3d_fdraws, g_d3d_fdisp);
     }
     g_d3d_fdisp = 0; g_d3d_fdraws = 0;
 }
@@ -220,14 +225,27 @@ static void d3d_log_dispatch(const vkshader_t *cs, uint32_t x, uint32_t y, uint3
 static void d3d_log_draw(const char *kind, uint32_t count, uint32_t inst, uint32_t orig_binst) {
     g_d3d_fdraws++;
     if (g_d3d_state != 1) return;
+    static uint32_t last_pass_id;
+    static uint64_t seen_sig[4];
+    static int seen_n;
+    if (last_pass_id != g_d3d_passes) { last_pass_id = g_d3d_passes; seen_n = 0; }
+    uint64_t vs_k = S.sh[0] ? S.sh[0]->key : 0, fs_k = S.sh[1] ? S.sh[1]->key : 0;
+    uint64_t pair_sig = vs_k ^ (fs_k * 0x9e3779b97f4a7c15ull);
+    int is_new_pair = 0;
+    if (seen_n < 4) {
+        int dup = 0;
+        for (int i = 0; i < seen_n; i++) if (seen_sig[i] == pair_sig) { dup = 1; break; }
+        if (!dup) { seen_sig[seen_n++] = pair_sig; is_new_pair = 1; }
+    }
     int is_fs_pp = (count <= 6) || (S.vp[0][2] >= (float)S.pass_w * 0.9f && S.vp[0][3] >= (float)S.pass_h * 0.9f && count <= 12);
     int is_inst = (inst > 1 || orig_binst > 0);
-    if (!is_fs_pp && !is_inst) return;
+    int is_shd_state = (S.poly.offset_en != 0 || S.ds.st != 0 || (S.ms.enable && S.ms.a2c));
+    if (!is_fs_pp && !is_inst && !is_new_pair && !is_shd_state) return;
     static const char SWC[8] = "01RGBA??";
-    char tbuf[512]; int o = 0;
+    char tbuf[512]; tbuf[0] = '\0'; int o = 0;
     vkshader_t *fs = S.sh[1];
-    if (fs) {
-        for (int i = 0; i < fs->nbind && o < (int)sizeof tbuf - 48; i++) {
+    if (fs && fs->b && fs->nbind > 0) {
+        for (int i = 0; i < fs->nbind && o < (int)sizeof tbuf - 64; i++) {
             const dmsv_bind *b = &fs->b[i];
             if (b->kind != RK_TEX && b->kind != RK_TEX_C2A && b->kind != RK_TEXD) continue;
             if (b->reg < 0 || b->reg >= 256) continue;
@@ -235,21 +253,31 @@ static void d3d_log_draw(const char *kind, uint32_t count, uint32_t inst, uint32
             if (!h) continue;
             int tid = (int)(h & 0xfffffu);
             const view_t *vw = NULL; const tex_t *tx = NULL;
-            vkimg_t *im = vk_tex_by_id(tid, &vw, &tx);
-            if (!im || !tx) continue;
+            // NOTE: vk_tex_by_id() returns sentinel (vkimg_t *)1 (presence only), NEVER a dereferenceable vkimg_t*.
+            // Dereferencing im->fmt caused SIGSEGV at addr=0x21 (0x1 + offsetof(vkimg_t, fmt)).
+            // Always verify presence + non-NULL tx and read format/dims/swizzle strictly from tx->d & vw (or check vk_img_valid(im)).
+            vkimg_t *im_pres = vk_tex_by_id(tid, &vw, &tx);
+            if (!im_pres || !tx) continue;
+            int nvn_fmt = (vw && vw->set_format) ? (int)vw->format : (int)tx->d.format;
+            const vkfmt_t *vf = vk_fmt(nvn_fmt);
+            int vkf = vk_img_valid(im_pres) ? (int)im_pres->fmt : (vf ? (int)vf->vk : -1);
             char sw[5] = "RGBA";
             if (vw && vw->set_swizzle) { for (int c = 0; c < 4; c++) sw[c] = SWC[vw->swz[c] & 7]; }
             else if (tx->set_swz) { for (int c = 0; c < 4; c++) sw[c] = SWC[(tx->swz >> (3 * c)) & 7]; }
-            o += snprintf(tbuf + o, sizeof tbuf - (size_t)o, " t%d:%ux%u/f%d/s%u(%s)",
-                          b->reg, tx->d.width, tx->d.height, (int)tx->d.format, tx->d.samples ? tx->d.samples : 1u, sw);
+            int n = snprintf(tbuf + o, sizeof tbuf - (size_t)o, " t%d:%ux%u/nvn%d/vk%d/s%u(%s)",
+                             b->reg, tx->d.width, tx->d.height, nvn_fmt, vkf, tx->d.samples ? tx->d.samples : 1u, sw);
+            if (n > 0) {
+                o += n;
+                if (o >= (int)sizeof tbuf) { o = (int)sizeof tbuf - 1; break; }
+            }
         }
     }
     const blend_st *bl = &S.blend[0];
-    VKLOG("[3D-DUMP]   DRAW #%u %s[%s%s] cnt=%u inst=%u binst=%u vs=%016llx fs=%016llx bl=%#x(c:%u/%u/%u a:%u/%u/%u) wm=%#x dt=%u dw=%u%s",
-          ++g_d3d_dumped_draws, kind, is_fs_pp ? "PP" : "", is_inst ? "INST" : "",
+    VKLOG("[3D-DUMP]   DRAW #%u %s[%s%s%s] cnt=%u inst=%u binst=%u vs=%016llx fs=%016llx bl=%#x(c:%u/%u/%u a:%u/%u/%u) wm=%#x dt=%u dw=%u df=%u bias=%u st=%u a2c=%u%s",
+          ++g_d3d_dumped_draws, kind ? kind : "?", is_fs_pp ? "PP" : "", is_inst ? "INST" : "", is_new_pair && !is_fs_pp && !is_inst ? "SHD" : "",
           count, inst, orig_binst,
-          (unsigned long long)(S.sh[0] ? S.sh[0]->key : 0),
-          (unsigned long long)(fs ? fs->key : 0),
+          (unsigned long long)vs_k,
+          (unsigned long long)fs_k,
           S.color.blend_en, bl->src_rgb, bl->dst_rgb, bl->eq_rgb, bl->src_a, bl->dst_a, bl->eq_a,
-          S.chmask.mask, S.ds.dt, S.ds.dw, o ? tbuf : "");
+          S.chmask.mask, S.ds.dt, S.ds.dw, S.ds.df, S.poly.offset_en, S.ds.st, (unsigned)(S.ms.enable && S.ms.a2c), o ? tbuf : "");
 }

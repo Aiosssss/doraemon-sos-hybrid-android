@@ -25,12 +25,13 @@
         android:supportsRtl="false"
         android:theme="@style/Theme.DoraemonHybrid">
 
-        <!-- Hybrid Setup, Settings, Diagnostics & Launch Hub -->
+        <!-- Hybrid Setup, Settings, Diagnostics & Launch Hub (Landscape Story of Seasons UI) -->
         <activity
             android:name="org.nx2a.doraemon.LauncherActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation"
             android:exported="true"
-            android:launchMode="singleTop">
+            android:launchMode="singleTop"
+            android:screenOrientation="sensorLandscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

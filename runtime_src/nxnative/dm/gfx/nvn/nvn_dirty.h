@@ -8,6 +8,8 @@ void nvn_dirty_stat(int *live, int *peak, int *cap);                // number of
 void nvn_dirty_remove_range(const void *mem);                     // Pool destruction: restore protected pages to writable and mark invalid
 int nvn_dirty_tracked(const void *addr, size_t len);
 void nvn_dirty_protect(const void *addr, size_t len);              // Set the covered pages read-only
+void nvn_dirty_protect_blk(const void *addr, size_t len, size_t span_blk); // Coalesced mprotect(PROT_READ) with per-block fault release spans (prevents multi-MB fault cascades in copied pools)
+void nvn_dirty_protect_span_blk(const void *span, const void *addr, size_t len, size_t span_blk); // O(1) span-handle variant of nvn_dirty_protect_blk (avoids range-table linear scan)
 void nvn_dirty_release(const void *addr, size_t len);              // Make the covered pages writable again and stamp them as written (a span no longer watched)
 uint64_t nvn_dirty_released(void);                                 // Cumulative: pages unprotected by nvn_dirty_release
 int nvn_dirty_runs(void);                                          // Runs of protected pages now (each a mapping of the process)

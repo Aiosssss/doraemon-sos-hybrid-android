@@ -303,6 +303,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
         if (op == 22 && n == 3 && w[i + 2] == 64) f64_used = 1;   // OpTypeFloat 64
         if (op == 16 && n >= 3 && w[i + 2] == 11) s->xfb = 1;     // OpExecutionMode Xfb: a vertex shader that captures transform feedback (shader_vk.py xfb_layout)
         if (op == 16 && n >= 3 && (w[i + 2] == 12 || w[i + 2] == 14 || w[i + 2] == 15)) s->depth_repl = 1;   // OpExecutionMode DepthReplacing / DepthGreater / DepthLess
+        if (op == 252 || op == 4416 || op == 5380) s->has_discard = 1;   // OpKill / OpTerminateInvocation / OpDemoteToHelperInvocation
         // each buffer's stride: the translator decorates an output XfbBuffer b, then XfbStride s (OpDecorate, or OpMemberDecorate for gl_Position's block)
         { uint32_t d = op == 71 && n >= 4 ? w[i + 2] : op == 72 && n >= 5 ? w[i + 3] : 0, v = op == 71 ? w[i + 3] : op == 72 && n >= 5 ? w[i + 4] : 0;
           if (d == 36) xb = v; else if (d == 37 && xb < 4) s->xfb_stride[xb] = v; }

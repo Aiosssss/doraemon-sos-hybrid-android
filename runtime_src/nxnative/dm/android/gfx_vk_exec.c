@@ -19,6 +19,7 @@ void vk_sub_update(uint64_t dst, const void *data, uint64_t n);
 void vk_gpu_wrote(uint64_t a, uint64_t n);
 int prog_key(const prog_t *p, unsigned st, uint8_t key[8]);
 static int shader_wmem(vkshader_t *s);
+static int shader_bind_writes(vkshader_t *s, uint16_t binding);
 
 #include "gfx_vk_exec_state.inc"   // the NVN state shadow: what the game set, read by the walker and the draws
 #include "gfx_vk_exec_render_cond.inc"   // conditional rendering (profile render_cond)

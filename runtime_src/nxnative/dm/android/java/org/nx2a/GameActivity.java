@@ -18,5 +18,5 @@ public class GameActivity extends NativeActivity {
 
     @Override protected void onResume() { super.onResume(); keyboard.pause(false); }
     @Override protected void onPause() { keyboard.pause(true); super.onPause(); }
-    @Override protected void onDestroy() { keyboard.pause(true); super.onDestroy(); }
+    @Override protected void onDestroy() { keyboard.destroy(); super.onDestroy(); }
 }

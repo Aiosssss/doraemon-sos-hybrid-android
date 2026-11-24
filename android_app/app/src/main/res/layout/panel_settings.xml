@@ -1,0 +1,814 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/panel_settings_card"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_panel_storybook"
+    android:clickable="true"
+    android:focusable="true"
+    android:orientation="vertical"
+    android:padding="4dp">
+
+    <!-- Wooden Ribbon Header -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:background="@drawable/bg_panel_header"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="18dp"
+        android:paddingEnd="12dp">
+
+        <ImageView
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:contentDescription="@string/btn_settings"
+            android:src="@drawable/ic_gear_wood"
+            android:tint="#FFF6DF" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:layout_weight="1"
+            android:text="@string/settings_title"
+            android:textColor="#FFF8E7"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <!-- Tab Switcher inside Header -->
+        <TextView
+            android:id="@+id/tab_btn_basic"
+            android:layout_width="wrap_content"
+            android:layout_height="30dp"
+            android:layout_marginEnd="6dp"
+            android:background="@drawable/bg_preset_active"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:text="@string/tab_basic"
+            android:textColor="#FFFDF5"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tab_btn_advanced"
+            android:layout_width="wrap_content"
+            android:layout_height="30dp"
+            android:layout_marginEnd="14dp"
+            android:background="@drawable/bg_preset_idle"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:text="@string/tab_advanced"
+            android:textColor="#5C3919"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <!-- Circular Wooden Close Button -->
+        <FrameLayout
+            android:id="@+id/btn_close_settings"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:background="@drawable/bg_btn_wood_close"
+            android:clickable="true"
+            android:focusable="true">
+
+            <ImageView
+                android:layout_width="18dp"
+                android:layout_height="18dp"
+                android:layout_gravity="center"
+                android:contentDescription="@string/cd_close"
+                android:src="@drawable/ic_close_x" />
+        </FrameLayout>
+    </LinearLayout>
+
+    <!-- 1-Click Quick Preset Bar -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="14dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="6dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:text="@string/preset_label"
+            android:textColor="#6B421E"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/btn_preset_auto"
+            android:layout_width="0dp"
+            android:layout_height="30dp"
+            android:layout_weight="1.2"
+            android:background="@drawable/bg_preset_active"
+            android:clickable="true"
+            android:focusable="true"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:text="@string/preset_auto"
+            android:textColor="#FFFDF5"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/btn_preset_low"
+            android:layout_width="0dp"
+            android:layout_height="30dp"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1.1"
+            android:background="@drawable/bg_preset_idle"
+            android:clickable="true"
+            android:focusable="true"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:text="@string/preset_low"
+            android:textColor="#5C3919"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/btn_preset_balanced"
+            android:layout_width="0dp"
+            android:layout_height="30dp"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1.0"
+            android:background="@drawable/bg_preset_idle"
+            android:clickable="true"
+            android:focusable="true"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:text="@string/preset_balanced"
+            android:textColor="#5C3919"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/btn_preset_high"
+            android:layout_width="0dp"
+            android:layout_height="30dp"
+            android:layout_marginStart="6dp"
+            android:layout_weight="0.95"
+            android:background="@drawable/bg_preset_idle"
+            android:clickable="true"
+            android:focusable="true"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:text="@string/preset_high"
+            android:textColor="#5C3919"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- Tab 1: Basic Settings (2-Column Landscape Layout) -->
+    <LinearLayout
+        android:id="@+id/tab_settings_basic"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="horizontal"
+        android:paddingStart="14dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="10dp">
+
+        <!-- Left Column: Graphics & Performance -->
+        <ScrollView
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginEnd="8dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card_inner"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/sec_graphics"
+                    android:textColor="#7A481D"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <!-- Render Scale -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:text="@string/lbl_render_scale"
+                    android:textColor="#4A2E14"
+                    android:textSize="11.5sp"
+                    android:textStyle="bold" />
+
+                <Spinner
+                    android:id="@+id/sp_render_scale"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <!-- Shadow Resolution (0.5x / 0.75x / 1.0x) -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:text="@string/lbl_shadow_scale"
+                    android:textColor="#4A2E14"
+                    android:textSize="11.5sp"
+                    android:textStyle="bold" />
+
+                <Spinner
+                    android:id="@+id/sp_shadow_scale"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <!-- Target FPS -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:text="@string/lbl_target_fps"
+                    android:textColor="#4A2E14"
+                    android:textSize="11.5sp"
+                    android:textStyle="bold" />
+
+                <Spinner
+                    android:id="@+id/sp_target_fps"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <!-- Anti-Aliasing (MSAA 2x) -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:text="@string/lbl_msaa"
+                    android:textColor="#4A2E14"
+                    android:textSize="11.5sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/sub_msaa"
+                    android:textColor="#8A6A4A"
+                    android:textSize="9.5sp" />
+
+                <Spinner
+                    android:id="@+id/sp_msaa_mode"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <!-- Docked 1080p Mode -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/lbl_docked"
+                            android:textColor="#4A2E14"
+                            android:textSize="11.5sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/sub_docked"
+                            android:textColor="#8A6A4A"
+                            android:textSize="9.5sp" />
+                    </LinearLayout>
+
+                    <Switch
+                        android:id="@+id/sw_docked_mode"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+            </LinearLayout>
+        </ScrollView>
+
+        <!-- Right Column: Anti-Flicker Status, Audio, Gamepad & Mod -->
+        <ScrollView
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card_inner"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/sec_protection_controls"
+                    android:textColor="#7A481D"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <!-- Locked Default Anti-Flicker Status Badge (Mode 2 Default; Experimental Mode 1 lives in Advanced) -->
+                <LinearLayout
+                    android:id="@+id/card_safe_sync_status"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:background="#EBF5E6"
+                    android:orientation="vertical"
+                    android:padding="8dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/lbl_safe_sync_card_title"
+                        android:textColor="#2E6120"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/txt_safe_sync_card_status"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="@string/lbl_safe_sync_card_active"
+                        android:textColor="#2E6120"
+                        android:textSize="11.5sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="@string/lbl_safe_sync_card_sub"
+                        android:textColor="#5C6B54"
+                        android:textSize="9.5sp" />
+                </LinearLayout>
+
+                <!-- Audio Volume -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:id="@+id/txt_audio_vol"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/lbl_audio_vol_fmt"
+                        android:textColor="#4A2E14"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <SeekBar
+                        android:id="@+id/seek_audio_vol"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:max="100" />
+                </LinearLayout>
+
+                <!-- Gamepad / Rumble / FPS toggles -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/lbl_virtual_gamepad"
+                        android:textColor="#4A2E14"
+                        android:textSize="12sp" />
+
+                    <Switch
+                        android:id="@+id/sw_overlay"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/lbl_rumble_fps"
+                        android:textColor="#4A2E14"
+                        android:textSize="12sp" />
+
+                    <Switch
+                        android:id="@+id/sw_rumble"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginEnd="6dp" />
+
+                    <Switch
+                        android:id="@+id/sw_fps_counter"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <!-- RomFS / Language Mod Strip -->
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginTop="8dp"
+                    android:layout_marginBottom="6dp"
+                    android:background="#E8D5B7" />
+
+                <TextView
+                    android:id="@+id/txt_mod_status"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:text="@string/mod_status_original"
+                    android:textColor="#6B421E"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:id="@+id/btn_install_mod"
+                        android:layout_width="0dp"
+                        android:layout_height="32dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_btn_leaf"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:gravity="center"
+                        android:text="@string/btn_install_mod"
+                        android:textColor="#FFFDF5"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/btn_restore_mod"
+                        android:layout_width="0dp"
+                        android:layout_height="32dp"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_btn_parchment"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:gravity="center"
+                        android:text="@string/btn_restore_mod"
+                        android:textColor="#4A2E14"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+            </LinearLayout>
+        </ScrollView>
+    </LinearLayout>
+
+    <!-- Tab 2: Advanced & Diagnostics (2-Column Landscape Layout) -->
+    <LinearLayout
+        android:id="@+id/tab_settings_advanced"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="horizontal"
+        android:paddingStart="14dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="10dp"
+        android:visibility="gone">
+
+        <!-- Left Column: Export Log, Save Backup/Restore, Reset & GPU Info -->
+        <ScrollView
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginEnd="8dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card_inner"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/sec_diag"
+                    android:textColor="#7A481D"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <!-- 1-Click Export Log Report -->
+                <TextView
+                    android:id="@+id/btn_export_log"
+                    android:layout_width="match_parent"
+                    android:layout_height="38dp"
+                    android:layout_marginTop="8dp"
+                    android:background="@drawable/bg_btn_play"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="@string/btn_export_log"
+                    android:textColor="#FFFDF5"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:id="@+id/btn_backup_save"
+                        android:layout_width="0dp"
+                        android:layout_height="34dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_btn_leaf"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:gravity="center"
+                        android:text="@string/btn_backup_save"
+                        android:textColor="#FFFDF5"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/btn_restore_save"
+                        android:layout_width="0dp"
+                        android:layout_height="34dp"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_btn_parchment"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:gravity="center"
+                        android:text="@string/btn_restore_save"
+                        android:textColor="#4A2E14"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/btn_reset_defaults"
+                    android:layout_width="match_parent"
+                    android:layout_height="34dp"
+                    android:layout_marginTop="8dp"
+                    android:background="@drawable/bg_btn_parchment"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="@string/btn_reset_defaults"
+                    android:textColor="#9B2C1F"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <!-- Short GPU & RAM Info -->
+                <TextView
+                    android:id="@+id/txt_gpu_ram_info"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:background="#F7ECD8"
+                    android:padding="8dp"
+                    android:text="@string/gpu_detecting"
+                    android:textColor="#5C3919"
+                    android:textSize="10sp"
+                    android:typeface="monospace" />
+            </LinearLayout>
+        </ScrollView>
+
+        <!-- Right Column: Advanced Vulkan / Memory Switches + Experimental Pool Safe Sync -->
+        <ScrollView
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card_inner"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/sec_vulkan_adv"
+                    android:textColor="#7A481D"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <!-- Pool Safe Sync Selector (Mode 2 Recommended, Mode 1 Experimental) -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/lbl_safe_sync_adv"
+                    android:textColor="#4A2E14"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/sub_safe_sync_adv"
+                    android:textColor="#9B4D18"
+                    android:textSize="9.5sp" />
+
+                <Spinner
+                    android:id="@+id/sp_safe_sync"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/lbl_robust_access"
+                        android:textColor="#4A2E14"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+                    <Switch
+                        android:id="@+id/sw_robust_access"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="3dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/lbl_inline_resolve"
+                        android:textColor="#4A2E14"
+                        android:textSize="11sp" />
+                    <Switch
+                        android:id="@+id/sw_inline_resolve"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="3dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/lbl_strict_barriers"
+                        android:textColor="#4A2E14"
+                        android:textSize="11sp" />
+                    <Switch
+                        android:id="@+id/sw_strict_barriers"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="3dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/lbl_bc_cache"
+                        android:textColor="#4A2E14"
+                        android:textSize="11sp" />
+                    <Switch
+                        android:id="@+id/sw_bc_cache"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:text="@string/lbl_low_ram"
+                    android:textColor="#4A2E14"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <Spinner
+                    android:id="@+id/sp_low_ram"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:text="@string/lbl_low_cost_pp"
+                    android:textColor="#4A2E14"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <Spinner
+                    android:id="@+id/sp_low_cost_pp"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+            </LinearLayout>
+        </ScrollView>
+    </LinearLayout>
+
+</LinearLayout>

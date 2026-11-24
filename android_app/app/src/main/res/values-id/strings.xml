@@ -1,0 +1,198 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Identitas Aplikasi -->
+    <string name="app_name">SOS FOTGK</string>
+    <string name="app_subtitle">Friends of the Great Kingdom • Port Native ARM64</string>
+    <string name="notif_channel_extract">Ekstraksi Aset Game</string>
+    <string name="notif_channel_extract_desc">Notifikasi progres saat mengekstrak file game Nintendo Switch</string>
+    <string name="watermark_aiosport">@AiosPort</string>
+
+    <!-- Layar Utama Launcher -->
+    <string name="cd_wallpaper">Key Art Doraemon Story of Seasons</string>
+    <string name="btn_play">MAIN</string>
+    <string name="btn_play_waiting_import">MAIN  (Meng-import…)</string>
+    <string name="btn_play_import_first">MAIN  (Import Dulu)</string>
+    <string name="btn_settings">PENGATURAN</string>
+    <string name="btn_import_game">IMPORT GAME</string>
+    <string name="cd_close">Tutup</string>
+    <string name="cd_check">Dipilih</string>
+    <string name="status_checking">Memeriksa data game…</string>
+    <string name="status_importing">Sedang meng-import game…</string>
+    <string name="status_ready_fmt">Siap Dimainkan • v%1$s</string>
+    <string name="status_not_imported">Belum Import Game</string>
+
+    <!-- Header & Tab Panel Pengaturan -->
+    <string name="settings_title">Pengaturan Permainan</string>
+    <string name="tab_basic">Utama</string>
+    <string name="tab_advanced">Lanjutan &amp; Log</string>
+
+    <!-- Preset Cepat -->
+    <string name="preset_label">Preset Cepat:</string>
+    <string name="preset_auto">Otomatis (Disarankan)</string>
+    <string name="preset_low">HP Kentang / Low-End</string>
+    <string name="preset_balanced">Performa 60 FPS</string>
+    <string name="preset_high">Kualitas Tinggi</string>
+    <string name="toast_preset_auto">Preset Otomatis diterapkan</string>
+    <string name="toast_preset_low">Preset HP Kentang / Low-End diterapkan</string>
+    <string name="toast_preset_balanced">Preset Performa 60 FPS diterapkan</string>
+    <string name="toast_preset_high">Preset Kualitas Tinggi diterapkan</string>
+
+    <!-- Tab Utama: Kolom Kiri (Grafis & Performa) -->
+    <string name="sec_graphics">Grafis &amp; Performa</string>
+    <string name="lbl_render_scale">Kualitas Grafis (Render Scale)</string>
+    <string name="lbl_shadow_scale">Resolusi Bayangan (Shadow Scale)</string>
+    <string name="lbl_target_fps">Target FPS</string>
+    <string name="lbl_msaa">Anti-Aliasing (MSAA 2x)</string>
+    <string name="sub_msaa">Matikan di HP low-end untuk FPS lebih tinggi (cache terpisah, bebas freeze).</string>
+    <string name="lbl_docked">Mode Layar Docked (1080p)</string>
+    <string name="sub_docked">OFF = Handheld 720p (ringan) • ON = Docked 1080p</string>
+
+    <!-- Tab Utama: Kolom Kanan (Proteksi Visual, Audio, Kontrol & Mod) -->
+    <string name="sec_protection_controls">Proteksi Visual, Audio &amp; Kontrol</string>
+    <string name="lbl_safe_sync_card_title">Proteksi Anti-Kedip (Mode 2 Default)</string>
+    <string name="lbl_safe_sync_card_active">Aktif: Serial Safe Sync (Mode 2) + Robust Access</string>
+    <string name="lbl_safe_sync_card_exp">Eksperimental: Pipelined Mode 1 aktif (bisa berkedip)</string>
+    <string name="lbl_safe_sync_card_sub">Terkunci aktif secara default untuk 0% kedip di semua GPU. Ubah di tab Lanjutan.</string>
+    <string name="lbl_audio_vol_fmt">Volume Audio: %1$d%%</string>
+    <string name="lbl_virtual_gamepad">Virtual Gamepad di Layar</string>
+    <string name="lbl_rumble_fps">Getaran &amp; Penghitung FPS</string>
+    <string name="mod_status_original">Mod Bahasa Indonesia: RomFS Asli</string>
+    <string name="mod_status_active_fmt">Mod Aktif: %1$s (%2$d file)</string>
+    <string name="btn_install_mod">Pasang Mod (.zip)</string>
+    <string name="btn_restore_mod">Pulihkan RomFS Asli</string>
+
+    <!-- Tab Lanjutan & Diagnostik -->
+    <string name="sec_diag">Laporan, Save Data &amp; Info Perangkat</string>
+    <string name="btn_export_log">Ekspor Log Laporan (.txt)</string>
+    <string name="btn_backup_save">Backup Save</string>
+    <string name="btn_restore_save">Restore Save</string>
+    <string name="btn_reset_defaults">Reset Pengaturan Default</string>
+    <string name="gpu_detecting">Mendeteksi GPU Vulkan &amp; RAM…</string>
+    <string name="gpu_not_available">GPU : Vulkan tidak tersedia</string>
+    <string name="gpu_probe_error">GPU : Probe error</string>
+    <string name="ram_summary_fmt">RAM : %1$.1f GB Total (%2$.1f GB Bebas)</string>
+
+    <string name="sec_vulkan_adv">Opsi Lanjutan Vulkan &amp; Memori</string>
+    <string name="lbl_safe_sync_adv">Mode Pool Safe Sync</string>
+    <string name="sub_safe_sync_adv">Mode 2 disarankan (0% kedip). Mode 1 eksperimental dan dapat memicu kedip merah/bayangan.</string>
+    <string name="lbl_robust_access">Robust Buffer Access (Anti Kedip Merah)</string>
+    <string name="lbl_inline_resolve">Inline TBDR MSAA Resolve (Hemat GPU)</string>
+    <string name="lbl_strict_barriers">Strict Vulkan Barriers (Diagnostik)</string>
+    <string name="lbl_bc_cache">Disk Cache Tekstur BC (Mali)</string>
+    <string name="lbl_low_ram">Profil Memori / Anti-LMK</string>
+    <string name="lbl_low_cost_pp">Low-Cost Post-Process (HP Kentang)</string>
+
+    <!-- Item Spinner -->
+    <string name="sp_scale_auto">Otomatis (Sesuai Tier GPU &amp; RAM)</string>
+    <string name="sp_scale_050">Ultra FPS (0.50x — 640×360 HP Kentang)</string>
+    <string name="sp_scale_055">Rendah (0.55x — 704×396)</string>
+    <string name="sp_scale_067">Ringan (0.67x — 854×480)</string>
+    <string name="sp_scale_075">Sedang (0.75x — 960×540)</string>
+    <string name="sp_scale_100">Tajam (1.00x — Native 720p)</string>
+
+    <string name="sp_shadow_auto">Otomatis (1.0x Flagship / 0.75x Mid / 0.5x Low-End)</string>
+    <string name="sp_shadow_050">Rendah (0.50x — Hemat 75% GPU Bayangan)</string>
+    <string name="sp_shadow_075">Sedang (0.75x — Seimbang Mid-Range)</string>
+    <string name="sp_shadow_100">Native (1.00x — Detail Bayangan Penuh)</string>
+
+    <string name="sp_fps_auto">Otomatis (60 FPS • 30 FPS Ultra Low-End)</string>
+    <string name="sp_fps_30">30 FPS (Hemat &amp; Stabil)</string>
+    <string name="sp_fps_45">45 FPS (Halus Mid-Range)</string>
+    <string name="sp_fps_60">60 FPS (Mulus Penuh)</string>
+
+    <string name="sp_msaa_auto">Otomatis (2x Flagship / OFF Mid &amp; Low-End)</string>
+    <string name="sp_msaa_off">OFF — 1x (FPS Lebih Tinggi &amp; Adem)</string>
+    <string name="sp_msaa_on">ON — Native 2x MSAA (Halus)</string>
+
+    <string name="sp_safe_sync_mode2">Mode 2 — Ekstra Aman Serial (Disarankan, 0% Kedip)</string>
+    <string name="sp_safe_sync_mode1">Mode 1 — Pipelined (Eksperimental — Bisa Berkedip)</string>
+
+    <string name="sp_low_ram_auto">Otomatis (Deteksi RAM Perangkat)</string>
+    <string name="sp_low_ram_std">Standar (&gt;= 6 GB RAM)</string>
+    <string name="sp_low_ram_4gb">Hemat RAM 4 GB (Anti-LMK)</string>
+    <string name="sp_low_ram_3gb">Ultra Hemat 3 GB (Anti-LMK)</string>
+
+    <string name="sp_low_cost_pp_auto">Otomatis (Aktif di HP Low-End)</string>
+    <string name="sp_low_cost_pp_on">ON — Ringankan Bloom Mikro</string>
+    <string name="sp_low_cost_pp_off">OFF — Post-Process Penuh</string>
+
+    <!-- Panel Import Game -->
+    <string name="import_title">Import Game Nintendo Switch</string>
+    <string name="import_step1_title">1. prod.keys  (Wajib)</string>
+    <string name="import_step1_hint">Belum dipilih — kunci dekripsi Switch Anda</string>
+    <string name="import_step2_title">2. Base Game (.nsp / .xci)  (Wajib)</string>
+    <string name="import_step2_hint">Mendukung Base NSP/XCI atau Merged/Super NSP</string>
+    <string name="import_step3_title">3. Update v1.1.2 (.nsp)  (Wajib kecuali Merged)</string>
+    <string name="import_step3_hint">Kosongkan jika Base sudah Merged v1.1.2</string>
+    <string name="import_step4_title">4. DLC (.nsp)  (Opsional)</string>
+    <string name="import_step4_hint">Boleh dikosongkan (mendukung 0–3 file DLC)</string>
+    <string name="btn_pick">Pilih</string>
+    <string name="sec_import_status">Status Instalasi &amp; Penyimpanan</string>
+    <string name="import_status_none">Belum ada data game terpasang.\nPilih prod.keys &amp; Base Game (.nsp/.xci) di kiri.</string>
+    <string name="import_status_ready_fmt">Terpasang &amp; Siap Dimainkan\nUpdate v%1$s • %2$d file RomFS\nDLC: %3$s</string>
+    <string name="import_status_syncing">Data game terdeteksi, sinkronisasi aset inti sedang diproses…</string>
+    <string name="import_storage_checking">Penyimpanan bebas: memeriksa…</string>
+    <string name="import_storage_fmt">Penyimpanan bebas: %.2f GB (minimal 3.20 GB diperlukan)</string>
+    <string name="btn_start_extract">Mulai Import &amp; Ekstrak</string>
+    <string name="btn_reimport_add_dlc">Import Ulang / Tambah DLC</string>
+    <string name="btn_cancel_extract">Batalkan Ekstraksi</string>
+    <string name="btn_clean_data">Hapus Data Game (Import Ulang)</string>
+
+    <!-- Dialog & Toast -->
+    <string name="toast_import_first">Silakan import file game terlebih dahulu.</string>
+    <string name="toast_game_not_verified">Data game belum terverifikasi.</string>
+    <string name="toast_config_save_warn">Peringatan simpan konfigurasi: %1$s</string>
+    <string name="toast_config_save_fail">Gagal menyimpan pengaturan: %1$s</string>
+    <string name="toast_core_sync_fail">Sinkronisasi aset inti gagal: %1$s</string>
+    <string name="toast_extract_done">Import &amp; verifikasi selesai! Siap dimainkan.</string>
+    <string name="toast_pick_required">Pilih prod.keys (Wajib) dan Base Game (.nsp/.xci) (Wajib) terlebih dahulu.</string>
+    <string name="msg_extract_starting">Memulai proses ekstrak…</string>
+    <string name="picked_fmt">Dipilih: %1$s</string>
+    <string name="picked_dlc_none">Boleh dikosongkan (0 file DLC)</string>
+    <string name="picked_dlc_count_fmt">%1$d file DLC dipilih</string>
+
+    <string name="dlg_reset_title">Reset Pengaturan Default?</string>
+    <string name="dlg_reset_msg">Semua pengaturan grafis, FPS, dan Vulkan akan dikembalikan ke default optimal (Safe Sync Mode 2 aktif).</string>
+    <string name="btn_reset">Reset</string>
+    <string name="btn_cancel">Batal</string>
+    <string name="btn_ok">OK</string>
+    <string name="btn_understood">Mengerti</string>
+    <string name="toast_reset_done">Pengaturan dikembalikan ke default.</string>
+
+    <string name="dlg_upd_missing_title">Update v1.1.2 Tidak Ditemukan</string>
+    <string name="dlg_upd_missing_msg">Port ini membutuhkan Update v1.1.2 (01008EE0177A8800 v262144), sedangkan DLC boleh dikosongkan.\n\n• Pilih Base Game (.nsp/.xci) + Update v1.1.2 (.nsp), ATAU\n• Pilih 1 file Merged/Super NSP/XCI yang sudah memuat Update v1.1.2.\n\nDetail: %1$s</string>
+    <string name="dlg_import_fail_title">Import Gagal</string>
+    <string name="dlg_import_fail_msg">Terjadi kendala saat ekstrak file game:\n\n%1$s\n\nAnda bisa mengekspor log di Pengaturan → Lanjutan &amp; Log → Ekspor Log Laporan.</string>
+
+    <string name="dlg_clean_title">Hapus Data Game (Save Tetap Aman)?</string>
+    <string name="dlg_clean_msg">Menghapus file RomFS/ExeFS hasil ekstrak agar Anda bisa meng-import ulang dengan bersih. Save data game di folder save tetap disimpan.</string>
+    <string name="btn_clean_confirm">Hapus &amp; Import Ulang</string>
+    <string name="toast_clean_done">Data ekstrak dibersihkan. Silakan import ulang.</string>
+
+    <string name="dlg_gpu_lost_title">Mode Pemulihan GPU (-4)</string>
+    <string name="dlg_gpu_lost_msg">Sesi sebelumnya mengalami VK_ERROR_DEVICE_LOST (-4).\n\n%1$sAktifkan Mode Aman GPU 1-Klik? (Pool Safe Sync Mode 2 + Robust Access + MSAA OFF)</string>
+    <string name="btn_enable_safe_mode">Aktifkan Mode Aman</string>
+    <string name="btn_ignore">Abaikan</string>
+    <string name="toast_safe_mode_on">Mode Aman GPU diaktifkan.</string>
+
+    <string name="toast_log_exported">Log berhasil diekspor (%1$d KiB)</string>
+    <string name="toast_log_export_fail">Gagal ekspor log: %1$s</string>
+    <string name="toast_save_backup_ok">Backup save selesai (%1$d file)</string>
+    <string name="toast_save_backup_fail">Backup save gagal: %1$s</string>
+    <string name="dlg_restore_save_title">Restore Save Data?</string>
+    <string name="dlg_restore_save_msg">Mengganti save game saat ini dengan arsip ZIP yang dipilih.</string>
+    <string name="btn_restore">Restore</string>
+    <string name="toast_save_restore_ok">Save berhasil dipulihkan (%1$d file)</string>
+    <string name="toast_save_restore_fail">Restore save gagal: %1$s</string>
+
+    <string name="dlg_install_mod_title">Pasang Mod Bahasa Indonesia (.zip)?</string>
+    <string name="dlg_install_mod_msg">Menerapkan \"%1$s\" ke game_data/RomFS/?\n\nFile asli yang tertimpa dicadangkan otomatis agar bisa dipulihkan dalam 1 detik.</string>
+    <string name="btn_install_mod_confirm">Pasang Mod</string>
+    <string name="toast_mod_installed">Mod terpasang: %1$s (%2$d file)</string>
+    <string name="toast_mod_install_fail">Gagal memasang mod: %1$s</string>
+
+    <string name="dlg_restore_romfs_title">Pulihkan RomFS Asli?</string>
+    <string name="dlg_restore_romfs_msg">Menonaktifkan mod dan mengembalikan seluruh file RomFS asli dalam ~1 detik tanpa perlu import ulang NSP.</string>
+    <string name="toast_romfs_restored">RomFS asli dipulihkan (%1$d file)</string>
+    <string name="toast_romfs_restore_fail">Gagal memulihkan: %1$s</string>
+</resources>

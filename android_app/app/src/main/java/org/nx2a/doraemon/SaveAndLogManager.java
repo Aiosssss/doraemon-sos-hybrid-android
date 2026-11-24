@@ -29,15 +29,51 @@ import java.util.zip.ZipOutputStream;
  * atomic ZIP backup / restore of internal game saves (filesDir/save/).
  */
 public final class SaveAndLogManager {
+    private static final String LAUNCHER_LOG_FILE = "launcher_extract.log";
+    private static final long MAX_LAUNCHER_LOG_BYTES = 262144L; // 256 KiB
+    private static final Object LOG_LOCK = new Object();
+
     private SaveAndLogManager() {}
 
     /**
-     * Exports diagnostics header + log.txt + log.prev.txt to a SAF destination URI.
+     * Appends a timestamped Launcher / Extractor diagnostic line into filesDir/launcher_extract.log.
+     * Stored outside game_data/ so extraction errors are always preserved and exportable even before
+     * game_data/log.txt exists. Never pass secret key material to this method.
+     */
+    public static void appendLauncherLog(Context ctx, String tag, String msg) {
+        if (ctx == null || msg == null) return;
+        synchronized (LOG_LOCK) {
+            try {
+                File f = new File(ctx.getFilesDir(), LAUNCHER_LOG_FILE);
+                if (f.isFile() && f.length() > MAX_LAUNCHER_LOG_BYTES) {
+                    File prev = new File(ctx.getFilesDir(), LAUNCHER_LOG_FILE + ".prev");
+                    //noinspection ResultOfMethodCallIgnored
+                    prev.delete();
+                    //noinspection ResultOfMethodCallIgnored
+                    f.renameTo(prev);
+                }
+                String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
+                String line = "[" + ts + "] [" + (tag != null ? tag : "launcher") + "] " + msg + "\n";
+                try (FileOutputStream fos = new FileOutputStream(f, true)) {
+                    fos.write(line.getBytes(StandardCharsets.UTF_8));
+                    fos.flush();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * Exports diagnostics header + launcher_extract.log + last_launch_error.txt + log.txt + log.prev.txt
+     * to a SAF destination URI. Always succeeds even before game_data/log.txt exists.
      */
     public static int exportRuntimeLogs(Context ctx, Uri destUri, String vulkanProbeJson) throws IOException {
         File gameDir = CoreAssetSync.getGameDataDir(ctx);
+        File launcherLog = new File(ctx.getFilesDir(), LAUNCHER_LOG_FILE);
+        File lastErr = new File(gameDir, "last_launch_error.txt");
         File curLog = new File(gameDir, "log.txt");
         File prevLog = new File(gameDir, "log.prev.txt");
+        CoreAssetSync.Status st = CoreAssetSync.inspectStatus(ctx);
 
         int totalBytes = 0;
         try (OutputStream out = ctx.getContentResolver().openOutputStream(destUri, "wt")) {
@@ -50,26 +86,35 @@ public final class SaveAndLogManager {
                     + " (" + BuildConfig.VERSION_CODE + ")\n"
                     + "Device: " + Build.MANUFACTURER + " " + Build.MODEL
                     + " (Android " + Build.VERSION.RELEASE + ", API " + Build.VERSION.SDK_INT + ")\n"
-                    + "Vulkan Probe: " + (vulkanProbeJson != null ? vulkanProbeJson : "(unavailable)") + "\n\n";
+                    + "Install Status: " + st.summary + "\n"
+                    + "Vulkan Probe: " + (vulkanProbeJson != null && !vulkanProbeJson.isEmpty() ? vulkanProbeJson : "(unavailable)") + "\n\n";
             byte[] hb = header.getBytes(StandardCharsets.UTF_8);
             out.write(hb);
             totalBytes += hb.length;
 
-            totalBytes += appendLogSection(out, "=== CURRENT LOG (game_data/log.txt) ===", curLog);
-            totalBytes += appendLogSection(out, "\n=== PREVIOUS LOG (game_data/log.prev.txt) ===", prevLog);
+            totalBytes += appendLogSection(out, "=== LAUNCHER & EXTRACT LOG (launcher_extract.log) ===", launcherLog,
+                    "(no extraction/launcher events recorded yet)\n");
+            if (lastErr.isFile() && lastErr.length() > 0) {
+                totalBytes += appendLogSection(out, "\n=== LAST LAUNCH ERROR (game_data/last_launch_error.txt) ===", lastErr,
+                        "(none)\n");
+            }
+            totalBytes += appendLogSection(out, "\n=== CURRENT RUNTIME LOG (game_data/log.txt) ===", curLog,
+                    "(file not present or empty — launch the game first)\n");
+            totalBytes += appendLogSection(out, "\n=== PREVIOUS RUNTIME LOG (game_data/log.prev.txt) ===", prevLog,
+                    "(file not present or empty)\n");
             out.flush();
         }
         return totalBytes;
     }
 
-    private static int appendLogSection(OutputStream out, String title, File f) throws IOException {
+    private static int appendLogSection(OutputStream out, String title, File f, String emptyNote) throws IOException {
         int written = 0;
         byte[] tb = (title + "\n").getBytes(StandardCharsets.UTF_8);
         out.write(tb);
         written += tb.length;
 
         if (!f.isFile() || f.length() == 0) {
-            byte[] empty = "(file not present or empty — launch the game first)\n".getBytes(StandardCharsets.UTF_8);
+            byte[] empty = emptyNote.getBytes(StandardCharsets.UTF_8);
             out.write(empty);
             return written + empty.length;
         }

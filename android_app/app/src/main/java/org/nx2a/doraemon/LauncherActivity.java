@@ -2,6 +2,7 @@ package org.nx2a.doraemon;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
@@ -11,22 +12,20 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Color;
-import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
-import android.util.TypedValue;
-import android.view.Gravity;
 import android.view.View;
-import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
-import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
-import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.Switch;
@@ -36,20 +35,25 @@ import android.widget.Toast;
 import org.json.JSONObject;
 import org.nx2a.GameActivity;
 
+import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.Locale;
 
 /**
- * Standalone Hybrid Android Launcher for DORAEMON STORY OF SEASONS: Friends of the Great Kingdom.
+ * Landscape Storybook-themed Launcher for DORAEMON STORY OF SEASONS: Friends of the Great Kingdom.
  *
- * Sections:
- *   1. Setup & Extraction (SAF pickers for prod.keys, Base NSP, Update 1.1.2 NSP, 0..3 DLC NSPs,
- *      storage check, ExtractForegroundService progress + Cancel, strict Play gate).
- *   2. Runtime Settings (100% real knobs synced to game_data/env.txt & game_data/settings.txt).
- *   3. Diagnostics, Logs & Save Management (live Vulkan Mali/Adreno probe, Build IDs, AOC status,
- *      SAF Log Export, SAF Save Backup/Restore ZIP).
+ * Localization:
+ *   - Auto-detects Android system locale via resource qualifiers:
+ *     Indonesian (values-in / values-id) -> Bahasa Indonesia
+ *     All other system locales (values)  -> English (default)
+ *
+ * Main Screen (Landscape Fullscreen):
+ *   - HD Farm Key-Art wallpaper (2048x1024); title logo & Doraemon/Nobita 100% unobstructed
+ *   - 3 clear primary buttons neatly positioned strictly beneath the title logo: PLAY, SETTINGS, IMPORT GAME
+ *   - Minimal bottom-left wooden status pill + compact hybrid27 version badge
+ *   - Tiny crisp @AiosPort watermark pinned to the bottom-right corner
  */
 public final class LauncherActivity extends Activity {
     private static final int REQ_PICK_KEYS = 101;
@@ -62,45 +66,102 @@ public final class LauncherActivity extends Activity {
     private static final int REQ_INSTALL_MOD = 204;
     private static final int REQ_POST_NOTIF = 301;
 
-    private static final int COL_BG = Color.parseColor("#0B1320");
-    private static final int COL_CARD = Color.parseColor("#132033");
-    private static final int COL_BORDER = Color.parseColor("#233754");
-    private static final int COL_TEXT = Color.parseColor("#EEF4FC");
-    private static final int COL_MUTED = Color.parseColor("#9FB3CE");
-    private static final int COL_ACCENT = Color.parseColor("#2196F3");
-    private static final int COL_GREEN = Color.parseColor("#2E7D32");
-    private static final int COL_AMBER = Color.parseColor("#E65100");
-    private static final int COL_RED = Color.parseColor("#C62828");
+    private static final int[] SCALE_PRESET_MAP = {
+            RuntimeConfigManager.SCALE_AUTO,
+            RuntimeConfigManager.SCALE_050,
+            RuntimeConfigManager.SCALE_055,
+            RuntimeConfigManager.SCALE_067,
+            RuntimeConfigManager.SCALE_075,
+            RuntimeConfigManager.SCALE_100
+    };
+    private static final int[] SHADOW_PRESET_MAP = {
+            RuntimeConfigManager.SHADOW_AUTO,
+            RuntimeConfigManager.SHADOW_HALF,
+            RuntimeConfigManager.SHADOW_THREE_QUARTER,
+            RuntimeConfigManager.SHADOW_FULL
+    };
+    private static final int[] FPS_PRESET_MAP = {
+            RuntimeConfigManager.FPS_AUTO,
+            RuntimeConfigManager.FPS_30_COOL,
+            RuntimeConfigManager.FPS_45,
+            RuntimeConfigManager.FPS_60
+    };
 
-    // Selected SAF URIs (in-memory for extraction session; prod.keys is NEVER persisted or logged)
+    // Selected SAF URIs (in-memory only; prod.keys is NEVER persisted or logged)
     private Uri mKeysUri;
     private Uri mBaseUri;
     private Uri mUpdateUri;
     private final ArrayList<Uri> mDlcUris = new ArrayList<>();
 
-    // UI references
-    private TextView mStatusBanner;
-    private TextView mStorageText;
-    private TextView mKeysLabel;
-    private TextView mBaseLabel;
-    private TextView mUpdateLabel;
-    private TextView mDlcsLabel;
-    private ProgressBar mProgressBar;
-    private TextView mProgressText;
-    private Button mBtnExtract;
-    private Button mBtnCancel;
-    private Button mBtnPlay;
+    // Main screen views
+    private LinearLayout mBtnMainPlay;
+    private TextView mTxtMainPlay;
+    private LinearLayout mBtnMainSettings;
+    private LinearLayout mBtnMainImport;
+    private View mStatusDot;
+    private TextView mTxtStatusShort;
+    private TextView mTxtVersionBadge;
 
-    private TextView mDiagGpuText;
-    private TextView mDiagGameText;
-    private TextView mModStatusText;
-    private Button mBtnInstallMod;
-    private Button mBtnRestoreMod;
-    private Switch mDockedSwitch;
+    // Overlays
+    private FrameLayout mOverlaySettings;
+    private FrameLayout mOverlayImport;
+
+    // Settings overlay views
+    private TextView mTabBtnBasic;
+    private TextView mTabBtnAdvanced;
+    private View mTabSettingsBasic;
+    private View mTabSettingsAdvanced;
+    private TextView mBtnPresetAuto;
+    private TextView mBtnPresetLow;
+    private TextView mBtnPresetBalanced;
+    private TextView mBtnPresetHigh;
+    private Spinner mSpRenderScale;
+    private Spinner mSpShadowScale;
+    private Spinner mSpTargetFps;
+    private Spinner mSpMsaaMode;
+    private Switch mSwDockedMode;
+    private LinearLayout mCardSafeSyncStatus;
+    private TextView mTxtSafeSyncCardStatus;
+    private Spinner mSpSafeSync;
+    private TextView mTxtAudioVol;
+    private SeekBar mSeekAudioVol;
+    private Switch mSwOverlay;
+    private Switch mSwRumble;
+    private Switch mSwFpsCounter;
+    private TextView mTxtModStatus;
+    private TextView mBtnInstallMod;
+    private TextView mBtnRestoreMod;
+    private TextView mTxtGpuRamInfo;
+    private Switch mSwRobustAccess;
+    private Switch mSwInlineResolve;
+    private Switch mSwStrictBarriers;
+    private Switch mSwBcCache;
+    private Spinner mSpLowRam;
+    private Spinner mSpLowCostPp;
+
+    // Import overlay views
+    private ImageView mChkKeys;
+    private ImageView mChkBase;
+    private ImageView mChkUpdate;
+    private ImageView mChkDlcs;
+    private TextView mLblPickKeys;
+    private TextView mLblPickBase;
+    private TextView mLblPickUpdate;
+    private TextView mLblPickDlcs;
+    private TextView mTxtImportStatus;
+    private TextView mTxtImportStorage;
+    private ProgressBar mProgImport;
+    private TextView mTxtImportProgress;
+    private TextView mBtnStartExtract;
+    private TextView mBtnCancelExtract;
+    private TextView mBtnReimportClean;
 
     private RuntimeConfigManager.Config mConfig;
     private boolean mUpdatingUi = false;
     private boolean mReceiverRegistered = false;
+    private boolean mDeviceLostPrompted = false;
+    private boolean mReadyToPlay = false;
+    private long mLastHandledExtractEventId = 0L;
     private String mVulkanProbeJson = "";
 
     private final BroadcastReceiver mExtractReceiver = new BroadcastReceiver() {
@@ -113,10 +174,40 @@ public final class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_launcher);
+        applyImmersiveFullscreen();
         mConfig = RuntimeConfigManager.load(this);
-        buildUi();
+        bindViews();
+        wireEvents();
+        syncSettingsUiFromConfig();
         probeVulkanAsync();
         syncCoreIfApkUpdatedAsync();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) applyImmersiveFullscreen();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void applyImmersiveFullscreen() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getWindow().setDecorFitsSystemWindows(false);
+            WindowInsetsController ctl = getWindow().getInsetsController();
+            if (ctl != null) {
+                ctl.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                ctl.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        } else {
+            getWindow().getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        }
     }
 
     @Override
@@ -132,8 +223,10 @@ public final class LauncherActivity extends Activity {
             mReceiverRegistered = true;
         }
         mConfig = RuntimeConfigManager.load(this);
+        syncSettingsUiFromConfig();
         refreshInstallAndStorageStatus();
         updateExtractionUi(ExtractForegroundService.getSnapshot());
+        checkGpuDeviceLostRecovery();
     }
 
     @Override
@@ -148,300 +241,219 @@ public final class LauncherActivity extends Activity {
         super.onPause();
     }
 
-    private void buildUi() {
-        ScrollView scroll = new ScrollView(this);
-        scroll.setBackgroundColor(COL_BG);
-        scroll.setFillViewport(true);
-
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        int pad = dp(16);
-        root.setPadding(pad, dp(24), pad, dp(32));
-        scroll.addView(root, new ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        // ---- Header ----
-        TextView title = makeText("Doraemon Story of Seasons", 22, COL_TEXT, true);
-        TextView sub = makeText(getString(R.string.app_subtitle)
-                + " • v" + BuildConfig.VERSION_NAME + " (ARM64 Unified Mali + Adreno)", 12, COL_MUTED, false);
-        root.addView(title);
-        root.addView(sub, marginTop(4));
-
-        // ---- Card 1: Setup & Extraction ----
-        LinearLayout setupCard = makeCard();
-        setupCard.addView(makeText("1. Setup & Game Extraction (SAF)", 16, COL_TEXT, true));
-
-        mStatusBanner = makeText("Checking game data...", 13, COL_TEXT, true);
-        mStatusBanner.setPadding(dp(10), dp(8), dp(10), dp(8));
-        mStatusBanner.setBackground(makeRoundedBg(Color.parseColor("#1B2D47"), 8));
-        setupCard.addView(mStatusBanner, marginTop(10));
-
-        mStorageText = makeText("Free internal storage: checking...", 12, COL_MUTED, false);
-        setupCard.addView(mStorageText, marginTop(6));
-
-        mBtnPlay = makeButton("PLAY GAME", COL_GREEN);
-        mBtnPlay.setEnabled(false);
-        mBtnPlay.setOnClickListener(v -> launchGame());
-        setupCard.addView(mBtnPlay, marginTop(10));
-
-        // SAF File pickers
-        mKeysLabel = addFilePickerRow(setupCard, "Select prod.keys", "Not selected (required)",
-                v -> openDocumentPicker(REQ_PICK_KEYS, false));
-        mBaseLabel = addFilePickerRow(setupCard, "Select Base NSP", "01008EE0177A8000 (required)",
-                v -> openDocumentPicker(REQ_PICK_BASE, false));
-        mUpdateLabel = addFilePickerRow(setupCard, "Select Update 1.1.2 NSP", "01008EE0177A8800 v262144 (required)",
-                v -> openDocumentPicker(REQ_PICK_UPDATE, false));
-        mDlcsLabel = addFilePickerRow(setupCard, "Select DLC NSPs (0-3)", "Optional (AOC 1, 11, 201 — multi-select)",
-                v -> openDocumentPicker(REQ_PICK_DLCS, true));
-
-        // Extract & Cancel buttons
-        LinearLayout actionRow = new LinearLayout(this);
-        actionRow.setOrientation(LinearLayout.HORIZONTAL);
-        mBtnExtract = makeButton("Extract & Verify", COL_ACCENT);
-        mBtnExtract.setOnClickListener(v -> onExtractClicked());
-        mBtnCancel = makeButton("Cancel", COL_RED);
-        mBtnCancel.setVisibility(View.GONE);
-        mBtnCancel.setOnClickListener(v -> {
-            Intent ci = new Intent(this, ExtractForegroundService.class);
-            ci.setAction(ExtractForegroundService.ACTION_CANCEL);
-            startService(ci);
-        });
-        LinearLayout.LayoutParams lpLeft = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        actionRow.addView(mBtnExtract, lpLeft);
-        LinearLayout.LayoutParams lpRight = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.6f);
-        lpRight.leftMargin = dp(8);
-        actionRow.addView(mBtnCancel, lpRight);
-        setupCard.addView(actionRow, marginTop(12));
-
-        mProgressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        mProgressBar.setMax(100);
-        mProgressBar.setVisibility(View.GONE);
-        setupCard.addView(mProgressBar, marginTop(10));
-
-        mProgressText = makeText("", 12, COL_MUTED, false);
-        mProgressText.setVisibility(View.GONE);
-        setupCard.addView(mProgressText, marginTop(4));
-
-        root.addView(setupCard, marginTop(14));
-
-        // ---- Card 2: Runtime Settings ----
-        LinearLayout settingsCard = makeCard();
-        settingsCard.addView(makeText("2. Runtime Settings (env.txt & settings.txt)", 16, COL_TEXT, true));
-        settingsCard.addView(makeText("Every switch directly controls libdmhost.so. Gamepad button layout can also be customized live in the in-game Pause Menu.", 11, COL_MUTED, false), marginTop(4));
-
-        // Render Scale spinner (0.75x / 0.85x Balanced 60 FPS / 1.0x Native / 1.25x Docked 1080p HQ)
-        final int[] scalePresetMap = {
-                RuntimeConfigManager.SCALE_075,
-                RuntimeConfigManager.SCALE_085,
-                RuntimeConfigManager.SCALE_100,
-                RuntimeConfigManager.SCALE_125
-        };
-        int initScaleIdx = 2; // default 1.0x
-        for (int i = 0; i < scalePresetMap.length; i++) {
-            if (scalePresetMap[i] == mConfig.renderScalePreset) {
-                initScaleIdx = i;
-                break;
-            }
+    @Override
+    public void onBackPressed() {
+        if (mOverlaySettings != null && mOverlaySettings.getVisibility() == View.VISIBLE) {
+            mOverlaySettings.setVisibility(View.GONE);
+            return;
         }
-        addSpinnerRow(settingsCard, "Render Scale",
-                new String[]{"0.75x (Performance)", "0.85x (Balanced 60 FPS)", "1.0x (Native)", "1.25x (Docked 1080p HQ)"},
-                initScaleIdx,
-                pos -> {
-                    int preset = (pos >= 0 && pos < scalePresetMap.length) ? scalePresetMap[pos] : RuntimeConfigManager.SCALE_100;
-                    mConfig.renderScalePreset = preset;
-                    if (preset == RuntimeConfigManager.SCALE_125 && !mConfig.dockedMode) {
-                        mConfig.dockedMode = true;
-                        if (mDockedSwitch != null) {
-                            mUpdatingUi = true;
-                            mDockedSwitch.setChecked(true);
-                            mUpdatingUi = false;
-                        }
-                    }
-                    persistConfig();
-                });
+        if (mOverlayImport != null && mOverlayImport.getVisibility() == View.VISIBLE) {
+            mOverlayImport.setVisibility(View.GONE);
+            return;
+        }
+        super.onBackPressed();
+    }
 
-        // Target FPS spinner with explicit real 60 FPS unlock & Mali-G720 Handheld 720p recommendation
-        Spinner fpsSpinner = addSpinnerRow(settingsCard, "Target FPS",
-                new String[]{"30 FPS (Default / Switch Native)", "60 FPS Unlock (Rec: Handheld 720p + 0.85x–1.0x)"},
-                mConfig.targetFps == 60 ? 1 : 0,
-                null);
-        fpsSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
-                if (mUpdatingUi) return;
-                if (pos == 1 && mConfig.targetFps != 60) {
-                    new AlertDialog.Builder(LauncherActivity.this)
-                            .setTitle("60 FPS Unlock (DM_PRESENT_INTERVAL=display)")
-                            .setMessage("Doraemon Story of Seasons natively locks to 30 FPS via Unity vSyncCount=2. "
-                                    + "Enabling 60 FPS forces DM_PRESENT_INTERVAL=display, DM_FPS_CEILING=0, DM_FPS_HOLD=off, "
-                                    + "and pairs with Mali Copied-Pool Overlap (DM_VK_POOL_OVERLAP=1).\n\n"
-                                    + "• Recommended for stable 60 FPS on Mali-G720: keep Docked Mode OFF (Handheld 720p) "
-                                    + "and use Render Scale 0.85x–1.0x (GPU p50 ~11–13.5 ms < 16.67 ms budget).\n"
-                                    + "• Cutscenes/UI timers tied to frame counts may run faster.\n\n"
-                                    + "Enable 60 FPS unlock?")
-                            .setPositiveButton("Enable 60 FPS", (d, w) -> {
-                                mConfig.targetFps = 60;
-                                persistConfig();
-                            })
-                            .setNegativeButton("Keep 30 FPS", (d, w) -> {
-                                mUpdatingUi = true;
-                                fpsSpinner.setSelection(0);
-                                mUpdatingUi = false;
-                            })
-                            .setCancelable(false)
-                            .show();
-                } else if (pos == 0 && mConfig.targetFps != 30) {
-                    mConfig.targetFps = 30;
-                    persistConfig();
-                }
+    private void bindViews() {
+        mBtnMainPlay = findViewById(R.id.btn_main_play);
+        mTxtMainPlay = findViewById(R.id.txt_main_play);
+        mBtnMainSettings = findViewById(R.id.btn_main_settings);
+        mBtnMainImport = findViewById(R.id.btn_main_import);
+        mStatusDot = findViewById(R.id.status_dot);
+        mTxtStatusShort = findViewById(R.id.txt_status_short);
+        mTxtVersionBadge = findViewById(R.id.txt_version_badge);
+        if (mTxtVersionBadge != null) {
+            mTxtVersionBadge.setText("FOTGK");
+        }
+
+        mOverlaySettings = findViewById(R.id.overlay_settings);
+        mOverlayImport = findViewById(R.id.overlay_import);
+
+        // Settings views
+        mTabBtnBasic = findViewById(R.id.tab_btn_basic);
+        mTabBtnAdvanced = findViewById(R.id.tab_btn_advanced);
+        mTabSettingsBasic = findViewById(R.id.tab_settings_basic);
+        mTabSettingsAdvanced = findViewById(R.id.tab_settings_advanced);
+        mBtnPresetAuto = findViewById(R.id.btn_preset_auto);
+        mBtnPresetLow = findViewById(R.id.btn_preset_low);
+        mBtnPresetBalanced = findViewById(R.id.btn_preset_balanced);
+        mBtnPresetHigh = findViewById(R.id.btn_preset_high);
+
+        mSpRenderScale = findViewById(R.id.sp_render_scale);
+        mSpShadowScale = findViewById(R.id.sp_shadow_scale);
+        mSpTargetFps = findViewById(R.id.sp_target_fps);
+        mSpMsaaMode = findViewById(R.id.sp_msaa_mode);
+        mSwDockedMode = findViewById(R.id.sw_docked_mode);
+        mCardSafeSyncStatus = findViewById(R.id.card_safe_sync_status);
+        mTxtSafeSyncCardStatus = findViewById(R.id.txt_safe_sync_card_status);
+        mSpSafeSync = findViewById(R.id.sp_safe_sync);
+        mTxtAudioVol = findViewById(R.id.txt_audio_vol);
+        mSeekAudioVol = findViewById(R.id.seek_audio_vol);
+        mSwOverlay = findViewById(R.id.sw_overlay);
+        mSwRumble = findViewById(R.id.sw_rumble);
+        mSwFpsCounter = findViewById(R.id.sw_fps_counter);
+        mTxtModStatus = findViewById(R.id.txt_mod_status);
+        mBtnInstallMod = findViewById(R.id.btn_install_mod);
+        mBtnRestoreMod = findViewById(R.id.btn_restore_mod);
+
+        mTxtGpuRamInfo = findViewById(R.id.txt_gpu_ram_info);
+        mSwRobustAccess = findViewById(R.id.sw_robust_access);
+        mSwInlineResolve = findViewById(R.id.sw_inline_resolve);
+        mSwStrictBarriers = findViewById(R.id.sw_strict_barriers);
+        mSwBcCache = findViewById(R.id.sw_bc_cache);
+        mSpLowRam = findViewById(R.id.sp_low_ram);
+        mSpLowCostPp = findViewById(R.id.sp_low_cost_pp);
+
+        // Import views
+        mChkKeys = findViewById(R.id.chk_keys);
+        mChkBase = findViewById(R.id.chk_base);
+        mChkUpdate = findViewById(R.id.chk_update);
+        mChkDlcs = findViewById(R.id.chk_dlcs);
+        mLblPickKeys = findViewById(R.id.lbl_pick_keys);
+        mLblPickBase = findViewById(R.id.lbl_pick_base);
+        mLblPickUpdate = findViewById(R.id.lbl_pick_update);
+        mLblPickDlcs = findViewById(R.id.lbl_pick_dlcs);
+        mTxtImportStatus = findViewById(R.id.txt_import_status);
+        mTxtImportStorage = findViewById(R.id.txt_import_storage);
+        mProgImport = findViewById(R.id.prog_import);
+        mTxtImportProgress = findViewById(R.id.txt_import_progress);
+        mBtnStartExtract = findViewById(R.id.btn_start_extract);
+        mBtnCancelExtract = findViewById(R.id.btn_cancel_extract);
+        mBtnReimportClean = findViewById(R.id.btn_reimport_clean);
+
+        // Setup Spinners with localized strings (auto-detects EN / ID via system locale)
+        setupSpinner(mSpRenderScale, new String[]{
+                getString(R.string.sp_scale_auto),
+                getString(R.string.sp_scale_050),
+                getString(R.string.sp_scale_055),
+                getString(R.string.sp_scale_067),
+                getString(R.string.sp_scale_075),
+                getString(R.string.sp_scale_100)
+        });
+        setupSpinner(mSpShadowScale, new String[]{
+                getString(R.string.sp_shadow_auto),
+                getString(R.string.sp_shadow_050),
+                getString(R.string.sp_shadow_075),
+                getString(R.string.sp_shadow_100)
+        });
+        setupSpinner(mSpTargetFps, new String[]{
+                getString(R.string.sp_fps_auto),
+                getString(R.string.sp_fps_30),
+                getString(R.string.sp_fps_45),
+                getString(R.string.sp_fps_60)
+        });
+        setupSpinner(mSpMsaaMode, new String[]{
+                getString(R.string.sp_msaa_auto),
+                getString(R.string.sp_msaa_off),
+                getString(R.string.sp_msaa_on)
+        });
+        setupSpinner(mSpSafeSync, new String[]{
+                getString(R.string.sp_safe_sync_mode2),
+                getString(R.string.sp_safe_sync_mode1)
+        });
+        setupSpinner(mSpLowRam, new String[]{
+                getString(R.string.sp_low_ram_auto),
+                getString(R.string.sp_low_ram_std),
+                getString(R.string.sp_low_ram_4gb),
+                getString(R.string.sp_low_ram_3gb)
+        });
+        setupSpinner(mSpLowCostPp, new String[]{
+                getString(R.string.sp_low_cost_pp_auto),
+                getString(R.string.sp_low_cost_pp_on),
+                getString(R.string.sp_low_cost_pp_off)
+        });
+    }
+
+    private void setupSpinner(Spinner sp, String[] items) {
+        ArrayAdapter<String> ad = new ArrayAdapter<>(this, R.layout.item_spinner_wood, items);
+        ad.setDropDownViewResource(R.layout.item_spinner_wood_dropdown);
+        sp.setAdapter(ad);
+    }
+
+    private void wireEvents() {
+        // Main 3 Buttons
+        mBtnMainPlay.setOnClickListener(v -> {
+            if (!mReadyToPlay) {
+                openImportOverlay();
+                Toast.makeText(this, R.string.toast_import_first, Toast.LENGTH_SHORT).show();
+            } else {
+                launchGame();
             }
-
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {}
         });
+        mBtnMainSettings.setOnClickListener(v -> openSettingsOverlay());
+        mBtnMainImport.setOnClickListener(v -> openImportOverlay());
 
-        // Docked / Handheld switch
-        mDockedSwitch = addSwitchRow(settingsCard, "Docked Mode (1080p vs 720p Handheld)", mConfig.dockedMode, checked -> {
+        // Overlay scrim & close buttons
+        mOverlaySettings.setOnClickListener(v -> mOverlaySettings.setVisibility(View.GONE));
+        findViewById(R.id.btn_close_settings).setOnClickListener(v -> mOverlaySettings.setVisibility(View.GONE));
+        mOverlayImport.setOnClickListener(v -> mOverlayImport.setVisibility(View.GONE));
+        findViewById(R.id.btn_close_import).setOnClickListener(v -> mOverlayImport.setVisibility(View.GONE));
+
+        // Settings Tabs
+        mTabBtnBasic.setOnClickListener(v -> showSettingsTab(false));
+        mTabBtnAdvanced.setOnClickListener(v -> showSettingsTab(true));
+
+        // 4 Quick Presets (1-Click)
+        mBtnPresetAuto.setOnClickListener(v -> applyPresetFromUi(RuntimeConfigManager.PRESET_AUTO, R.string.toast_preset_auto));
+        mBtnPresetLow.setOnClickListener(v -> applyPresetFromUi(RuntimeConfigManager.PRESET_LOW_END, R.string.toast_preset_low));
+        mBtnPresetBalanced.setOnClickListener(v -> applyPresetFromUi(RuntimeConfigManager.PRESET_BALANCED, R.string.toast_preset_balanced));
+        mBtnPresetHigh.setOnClickListener(v -> applyPresetFromUi(RuntimeConfigManager.PRESET_HIGH, R.string.toast_preset_high));
+
+        // Basic Settings listeners
+        onSpinnerSelect(mSpRenderScale, pos -> {
+            mConfig.renderScalePreset = (pos >= 0 && pos < SCALE_PRESET_MAP.length)
+                    ? SCALE_PRESET_MAP[pos] : RuntimeConfigManager.SCALE_AUTO;
+            updatePresetHighlight();
+            persistConfig();
+        });
+        onSpinnerSelect(mSpShadowScale, pos -> {
+            mConfig.shadowScaleMode = (pos >= 0 && pos < SHADOW_PRESET_MAP.length)
+                    ? SHADOW_PRESET_MAP[pos] : RuntimeConfigManager.SHADOW_AUTO;
+            updatePresetHighlight();
+            persistConfig();
+        });
+        onSpinnerSelect(mSpTargetFps, pos -> {
+            mConfig.targetFps = (pos >= 0 && pos < FPS_PRESET_MAP.length)
+                    ? FPS_PRESET_MAP[pos] : RuntimeConfigManager.FPS_AUTO;
+            updatePresetHighlight();
+            persistConfig();
+        });
+        onSpinnerSelect(mSpMsaaMode, pos -> {
+            mConfig.msaaMode = pos;
+            updatePresetHighlight();
+            persistConfig();
+        });
+        mSwDockedMode.setOnCheckedChangeListener((b, checked) -> {
+            if (mUpdatingUi) return;
             mConfig.dockedMode = checked;
+            updatePresetHighlight();
             persistConfig();
         });
-
-        // Audio Volume SeekBar
-        addSeekBarRow(settingsCard, "Audio Volume (DM_AUDIO_VOLUME)", 0, 100, mConfig.audioVolumePct, "%", val -> {
-            mConfig.audioVolumePct = val;
+        onSpinnerSelect(mSpSafeSync, pos -> {
+            mConfig.poolSafeSyncMode = (pos == 1)
+                    ? RuntimeConfigManager.SAFE_SYNC_PIPELINED
+                    : RuntimeConfigManager.SAFE_SYNC_SERIAL_DBG;
+            updateSafeSyncStatusCard();
             persistConfig();
         });
-
-        // Virtual Gamepad switches
-        addSwitchRow(settingsCard, "Virtual On-Screen Gamepad", mConfig.overlayEnabled, checked -> {
-            mConfig.overlayEnabled = checked;
-            persistConfig();
+        mSeekAudioVol.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                mTxtAudioVol.setText(getString(R.string.lbl_audio_vol_fmt, progress));
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                if (mUpdatingUi) return;
+                mConfig.audioVolumePct = seekBar.getProgress();
+                persistConfig();
+            }
         });
-        addSeekBarRow(settingsCard, "Virtual Gamepad Opacity", 20, 80, mConfig.overlayOpacity, "%", val -> {
-            mConfig.overlayOpacity = val;
-            persistConfig();
-        });
-        addSwitchRow(settingsCard, "Controller Rumble & Tap Haptics", mConfig.rumbleEnabled, checked -> {
-            mConfig.rumbleEnabled = checked;
-            persistConfig();
-        });
-        addSwitchRow(settingsCard, "In-Game FPS Counter", mConfig.fpsCounter, checked -> {
-            mConfig.fpsCounter = checked;
-            persistConfig();
-        });
+        mSwOverlay.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.overlayEnabled = checked; persistConfig(); } });
+        mSwRumble.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.rumbleEnabled = checked; persistConfig(); } });
+        mSwFpsCounter.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.fpsCounter = checked; persistConfig(); } });
 
-        // Mali / Vulkan Advanced Settings
-        addSwitchRow(settingsCard, "Mali Persistent BC Texture Disk Cache", mConfig.bcDiskCache, checked -> {
-            mConfig.bcDiskCache = checked;
-            persistConfig();
-        });
-        addSpinnerRow(settingsCard, "2x MSAA Render Targets",
-                new String[]{"Native 2x MSAA (Default / Accurate)", "Disable MSAA 1x (Experimental)", "Force Native 2x MSAA (Explicit)"},
-                mConfig.msaaMode,
-                pos -> {
-                    mConfig.msaaMode = pos;
-                    persistConfig();
-                });
-        addSwitchRow(settingsCard, "Async NVN Replay Thread (Experimental • Big-Core)", mConfig.asyncReplay, checked -> {
-            mConfig.asyncReplay = checked;
-            persistConfig();
-        });
-        addSpinnerRow(settingsCard, "Vulkan Zero-Copy Quirk (Mali M1)",
-                new String[]{"Auto (Mali=Safe / Adreno=ZeroCopy)", "Force Safe Mode (NO_ZEROCOPY=1)", "Force Zero-Copy (NO_ZEROCOPY=0)"},
-                mConfig.zeroCopyQuirk,
-                pos -> {
-                    mConfig.zeroCopyQuirk = pos;
-                    persistConfig();
-                });
-
-        // Mali TBDR / Visual & Sync Diagnostics (v1.1.2-hybrid7)
-        settingsCard.addView(makeText("Mali TBDR / Visual & Sync Diagnostics (A/B)", 13, COL_ACCENT, true), marginTop(14));
-        addSpinnerRow(settingsCard, "2x MSAA Alpha-To-Coverage (Foliage Solid Fix)",
-                new String[]{"Auto (Mali=Solid Cutout / Adreno=Native A2C)", "Disable A2C (Solid Cutout Trees)", "Force Native A2C (Debug)"},
-                mConfig.a2cMode,
-                pos -> {
-                    mConfig.a2cMode = pos;
-                    persistConfig();
-                });
-        addSwitchRow(settingsCard, "Mali Pool CPU-GPU Overlap (DM_VK_POOL_OVERLAP — Cuts fence_wait for 60 FPS)",
-                mConfig.poolOverlap, checked -> {
-                    mConfig.poolOverlap = checked;
-                    persistConfig();
-                });
-        addSwitchRow(settingsCard, "Strict Pool Sync (DM_VK_POOL_SAFE_SYNC — Disables Overlap/Hot-Blocks, 30 FPS)",
-                mConfig.poolSafeSync, checked -> {
-                    mConfig.poolSafeSync = checked;
-                    persistConfig();
-                });
-        addSwitchRow(settingsCard, "Strict Vulkan Barriers (DM_VK_STRICT_BARRIERS — VkRenderPass2, No Clear-Fold)",
-                mConfig.strictBarriers, checked -> {
-                    mConfig.strictBarriers = checked;
-                    persistConfig();
-                });
-        addSwitchRow(settingsCard, "FirstInstance Emulation (DM_VK_EMU_FIRST_INSTANCE — Mali Divisor Fix)",
-                mConfig.emuFirstInstance, checked -> {
-                    mConfig.emuFirstInstance = checked;
-                    persistConfig();
-                });
-        addSwitchRow(settingsCard, "1-Shot 3D Render-Graph Dump (DM_VK_DUMP_3D_FRAME — Logs 1 Frame to log.txt)",
-                mConfig.dump3dFrame, checked -> {
-                    mConfig.dump3dFrame = checked;
-                    persistConfig();
-                });
-
-        root.addView(settingsCard, marginTop(14));
-
-        // ---- Card 3: Diagnostics, Logs & Saves ----
-        LinearLayout diagCard = makeCard();
-        diagCard.addView(makeText("3. Diagnostics, Logs & Save Data", 16, COL_TEXT, true));
-
-        mDiagGpuText = makeText("Probing Vulkan GPU capabilities...", 12, COL_MUTED, false);
-        mDiagGpuText.setTypeface(Typeface.MONOSPACE);
-        diagCard.addView(mDiagGpuText, marginTop(8));
-
-        mDiagGameText = makeText("Inspecting installation manifest...", 12, COL_MUTED, false);
-        mDiagGameText.setTypeface(Typeface.MONOSPACE);
-        diagCard.addView(mDiagGameText, marginTop(8));
-
-        Button btnLog = makeButton("Export Runtime & Crash Log (.txt)", Color.parseColor("#37474F"));
-        btnLog.setOnClickListener(v -> startCreateDocument(REQ_EXPORT_LOG, "text/plain",
-                "doraemon_hybrid_log_" + timestampSlug() + ".txt"));
-        diagCard.addView(btnLog, marginTop(12));
-
-        LinearLayout saveRow = new LinearLayout(this);
-        saveRow.setOrientation(LinearLayout.HORIZONTAL);
-        Button btnBackup = makeButton("Backup Save (.zip)", Color.parseColor("#00695C"));
-        btnBackup.setOnClickListener(v -> startCreateDocument(REQ_BACKUP_SAVE, "application/zip",
-                "doraemon_save_" + timestampSlug() + ".zip"));
-        Button btnRestore = makeButton("Restore Save (.zip)", Color.parseColor("#4E342E"));
-        btnRestore.setOnClickListener(v -> {
-            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-            i.addCategory(Intent.CATEGORY_OPENABLE);
-            i.setType("application/zip");
-            startActivityForResult(i, REQ_RESTORE_SAVE);
-        });
-        LinearLayout.LayoutParams sLp1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        LinearLayout.LayoutParams sLp2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        sLp2.leftMargin = dp(8);
-        saveRow.addView(btnBackup, sLp1);
-        saveRow.addView(btnRestore, sLp2);
-        diagCard.addView(saveRow, marginTop(8));
-
-        root.addView(diagCard, marginTop(14));
-
-        // ---- Card 4: Mod Bahasa Indonesia / RomFS Overlay (.zip) ----
-        LinearLayout modCard = makeCard();
-        modCard.addView(makeText("4. Mod Bahasa Indonesia / RomFS Overlay (.zip)", 16, COL_TEXT, true));
-        modCard.addView(makeText("Applies mod .zip directly into game_data/RomFS/ with automatic first-time backup of original files (romfs_orig_backup/) so you can restore original in 1 second without re-extracting NSP.", 11, COL_MUTED, false), marginTop(4));
-
-        mModStatusText = makeText("Status: Original RomFS (no mod active)", 12, COL_TEXT, true);
-        mModStatusText.setPadding(dp(10), dp(8), dp(10), dp(8));
-        mModStatusText.setBackground(makeRoundedBg(Color.parseColor("#1B2D47"), 8));
-        modCard.addView(mModStatusText, marginTop(10));
-
-        LinearLayout modRow = new LinearLayout(this);
-        modRow.setOrientation(LinearLayout.HORIZONTAL);
-        mBtnInstallMod = makeButton("Install Mod (.zip)", Color.parseColor("#1565C0"));
+        // Mod buttons
         mBtnInstallMod.setOnClickListener(v -> {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             i.addCategory(Intent.CATEGORY_OPENABLE);
@@ -449,18 +461,167 @@ public final class LauncherActivity extends Activity {
             i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/zip", "application/x-zip-compressed", "application/octet-stream"});
             startActivityForResult(i, REQ_INSTALL_MOD);
         });
-        mBtnRestoreMod = makeButton("Disable / Restore Original", Color.parseColor("#6A1B9A"));
         mBtnRestoreMod.setOnClickListener(v -> confirmRestoreOriginalRomfs());
 
-        LinearLayout.LayoutParams mLp1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        LinearLayout.LayoutParams mLp2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        mLp2.leftMargin = dp(8);
-        modRow.addView(mBtnInstallMod, mLp1);
-        modRow.addView(mBtnRestoreMod, mLp2);
-        modCard.addView(modRow, marginTop(10));
+        // Advanced & Diagnostics buttons
+        findViewById(R.id.btn_export_log).setOnClickListener(v -> startCreateDocument(
+                REQ_EXPORT_LOG, "text/plain", "doraemon_hybrid_log_" + timestampSlug() + ".txt"));
+        findViewById(R.id.btn_backup_save).setOnClickListener(v -> startCreateDocument(
+                REQ_BACKUP_SAVE, "application/zip", "doraemon_save_" + timestampSlug() + ".zip"));
+        findViewById(R.id.btn_restore_save).setOnClickListener(v -> {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("application/zip");
+            startActivityForResult(i, REQ_RESTORE_SAVE);
+        });
+        findViewById(R.id.btn_reset_defaults).setOnClickListener(v -> new AlertDialog.Builder(this)
+                .setTitle(R.string.dlg_reset_title)
+                .setMessage(R.string.dlg_reset_msg)
+                .setPositiveButton(R.string.btn_reset, (d, w) -> {
+                    mConfig = RuntimeConfigManager.createDefaultConfig();
+                    syncSettingsUiFromConfig();
+                    persistConfig();
+                    Toast.makeText(this, R.string.toast_reset_done, Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton(R.string.btn_cancel, null)
+                .show());
 
-        root.addView(modCard, marginTop(14));
-        setContentView(scroll);
+        // Advanced switches
+        mSwRobustAccess.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.robustAccess = checked; persistConfig(); } });
+        mSwInlineResolve.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.inlineResolve = checked; persistConfig(); } });
+        mSwStrictBarriers.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.strictBarriers = checked; persistConfig(); } });
+        mSwBcCache.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.bcDiskCache = checked; persistConfig(); } });
+        onSpinnerSelect(mSpLowRam, pos -> { mConfig.lowRamMode = pos; persistConfig(); });
+        onSpinnerSelect(mSpLowCostPp, pos -> { mConfig.lowCostPpMode = pos; persistConfig(); });
+
+        // Import panel file pickers & actions
+        findViewById(R.id.row_pick_keys).setOnClickListener(v -> openDocumentPicker(REQ_PICK_KEYS, false));
+        findViewById(R.id.row_pick_base).setOnClickListener(v -> openDocumentPicker(REQ_PICK_BASE, false));
+        findViewById(R.id.row_pick_update).setOnClickListener(v -> openDocumentPicker(REQ_PICK_UPDATE, false));
+        findViewById(R.id.row_pick_dlcs).setOnClickListener(v -> openDocumentPicker(REQ_PICK_DLCS, true));
+        mBtnStartExtract.setOnClickListener(v -> onExtractClicked());
+        mBtnCancelExtract.setOnClickListener(v -> {
+            Intent ci = new Intent(this, ExtractForegroundService.class);
+            ci.setAction(ExtractForegroundService.ACTION_CANCEL);
+            startService(ci);
+        });
+        mBtnReimportClean.setOnClickListener(v -> confirmCleanGameData());
+    }
+
+    private interface IntConsumer { void accept(int pos); }
+
+    private void onSpinnerSelect(Spinner sp, IntConsumer cb) {
+        sp.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                if (!mUpdatingUi) cb.accept(pos);
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+    }
+
+    private void openSettingsOverlay() {
+        mOverlayImport.setVisibility(View.GONE);
+        syncSettingsUiFromConfig();
+        showSettingsTab(false);
+        mOverlaySettings.setVisibility(View.VISIBLE);
+    }
+
+    private void openImportOverlay() {
+        mOverlaySettings.setVisibility(View.GONE);
+        refreshInstallAndStorageStatus();
+        mOverlayImport.setVisibility(View.VISIBLE);
+    }
+
+    private void showSettingsTab(boolean advanced) {
+        mTabSettingsBasic.setVisibility(advanced ? View.GONE : View.VISIBLE);
+        mTabSettingsAdvanced.setVisibility(advanced ? View.VISIBLE : View.GONE);
+        stylePill(mTabBtnBasic, !advanced);
+        stylePill(mTabBtnAdvanced, advanced);
+    }
+
+    private void applyPresetFromUi(int preset, int toastResId) {
+        RuntimeConfigManager.applyQuickPreset(mConfig, preset);
+        syncSettingsUiFromConfig();
+        persistConfig();
+        Toast.makeText(this, toastResId, Toast.LENGTH_SHORT).show();
+    }
+
+    private void updateSafeSyncStatusCard() {
+        if (mTxtSafeSyncCardStatus == null || mCardSafeSyncStatus == null) return;
+        boolean expMode1 = (mConfig.poolSafeSyncMode == RuntimeConfigManager.SAFE_SYNC_PIPELINED);
+        if (expMode1) {
+            mCardSafeSyncStatus.setBackgroundColor(Color.parseColor("#FDF1DC"));
+            mTxtSafeSyncCardStatus.setText(R.string.lbl_safe_sync_card_exp);
+            mTxtSafeSyncCardStatus.setTextColor(Color.parseColor("#9B4D18"));
+        } else {
+            mCardSafeSyncStatus.setBackgroundColor(Color.parseColor("#EBF5E6"));
+            mTxtSafeSyncCardStatus.setText(R.string.lbl_safe_sync_card_active);
+            mTxtSafeSyncCardStatus.setTextColor(Color.parseColor("#2E6120"));
+        }
+    }
+
+    private void syncSettingsUiFromConfig() {
+        mUpdatingUi = true;
+        int scaleIdx = 0;
+        for (int i = 0; i < SCALE_PRESET_MAP.length; i++) {
+            if (SCALE_PRESET_MAP[i] == mConfig.renderScalePreset) { scaleIdx = i; break; }
+        }
+        if (mConfig.renderScalePreset == RuntimeConfigManager.SCALE_085) scaleIdx = 4;
+        if (mConfig.renderScalePreset == RuntimeConfigManager.SCALE_125) scaleIdx = 5;
+        mSpRenderScale.setSelection(scaleIdx);
+
+        int shadowIdx = 0;
+        for (int i = 0; i < SHADOW_PRESET_MAP.length; i++) {
+            if (SHADOW_PRESET_MAP[i] == mConfig.shadowScaleMode) { shadowIdx = i; break; }
+        }
+        mSpShadowScale.setSelection(shadowIdx);
+
+        int fpsIdx = 0;
+        for (int i = 0; i < FPS_PRESET_MAP.length; i++) {
+            if (FPS_PRESET_MAP[i] == mConfig.targetFps) { fpsIdx = i; break; }
+        }
+        mSpTargetFps.setSelection(fpsIdx);
+        mSpMsaaMode.setSelection(Math.max(0, Math.min(2, mConfig.msaaMode)));
+        mSwDockedMode.setChecked(mConfig.dockedMode);
+        mSpSafeSync.setSelection(mConfig.poolSafeSyncMode == RuntimeConfigManager.SAFE_SYNC_PIPELINED ? 1 : 0);
+        updateSafeSyncStatusCard();
+        mSeekAudioVol.setProgress(mConfig.audioVolumePct);
+        mTxtAudioVol.setText(getString(R.string.lbl_audio_vol_fmt, mConfig.audioVolumePct));
+        mSwOverlay.setChecked(mConfig.overlayEnabled);
+        mSwRumble.setChecked(mConfig.rumbleEnabled);
+        mSwFpsCounter.setChecked(mConfig.fpsCounter);
+
+        mSwRobustAccess.setChecked(mConfig.robustAccess);
+        mSwInlineResolve.setChecked(mConfig.inlineResolve);
+        mSwStrictBarriers.setChecked(mConfig.strictBarriers);
+        mSwBcCache.setChecked(mConfig.bcDiskCache);
+        mSpLowRam.setSelection(Math.max(0, Math.min(3, mConfig.lowRamMode)));
+        mSpLowCostPp.setSelection(Math.max(0, Math.min(2, mConfig.lowCostPpMode)));
+        updatePresetHighlight();
+        mUpdatingUi = false;
+    }
+
+    private void updatePresetHighlight() {
+        int active = RuntimeConfigManager.detectQuickPreset(mConfig);
+        stylePill(mBtnPresetAuto, active == RuntimeConfigManager.PRESET_AUTO);
+        stylePill(mBtnPresetLow, active == RuntimeConfigManager.PRESET_LOW_END);
+        stylePill(mBtnPresetBalanced, active == RuntimeConfigManager.PRESET_BALANCED);
+        stylePill(mBtnPresetHigh, active == RuntimeConfigManager.PRESET_HIGH);
+    }
+
+    private void stylePill(TextView tv, boolean active) {
+        if (tv == null) return;
+        tv.setBackgroundResource(active ? R.drawable.bg_preset_active : R.drawable.bg_preset_idle);
+        tv.setTextColor(active ? Color.parseColor("#FFFDF5") : Color.parseColor("#5C3919"));
+    }
+
+    private void setDotColor(int color) {
+        if (mStatusDot == null) return;
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.OVAL);
+        d.setColor(color);
+        mStatusDot.setBackground(d);
     }
 
     private void probeVulkanAsync() {
@@ -469,9 +630,36 @@ public final class LauncherActivity extends Activity {
                     ? NativeBridge.nativeProbeVulkan()
                     : "{\"available\":false,\"error\":\"libnxhybrid_extract.so not loaded\"}";
             mVulkanProbeJson = json;
-            String formatted = formatVulkanProbe(json);
-            runOnUiThread(() -> mDiagGpuText.setText(formatted));
+            String formatted = buildShortGpuRamSummary(json);
+            runOnUiThread(() -> {
+                if (mTxtGpuRamInfo != null) mTxtGpuRamInfo.setText(formatted);
+            });
         }, "vk-probe").start();
+    }
+
+    private String buildShortGpuRamSummary(String json) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            JSONObject j = new JSONObject(json);
+            if (j.optBoolean("available", false)) {
+                sb.append("GPU : ").append(j.optString("gpu_name")).append("\n");
+                sb.append("API : Vulkan ").append(j.optString("vulkan_api"))
+                        .append(" (Drv ").append(j.optString("driver_version")).append(")\n");
+            } else {
+                sb.append(getString(R.string.gpu_not_available)).append("\n");
+            }
+        } catch (Exception e) {
+            sb.append(getString(R.string.gpu_probe_error)).append("\n");
+        }
+        ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+        if (am != null) {
+            ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+            am.getMemoryInfo(mi);
+            sb.append(getString(R.string.ram_summary_fmt,
+                    mi.totalMem / 1073741824.0, mi.availMem / 1073741824.0)).append("\n");
+        }
+        sb.append("APK : v").append(BuildConfig.VERSION_NAME).append(" (code ").append(BuildConfig.VERSION_CODE).append(")");
+        return sb.toString();
     }
 
     private void syncCoreIfApkUpdatedAsync() {
@@ -483,7 +671,7 @@ public final class LauncherActivity extends Activity {
                     RuntimeConfigManager.applyToGameData(this, RuntimeConfigManager.load(this), null);
                 } catch (Exception e) {
                     runOnUiThread(() -> Toast.makeText(this,
-                            "Core asset sync error: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                            getString(R.string.toast_core_sync_fail, e.getMessage()), Toast.LENGTH_LONG).show());
                 }
             }
             runOnUiThread(this::refreshInstallAndStorageStatus);
@@ -493,87 +681,120 @@ public final class LauncherActivity extends Activity {
     private void refreshInstallAndStorageStatus() {
         CoreAssetSync.Status st = CoreAssetSync.inspectStatus(this);
         boolean extracting = ExtractForegroundService.isRunning();
+        mReadyToPlay = st.readyToPlay && !extracting;
 
-        mStatusBanner.setText(st.summary);
-        mStatusBanner.setBackground(makeRoundedBg(
-                st.readyToPlay ? COL_GREEN : (st.gameExtracted ? COL_AMBER : Color.parseColor("#1B2D47")), 8));
+        // Minimalist status pill & PLAY / IMPORT button styling on Main Screen
+        if (extracting) {
+            setDotColor(Color.parseColor("#DF7E15"));
+            mTxtStatusShort.setText(R.string.status_importing);
+            mTxtMainPlay.setText(R.string.btn_play_waiting_import);
+            mBtnMainImport.setBackgroundResource(R.drawable.bg_btn_import_highlight);
+        } else if (mReadyToPlay) {
+            setDotColor(Color.parseColor("#4E8C3B"));
+            String ver = st.displayVersion != null ? st.displayVersion : "1.1.2";
+            mTxtStatusShort.setText(getString(R.string.status_ready_fmt, ver));
+            mTxtMainPlay.setText(R.string.btn_play);
+            mBtnMainImport.setBackgroundResource(R.drawable.bg_btn_parchment);
+        } else {
+            setDotColor(Color.parseColor("#DF7E15"));
+            mTxtStatusShort.setText(R.string.status_not_imported);
+            mTxtMainPlay.setText(R.string.btn_play_import_first);
+            mBtnMainImport.setBackgroundResource(R.drawable.bg_btn_import_highlight);
+        }
 
-        // Strict Play button gate: disabled until BOTH .ready.json AND .core_assets.json verified intact
-        mBtnPlay.setEnabled(st.readyToPlay && !extracting);
-        mBtnPlay.setAlpha((st.readyToPlay && !extracting) ? 1.0f : 0.45f);
+        // Import panel status & storage
+        if (st.readyToPlay) {
+            mTxtImportStatus.setText(getString(R.string.import_status_ready_fmt,
+                    st.displayVersion != null ? st.displayVersion : "1.1.2",
+                    st.romfsFiles,
+                    st.aocSummary != null ? st.aocSummary : "0"));
+            mTxtImportStatus.setTextColor(Color.parseColor("#2E6120"));
+            mBtnStartExtract.setText(R.string.btn_reimport_add_dlc);
+            mBtnReimportClean.setVisibility(extracting ? View.GONE : View.VISIBLE);
+        } else if (st.gameExtracted) {
+            mTxtImportStatus.setText(R.string.import_status_syncing);
+            mTxtImportStatus.setTextColor(Color.parseColor("#8A4B08"));
+            mBtnStartExtract.setText(R.string.btn_start_extract);
+            mBtnReimportClean.setVisibility(View.VISIBLE);
+        } else {
+            mTxtImportStatus.setText(R.string.import_status_none);
+            mTxtImportStatus.setTextColor(Color.parseColor("#6B421E"));
+            mBtnStartExtract.setText(R.string.btn_start_extract);
+            mBtnReimportClean.setVisibility(View.GONE);
+        }
 
         long freeBytes = NativeBridge.isLoaded()
                 ? NativeBridge.nativeQueryFreeSpace(getFilesDir().getAbsolutePath())
                 : getFilesDir().getUsableSpace();
-        mStorageText.setText(String.format(Locale.US,
-                "Free internal storage: %.2f GiB (minimum 3.00 GiB required for extraction)",
-                freeBytes / 1073741824.0));
+        double freeGib = freeBytes / 1073741824.0;
+        mTxtImportStorage.setText(getString(R.string.import_storage_fmt, freeGib));
+        mTxtImportStorage.setTextColor(freeGib >= 3.2 ? Color.parseColor("#3E702E") : Color.parseColor("#A6281A"));
 
+        // Mod status inside Settings
         SaveAndLogManager.ModStatus mod = SaveAndLogManager.getRomfsModStatus(this);
-        if (mModStatusText != null) {
-            if (mod.active) {
-                mModStatusText.setText(String.format(Locale.US,
-                        "Active Mod: %s (%d files • %d overwritten, %d added • %s)",
-                        mod.modName, mod.totalFiles, mod.overwrittenCount, mod.addedCount, mod.installedAt));
-                mModStatusText.setBackground(makeRoundedBg(COL_GREEN, 8));
-            } else {
-                mModStatusText.setText("Status: Original RomFS (no mod overlay active)");
-                mModStatusText.setBackground(makeRoundedBg(Color.parseColor("#1B2D47"), 8));
-            }
-        }
-        if (mBtnInstallMod != null) {
-            mBtnInstallMod.setEnabled(st.gameExtracted && !extracting);
-            mBtnInstallMod.setAlpha((st.gameExtracted && !extracting) ? 1.0f : 0.45f);
-        }
-        if (mBtnRestoreMod != null) {
-            mBtnRestoreMod.setEnabled(st.gameExtracted && mod.active && !extracting);
-            mBtnRestoreMod.setAlpha((st.gameExtracted && mod.active && !extracting) ? 1.0f : 0.45f);
-        }
-
-        StringBuilder diag = new StringBuilder();
-        diag.append("APK Version : ").append(BuildConfig.VERSION_NAME)
-                .append(" (code ").append(BuildConfig.VERSION_CODE).append(")\n");
-        if (st.gameExtracted) {
-            diag.append("Title ID    : ").append(st.titleId).append(" (v").append(st.displayVersion).append(")\n");
-            diag.append("RomFS       : ").append(st.romfsFiles).append(" files (")
-                    .append(String.format(Locale.US, "%.2f GiB", st.romfsBytes / 1073741824.0)).append(")\n");
-            diag.append("RomFS Mod   : ").append(mod.active
-                    ? (mod.modName + " (" + mod.totalFiles + " files active)")
-                    : "Original (none)").append("\n");
-            diag.append("DLC (AOC)   : ").append(st.aocSummary).append("\n");
-            diag.append("main BID    : ").append(st.mainBuildId).append("\n");
-            diag.append("subsdk0 BID : ").append(st.subsdk0BuildId).append("\n");
-            diag.append("sdk BID     : ").append(st.sdkBuildId).append("\n");
-            diag.append("Core Assets : ").append(st.coreSynced ? "VERIFIED (shaders.dmsv SHA-256 OK)" : "SYNC PENDING");
+        if (mod.active) {
+            mTxtModStatus.setText(getString(R.string.mod_status_active_fmt, mod.modName, mod.totalFiles));
+            mTxtModStatus.setTextColor(Color.parseColor("#2E6120"));
         } else {
-            diag.append("Game Data   : Not installed yet\n");
-            diag.append("RomFS Mod   : Original (awaiting extraction)\n");
-            diag.append("Core Assets : Bundled inside APK (awaiting extraction)");
+            mTxtModStatus.setText(R.string.mod_status_original);
+            mTxtModStatus.setTextColor(Color.parseColor("#6B421E"));
         }
-        mDiagGameText.setText(diag.toString());
+        mBtnInstallMod.setEnabled(st.gameExtracted && !extracting);
+        mBtnInstallMod.setAlpha((st.gameExtracted && !extracting) ? 1.0f : 0.45f);
+        mBtnRestoreMod.setEnabled(st.gameExtracted && mod.active && !extracting);
+        mBtnRestoreMod.setAlpha((st.gameExtracted && mod.active && !extracting) ? 1.0f : 0.45f);
     }
 
     private void updateExtractionUi(ExtractForegroundService.Snapshot snap) {
         boolean running = snap.running || ExtractForegroundService.isRunning();
-        mBtnExtract.setEnabled(!running);
-        mBtnCancel.setVisibility(running ? View.VISIBLE : View.GONE);
+        mBtnStartExtract.setEnabled(!running);
+        mBtnStartExtract.setAlpha(running ? 0.55f : 1.0f);
+        mBtnCancelExtract.setVisibility(running ? View.VISIBLE : View.GONE);
         if (running || !snap.message.isEmpty()) {
-            mProgressBar.setVisibility(running ? View.VISIBLE : View.GONE);
-            mProgressBar.setIndeterminate(running && snap.percent == 0);
-            mProgressBar.setProgress(snap.percent);
-            mProgressText.setVisibility(View.VISIBLE);
-            mProgressText.setText(snap.message);
+            mProgImport.setVisibility(running ? View.VISIBLE : View.GONE);
+            mProgImport.setIndeterminate(running && snap.percent == 0);
+            mProgImport.setProgress(snap.percent);
+            mTxtImportProgress.setVisibility(View.VISIBLE);
+            mTxtImportProgress.setText(running ? (snap.percent + "% — " + snap.message) : snap.message);
+        }
+        if (!running && snap.eventId != 0L && snap.eventId != mLastHandledExtractEventId) {
+            mLastHandledExtractEventId = snap.eventId;
+            if (!snap.success && !snap.cancelled && !snap.errorDetail.isEmpty()) {
+                showExtractFailureDialog(snap.errorDetail);
+            } else if (snap.success) {
+                Toast.makeText(this, R.string.toast_extract_done, Toast.LENGTH_LONG).show();
+            }
         }
         refreshInstallAndStorageStatus();
     }
 
+    private void showExtractFailureDialog(String rawErr) {
+        boolean missingUpd = rawErr.startsWith("UPDATE_112_MISSING:")
+                || rawErr.contains("Update NSP mismatch")
+                || rawErr.contains("Build ID mismatch");
+        String detail = rawErr.startsWith("UPDATE_112_MISSING:")
+                ? rawErr.substring("UPDATE_112_MISSING:".length()).trim()
+                : rawErr;
+        if (missingUpd) {
+            new AlertDialog.Builder(this)
+                    .setTitle(R.string.dlg_upd_missing_title)
+                    .setMessage(getString(R.string.dlg_upd_missing_msg, detail))
+                    .setPositiveButton(R.string.btn_understood, null)
+                    .show();
+        } else {
+            new AlertDialog.Builder(this)
+                    .setTitle(R.string.dlg_import_fail_title)
+                    .setMessage(getString(R.string.dlg_import_fail_msg, detail))
+                    .setPositiveButton(R.string.btn_ok, null)
+                    .show();
+        }
+    }
+
     private void onExtractClicked() {
-        if (mKeysUri == null || mBaseUri == null || mUpdateUri == null) {
-            Toast.makeText(this, "Please select prod.keys, Base NSP, and Update 1.1.2 NSP first.",
-                    Toast.LENGTH_LONG).show();
+        if (mKeysUri == null || mBaseUri == null) {
+            Toast.makeText(this, R.string.toast_pick_required, Toast.LENGTH_LONG).show();
             return;
         }
-        // Handle POST_NOTIFICATIONS on Android 13+ gracefully (never blocks extraction if denied)
         if (Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_POST_NOTIF);
@@ -585,10 +806,7 @@ public final class LauncherActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQ_POST_NOTIF) {
-            // Proceed even if notification permission was denied
-            startExtractionService();
-        }
+        if (requestCode == REQ_POST_NOTIF) startExtractionService();
     }
 
     private void startExtractionService() {
@@ -596,40 +814,108 @@ public final class LauncherActivity extends Activity {
         i.setAction(ExtractForegroundService.ACTION_START);
         i.putExtra(ExtractForegroundService.EXTRA_KEYS_URI, mKeysUri.toString());
         i.putExtra(ExtractForegroundService.EXTRA_BASE_URI, mBaseUri.toString());
-        i.putExtra(ExtractForegroundService.EXTRA_UPDATE_URI, mUpdateUri.toString());
+        i.putExtra(ExtractForegroundService.EXTRA_UPDATE_URI, mUpdateUri != null ? mUpdateUri.toString() : "");
         ArrayList<String> dlcs = new ArrayList<>();
         for (Uri u : mDlcUris) dlcs.add(u.toString());
         i.putStringArrayListExtra(ExtractForegroundService.EXTRA_DLC_URIS, dlcs);
+        SaveAndLogManager.appendLauncherLog(this, "ui",
+                "Extract clicked: base=" + queryDisplayName(mBaseUri)
+                        + " update=" + (mUpdateUri != null ? queryDisplayName(mUpdateUri) : "(none/auto)")
+                        + " dlcs=" + mDlcUris.size());
         startForegroundService(i);
-        mBtnExtract.setEnabled(false);
-        mBtnCancel.setVisibility(View.VISIBLE);
-        mProgressBar.setVisibility(View.VISIBLE);
-        mProgressBar.setIndeterminate(true);
-        mProgressText.setVisibility(View.VISIBLE);
-        mProgressText.setText("Starting extraction service...");
+        mBtnStartExtract.setEnabled(false);
+        mBtnStartExtract.setAlpha(0.55f);
+        mBtnCancelExtract.setVisibility(View.VISIBLE);
+        mProgImport.setVisibility(View.VISIBLE);
+        mProgImport.setIndeterminate(true);
+        mTxtImportProgress.setVisibility(View.VISIBLE);
+        mTxtImportProgress.setText(R.string.msg_extract_starting);
+    }
+
+    private void confirmCleanGameData() {
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.dlg_clean_title)
+                .setMessage(R.string.dlg_clean_msg)
+                .setPositiveButton(R.string.btn_clean_confirm, (d, w) -> new Thread(() -> {
+                    File gd = CoreAssetSync.getGameDataDir(this);
+                    deleteSubdir(new File(gd, "RomFS"));
+                    deleteSubdir(new File(gd, "ExeFS"));
+                    deleteSubdir(new File(gd, "romfs_orig_backup"));
+                    //noinspection ResultOfMethodCallIgnored
+                    new File(gd, ".ready.json").delete();
+                    //noinspection ResultOfMethodCallIgnored
+                    new File(gd, ".core_assets.json").delete();
+                    runOnUiThread(() -> {
+                        Toast.makeText(this, R.string.toast_clean_done, Toast.LENGTH_SHORT).show();
+                        refreshInstallAndStorageStatus();
+                    });
+                }, "clean-data").start())
+                .setNegativeButton(R.string.btn_cancel, null)
+                .show();
+    }
+
+    private void deleteSubdir(File f) {
+        if (f == null || !f.exists()) return;
+        File[] list = f.listFiles();
+        if (list != null) {
+            for (File c : list) deleteSubdir(c);
+        }
+        //noinspection ResultOfMethodCallIgnored
+        f.delete();
+    }
+
+    private void checkGpuDeviceLostRecovery() {
+        if (mDeviceLostPrompted) return;
+        File gameDir = CoreAssetSync.getGameDataDir(this);
+        File marker = new File(gameDir, ".gpu_device_lost");
+        if (!marker.isFile()) return;
+        mDeviceLostPrompted = true;
+        String detail = "";
+        File errFile = new File(gameDir, "last_launch_error.txt");
+        if (errFile.isFile()) {
+            try { detail = CoreAssetSync.readFileUtf8(errFile).trim(); } catch (Exception ignored) {}
+        }
+        String extraDetail = detail.isEmpty() ? "" : (detail + "\n\n");
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.dlg_gpu_lost_title)
+                .setMessage(getString(R.string.dlg_gpu_lost_msg, extraDetail))
+                .setPositiveButton(R.string.btn_enable_safe_mode, (d, w) -> {
+                    mConfig.poolSafeSyncMode = RuntimeConfigManager.SAFE_SYNC_SERIAL_DBG;
+                    mConfig.msaaMode = RuntimeConfigManager.MSAA_DISABLE;
+                    mConfig.robustAccess = true;
+                    syncSettingsUiFromConfig();
+                    persistConfig();
+                    //noinspection ResultOfMethodCallIgnored
+                    marker.delete();
+                    Toast.makeText(this, R.string.toast_safe_mode_on, Toast.LENGTH_LONG).show();
+                })
+                .setNegativeButton(R.string.btn_ignore, (d, w) -> {
+                    //noinspection ResultOfMethodCallIgnored
+                    marker.delete();
+                })
+                .show();
     }
 
     private void launchGame() {
         CoreAssetSync.Status st = CoreAssetSync.inspectStatus(this);
         if (!st.readyToPlay) {
-            Toast.makeText(this, "Game data or core shaders not verified yet.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, R.string.toast_game_not_verified, Toast.LENGTH_SHORT).show();
             refreshInstallAndStorageStatus();
             return;
         }
         try {
             RuntimeConfigManager.save(this, mConfig);
         } catch (Exception e) {
-            Toast.makeText(this, "Warning: could not flush config: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, getString(R.string.toast_config_save_warn, e.getMessage()), Toast.LENGTH_SHORT).show();
         }
-        Intent gameIntent = new Intent(this, GameActivity.class);
-        startActivity(gameIntent);
+        startActivity(new Intent(this, GameActivity.class));
     }
 
     private void persistConfig() {
         try {
             RuntimeConfigManager.save(this, mConfig);
         } catch (Exception e) {
-            Toast.makeText(this, "Failed saving runtime config: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, getString(R.string.toast_config_save_fail, e.getMessage()), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -637,9 +923,7 @@ public final class LauncherActivity extends Activity {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
         i.setType("*/*");
-        if (allowMultiple) {
-            i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-        }
+        if (allowMultiple) i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
         startActivityForResult(i, reqCode);
     }
 
@@ -658,13 +942,25 @@ public final class LauncherActivity extends Activity {
 
         if (requestCode == REQ_PICK_KEYS && data.getData() != null) {
             mKeysUri = data.getData();
-            mKeysLabel.setText("Selected: " + queryDisplayName(mKeysUri));
+            String nm = queryDisplayName(mKeysUri);
+            mLblPickKeys.setText(getString(R.string.picked_fmt, nm));
+            mLblPickKeys.setTextColor(Color.parseColor("#2E6120"));
+            mChkKeys.setAlpha(1.0f);
+            SaveAndLogManager.appendLauncherLog(this, "picker", "prod.keys selected (" + nm + ")");
         } else if (requestCode == REQ_PICK_BASE && data.getData() != null) {
             mBaseUri = data.getData();
-            mBaseLabel.setText("Selected: " + queryDisplayName(mBaseUri));
+            String nm = queryDisplayName(mBaseUri);
+            mLblPickBase.setText(getString(R.string.picked_fmt, nm));
+            mLblPickBase.setTextColor(Color.parseColor("#2E6120"));
+            mChkBase.setAlpha(1.0f);
+            SaveAndLogManager.appendLauncherLog(this, "picker", "Base Game selected (" + nm + ")");
         } else if (requestCode == REQ_PICK_UPDATE && data.getData() != null) {
             mUpdateUri = data.getData();
-            mUpdateLabel.setText("Selected: " + queryDisplayName(mUpdateUri));
+            String nm = queryDisplayName(mUpdateUri);
+            mLblPickUpdate.setText(getString(R.string.picked_fmt, nm));
+            mLblPickUpdate.setTextColor(Color.parseColor("#2E6120"));
+            mChkUpdate.setAlpha(1.0f);
+            SaveAndLogManager.appendLauncherLog(this, "picker", "Update selected (" + nm + ")");
         } else if (requestCode == REQ_PICK_DLCS) {
             mDlcUris.clear();
             ClipData clip = data.getClipData();
@@ -676,19 +972,26 @@ public final class LauncherActivity extends Activity {
             } else if (data.getData() != null) {
                 mDlcUris.add(data.getData());
             }
-            mDlcsLabel.setText(mDlcUris.isEmpty()
-                    ? "Optional (0 selected)"
-                    : (mDlcUris.size() + " DLC file(s) selected"));
+            if (mDlcUris.isEmpty()) {
+                mLblPickDlcs.setText(R.string.picked_dlc_none);
+                mLblPickDlcs.setTextColor(Color.parseColor("#8A6A4A"));
+                mChkDlcs.setAlpha(0.22f);
+            } else {
+                mLblPickDlcs.setText(getString(R.string.picked_dlc_count_fmt, mDlcUris.size()));
+                mLblPickDlcs.setTextColor(Color.parseColor("#2E6120"));
+                mChkDlcs.setAlpha(1.0f);
+            }
+            SaveAndLogManager.appendLauncherLog(this, "picker", "DLC selected count=" + mDlcUris.size());
         } else if (requestCode == REQ_EXPORT_LOG && data.getData() != null) {
             final Uri dest = data.getData();
             new Thread(() -> {
                 try {
                     int n = SaveAndLogManager.exportRuntimeLogs(this, dest, mVulkanProbeJson);
                     runOnUiThread(() -> Toast.makeText(this,
-                            "Exported log report (" + (n / 1024) + " KiB)", Toast.LENGTH_LONG).show());
+                            getString(R.string.toast_log_exported, n / 1024), Toast.LENGTH_LONG).show());
                 } catch (Exception e) {
                     runOnUiThread(() -> Toast.makeText(this,
-                            "Log export failed: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                            getString(R.string.toast_log_export_fail, e.getMessage()), Toast.LENGTH_LONG).show());
                 }
             }).start();
         } else if (requestCode == REQ_BACKUP_SAVE && data.getData() != null) {
@@ -697,257 +1000,82 @@ public final class LauncherActivity extends Activity {
                 try {
                     int count = SaveAndLogManager.exportSaveZip(this, dest);
                     runOnUiThread(() -> Toast.makeText(this,
-                            "Save backup complete (" + count + " files)", Toast.LENGTH_LONG).show());
+                            getString(R.string.toast_save_backup_ok, count), Toast.LENGTH_LONG).show());
                 } catch (Exception e) {
                     runOnUiThread(() -> Toast.makeText(this,
-                            "Save backup failed: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                            getString(R.string.toast_save_backup_fail, e.getMessage()), Toast.LENGTH_LONG).show());
                 }
             }).start();
         } else if (requestCode == REQ_RESTORE_SAVE && data.getData() != null) {
             final Uri src = data.getData();
             new AlertDialog.Builder(this)
-                    .setTitle("Restore Save Data?")
-                    .setMessage("This will atomically replace your current internal game save with the selected ZIP archive.")
-                    .setPositiveButton("Restore", (d, w) -> new Thread(() -> {
+                    .setTitle(R.string.dlg_restore_save_title)
+                    .setMessage(R.string.dlg_restore_save_msg)
+                    .setPositiveButton(R.string.btn_restore, (d, w) -> new Thread(() -> {
                         try {
                             int count = SaveAndLogManager.importSaveZip(this, src);
                             runOnUiThread(() -> Toast.makeText(this,
-                                    "Save restored (" + count + " files)", Toast.LENGTH_LONG).show());
+                                    getString(R.string.toast_save_restore_ok, count), Toast.LENGTH_LONG).show());
                         } catch (Exception e) {
                             runOnUiThread(() -> Toast.makeText(this,
-                                    "Save restore failed: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                                    getString(R.string.toast_save_restore_fail, e.getMessage()), Toast.LENGTH_LONG).show());
                         }
                     }).start())
-                    .setNegativeButton("Cancel", null)
+                    .setNegativeButton(R.string.btn_cancel, null)
                     .show();
         } else if (requestCode == REQ_INSTALL_MOD && data.getData() != null) {
             final Uri modUri = data.getData();
             final String modName = queryDisplayName(modUri);
             new AlertDialog.Builder(this)
-                    .setTitle("Install Mod Overlay (.zip)?")
-                    .setMessage("Apply \"" + modName + "\" into game_data/RomFS/?\n\n"
-                            + "Original files overwritten for the first time will be backed up automatically to "
-                            + "game_data/romfs_orig_backup/ so you can disable and restore original RomFS in 1 second.")
-                    .setPositiveButton("Install Mod", (d, w) -> {
-                        if (mBtnInstallMod != null) mBtnInstallMod.setEnabled(false);
-                        if (mBtnRestoreMod != null) mBtnRestoreMod.setEnabled(false);
-                        if (mModStatusText != null) mModStatusText.setText("Installing mod overlay: " + modName + "...");
-                        new Thread(() -> {
-                            try {
-                                SaveAndLogManager.ModStatus res = SaveAndLogManager.installRomfsModZip(this, modUri, modName);
-                                runOnUiThread(() -> {
-                                    Toast.makeText(this,
-                                            "Mod installed: " + res.modName + " (" + res.totalFiles + " files)",
-                                            Toast.LENGTH_LONG).show();
-                                    refreshInstallAndStorageStatus();
-                                });
-                            } catch (Exception e) {
-                                runOnUiThread(() -> {
-                                    Toast.makeText(this, "Mod install failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                                    refreshInstallAndStorageStatus();
-                                });
-                            }
-                        }, "mod-install").start();
-                    })
-                    .setNegativeButton("Cancel", null)
+                    .setTitle(R.string.dlg_install_mod_title)
+                    .setMessage(getString(R.string.dlg_install_mod_msg, modName))
+                    .setPositiveButton(R.string.btn_install_mod_confirm, (d, w) -> new Thread(() -> {
+                        try {
+                            SaveAndLogManager.ModStatus res = SaveAndLogManager.installRomfsModZip(this, modUri, modName);
+                            runOnUiThread(() -> {
+                                Toast.makeText(this, getString(R.string.toast_mod_installed, res.modName, res.totalFiles), Toast.LENGTH_LONG).show();
+                                refreshInstallAndStorageStatus();
+                            });
+                        } catch (Exception e) {
+                            runOnUiThread(() -> Toast.makeText(this, getString(R.string.toast_mod_install_fail, e.getMessage()), Toast.LENGTH_LONG).show());
+                        }
+                    }, "mod-install").start())
+                    .setNegativeButton(R.string.btn_cancel, null)
                     .show();
         }
     }
 
     private void confirmRestoreOriginalRomfs() {
         new AlertDialog.Builder(this)
-                .setTitle("Disable Mod & Restore Original RomFS?")
-                .setMessage("This will restore all backed-up original RomFS files and remove mod-added files "
-                        + "in ~1 second without re-extracting your 2.24 GiB NSP.")
-                .setPositiveButton("Restore Original", (d, w) -> {
-                    if (mBtnInstallMod != null) mBtnInstallMod.setEnabled(false);
-                    if (mBtnRestoreMod != null) mBtnRestoreMod.setEnabled(false);
-                    if (mModStatusText != null) mModStatusText.setText("Restoring original RomFS...");
-                    new Thread(() -> {
-                        try {
-                            int n = SaveAndLogManager.restoreOriginalRomfs(this);
-                            runOnUiThread(() -> {
-                                Toast.makeText(this,
-                                        "Original RomFS restored (" + n + " files reverted)",
-                                        Toast.LENGTH_LONG).show();
-                                refreshInstallAndStorageStatus();
-                            });
-                        } catch (Exception e) {
-                            runOnUiThread(() -> {
-                                Toast.makeText(this, "Restore failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                                refreshInstallAndStorageStatus();
-                            });
-                        }
-                    }, "mod-restore").start();
-                })
-                .setNegativeButton("Cancel", null)
+                .setTitle(R.string.dlg_restore_romfs_title)
+                .setMessage(R.string.dlg_restore_romfs_msg)
+                .setPositiveButton(R.string.btn_restore, (d, w) -> new Thread(() -> {
+                    try {
+                        int n = SaveAndLogManager.restoreOriginalRomfs(this);
+                        runOnUiThread(() -> {
+                            Toast.makeText(this, getString(R.string.toast_romfs_restored, n), Toast.LENGTH_LONG).show();
+                            refreshInstallAndStorageStatus();
+                        });
+                    } catch (Exception e) {
+                        runOnUiThread(() -> Toast.makeText(this, getString(R.string.toast_romfs_restore_fail, e.getMessage()), Toast.LENGTH_LONG).show());
+                    }
+                }, "mod-restore").start())
+                .setNegativeButton(R.string.btn_cancel, null)
                 .show();
     }
 
     private String queryDisplayName(Uri uri) {
-        try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME},
-                null, null, null)) {
+        try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
             if (c != null && c.moveToFirst()) {
                 String name = c.getString(0);
                 if (name != null && !name.isEmpty()) return name;
             }
         } catch (Exception ignored) {
         }
-        return uri.getLastPathSegment() != null ? uri.getLastPathSegment() : "selected file";
-    }
-
-    private String formatVulkanProbe(String json) {
-        try {
-            JSONObject j = new JSONObject(json);
-            if (!j.optBoolean("available", false)) {
-                return "Vulkan GPU  : Unavailable (" + j.optString("error", "unknown") + ")";
-            }
-            return "GPU Device  : " + j.optString("gpu_name") + "\n"
-                    + "Vendor / ID : " + j.optString("vendor_id") + " / " + j.optString("device_id") + "\n"
-                    + "Vulkan API  : " + j.optString("vulkan_api") + " (Driver " + j.optString("driver_version") + ")\n"
-                    + "Compression : BC7=" + (j.optBoolean("bc7_sampled") ? "Native" : "Mali Fallback+Cache")
-                    + " • ASTC_LDR=" + (j.optBoolean("astc_ldr") ? "Yes" : "No") + "\n"
-                    + "Active Path : " + j.optString("pipeline_path");
-        } catch (Exception e) {
-            return "Vulkan Probe: " + json;
-        }
+        return uri.getLastPathSegment() != null ? uri.getLastPathSegment() : "file";
     }
 
     private String timestampSlug() {
         return new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-    }
-
-    // ---- Lightweight UI builders (zero external dependencies) ----
-
-    private LinearLayout makeCard() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        int p = dp(14);
-        card.setPadding(p, p, p, p);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(COL_CARD);
-        bg.setCornerRadius(dp(12));
-        bg.setStroke(dp(1), COL_BORDER);
-        card.setBackground(bg);
-        return card;
-    }
-
-    private GradientDrawable makeRoundedBg(int color, int radiusDp) {
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(color);
-        bg.setCornerRadius(dp(radiusDp));
-        return bg;
-    }
-
-    private TextView makeText(String text, int sp, int color, boolean bold) {
-        TextView tv = new TextView(this);
-        tv.setText(text);
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
-        tv.setTextColor(color);
-        if (bold) tv.setTypeface(tv.getTypeface(), Typeface.BOLD);
-        return tv;
-    }
-
-    private Button makeButton(String label, int bgColor) {
-        Button b = new Button(this);
-        b.setText(label);
-        b.setTextColor(Color.WHITE);
-        b.setAllCaps(false);
-        b.setBackground(makeRoundedBg(bgColor, 8));
-        b.setPadding(dp(12), dp(10), dp(12), dp(10));
-        return b;
-    }
-
-    private TextView addFilePickerRow(LinearLayout parent, String btnLabel, String initSub, View.OnClickListener click) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-
-        Button btn = makeButton(btnLabel, Color.parseColor("#1E3A5F"));
-        btn.setOnClickListener(click);
-        TextView tv = makeText(initSub, 11, COL_MUTED, false);
-        tv.setPadding(dp(10), 0, 0, 0);
-
-        row.addView(btn, new LinearLayout.LayoutParams(dp(170), ViewGroup.LayoutParams.WRAP_CONTENT));
-        row.addView(tv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        parent.addView(row, marginTop(8));
-        return tv;
-    }
-
-    private interface IntConsumer { void accept(int value); }
-    private interface BoolConsumer { void accept(boolean value); }
-
-    private Spinner addSpinnerRow(LinearLayout parent, String label, String[] items, int initialIdx, IntConsumer onChange) {
-        parent.addView(makeText(label, 12, COL_MUTED, true), marginTop(10));
-        Spinner sp = new Spinner(this);
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, items);
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        sp.setAdapter(adapter);
-        mUpdatingUi = true;
-        sp.setSelection(Math.max(0, Math.min(items.length - 1, initialIdx)));
-        mUpdatingUi = false;
-        if (onChange != null) {
-            sp.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-                @Override
-                public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
-                    if (!mUpdatingUi) onChange.accept(pos);
-                }
-
-                @Override
-                public void onNothingSelected(AdapterView<?> p) {}
-            });
-        }
-        parent.addView(sp, marginTop(2));
-        return sp;
-    }
-
-    private Switch addSwitchRow(LinearLayout parent, String label, boolean initial, BoolConsumer onChange) {
-        Switch sw = new Switch(this);
-        sw.setText(label);
-        sw.setTextColor(COL_TEXT);
-        sw.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        sw.setChecked(initial);
-        sw.setOnCheckedChangeListener((btn, checked) -> {
-            if (!mUpdatingUi) onChange.accept(checked);
-        });
-        parent.addView(sw, marginTop(10));
-        return sw;
-    }
-
-    private void addSeekBarRow(LinearLayout parent, String label, int min, int max, int initial,
-                               String suffix, IntConsumer onChange) {
-        TextView tv = makeText(label + ": " + initial + suffix, 12, COL_TEXT, false);
-        SeekBar sb = new SeekBar(this);
-        sb.setMax(max - min);
-        sb.setProgress(Math.max(0, Math.min(max - min, initial - min)));
-        sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                int v = min + progress;
-                tv.setText(label + ": " + v + suffix);
-            }
-
-            @Override
-            public void onStartTrackingTouch(SeekBar seekBar) {}
-
-            @Override
-            public void onStopTrackingTouch(SeekBar seekBar) {
-                onChange.accept(min + seekBar.getProgress());
-            }
-        });
-        parent.addView(tv, marginTop(10));
-        parent.addView(sb, marginTop(2));
-    }
-
-    private LinearLayout.LayoutParams marginTop(int topDp) {
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(topDp);
-        return lp;
-    }
-
-    private int dp(int v) {
-        return Math.round(TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics()));
     }
 }

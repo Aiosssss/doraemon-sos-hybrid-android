@@ -12,6 +12,12 @@ vk_gpu g_vk_gpu;
 
 static int adreno(const vk_gpu *g) { return g->vendor == VENDOR_QUALCOMM; }   // both drivers: Qualcomm's own and Mesa's Turnip
 static int mali(const vk_gpu *g) { return g->vendor == VENDOR_ARM; }         // ARM Mali / Immortalis (0x13B5)
+static int mali_legacy_a2c(const vk_gpu *g) {
+    // Only disable A2C by default on legacy Mali drivers (< 40.0 or Vulkan < 1.3).
+    // Modern Mali Valhall/5th-gen (Vulkan 1.3, driver >= 40.0, e.g. Mali-G720 r49p1) supports native 2x MSAA A2C,
+    // which prevents opaque coverage Z-fighting/flickering on layered foliage cards and tree shadows.
+    return g->vendor == VENDOR_ARM && (g->api < VK_API_VERSION_1_3 || g->version < 0x0A000000u);
+}
 
 static const struct {
     enum vk_quirk q; const char *name, *setting; int (*match)(const vk_gpu *); const char *why;
@@ -30,8 +36,8 @@ static const struct {
      "Adreno UBWC VkImageFormatListCreateInfo opts Mali Valhall GENERAL-layout 2x MSAA MRTs into AFBC hazards; default DM_VK_UBWC=0 on Mali"},
     {VQ_NO_CB_SPLIT, "no_cb_split", "DM_VK_QUIRK_NO_CB_SPLIT", mali,
      "Adreno 128-draw mid-frame vkQueueSubmit splits are unnecessary on Mali and cause UBO/tile flicker on copied pools; default DM_VK_CB_DRAWS=0 on Mali"},
-    {VQ_NO_A2C, "no_a2c", "DM_VK_QUIRK_NO_A2C", mali,
-     "Mali 2x MSAA alphaToCoverageEnable turns semi-opaque cutout foliage alpha into 1-of-2 sample dither, letting overlapping tree cards bleed through depth"},
+    {VQ_NO_A2C, "no_a2c", "DM_VK_QUIRK_NO_A2C", mali_legacy_a2c,
+     "Legacy Mali (<40.0 / Vulkan <1.3) 2x MSAA alphaToCoverageEnable dither workaround; off by default on modern Mali Vulkan 1.3+ (driver >= 40.0)"},
 };
 _Static_assert(sizeof ROWS / sizeof *ROWS == VQ_COUNT, "one row a quirk");
 

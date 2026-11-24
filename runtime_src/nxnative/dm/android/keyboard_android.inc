@@ -84,6 +84,9 @@ static void *android_keyboard_worker(void *arg) {
 static int android_text_input(const char *title, const char *sub, const char *guide, const char *initial,
                               int max_chars, char *out, int out_cap) {
     if (!out || out_cap < 1) return -1;
+    LOG("swkbd: android_text_input start (title='%s' sub='%s' guide='%s' init='%s' min=%d max=%d)",
+        title ? title : "", sub ? sub : "", guide ? guide : "", initial ? initial : "",
+        g_swkbd_min_chars, max_chars);
     keyboard_request request = {
         .text = {title, sub, guide, initial},
         .out = out, .out_cap = out_cap,
@@ -95,5 +98,7 @@ static int android_text_input(const char *title, const char *sub, const char *gu
     pthread_t worker;
     if (pthread_create(&worker, NULL, android_keyboard_worker, &request)) return -1;
     pthread_join(worker, NULL);
+    LOG("swkbd: android_text_input done -> result=%d text='%s'",
+        request.result, request.result > 0 ? out : "");
     return request.result;
 }

@@ -96,11 +96,13 @@ static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 // sleep in the kernel: while a thrown ball's capture assets load, Pokémon Scarlet's ten busiest threads on an AYN Thor blocked on it ~1,000 times a second each, 84 us a
 // time with the wakeup (simpleperf sched_switch), up to 14% of their time. A short spin first gets it as its holder lets go. DM_SVC_SPIN=0 (live, a DM_CTL env line):
 // no spin, here or in block(); DM_SVC_SPIN_US (live, 30 by default): block()'s spin
-static int g_spin_on = 1; static unsigned g_spin_us = 30;
+// Short micro-spin (8 us default; live override via DM_SVC_SPIN_US / DM_SVC_SPIN=0) captures immediate
+// producer->consumer handoffs while letting threads enter kernel sleep/C-states quickly for lower SoC heat.
+static int g_spin_on = 1; static unsigned g_spin_us = 8;
 static _Atomic uint64_t g_spin_ok, g_spin_parked;   // block()'s spins: ended by the wake, ended by the time limit
 static void spin_cfg(void) {   // every 4096th SVC reads the switches again
     static _Atomic unsigned k; if (atomic_fetch_add(&k, 1) & 4095) return;
-    const char *e = getenv("DM_SVC_SPIN"), *u = getenv("DM_SVC_SPIN_US"); g_spin_on = !(e && !atoi(e)); g_spin_us = u && atoi(u) >= 0 ? (unsigned)atoi(u) : 30;
+    const char *e = getenv("DM_SVC_SPIN"), *u = getenv("DM_SVC_SPIN_US"); g_spin_on = !(e && !atoi(e)); g_spin_us = u && atoi(u) >= 0 ? (unsigned)atoi(u) : 8;
 }
 static inline void cpu_relax(void) {
 #if defined(__aarch64__)
@@ -110,7 +112,7 @@ static inline void cpu_relax(void) {
 #endif
 }
 static inline void G_lock(void) {
-    if (g_spin_on) for (int i = 0; i < 64; i++) { if (!pthread_mutex_trylock(&G)) return; for (int k = 0; k < 16; k++) cpu_relax(); }
+    if (g_spin_on) for (int i = 0; i < 16; i++) { if (!pthread_mutex_trylock(&G)) return; for (int k = 0; k < 8; k++) cpu_relax(); }
     pthread_mutex_lock(&G);
 }
 #define MAX_H 4096
@@ -215,10 +217,10 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {
     // Spin before parking: the game's threads hand work to each other thousands of times a second (Pokémon Scarlet's job workers wait ~2,500 times a second each, a
     // quarter of a millisecond on average), and a parked thread waits for the wake to reach a sleeping core as well; a wake that comes within the spin costs neither.
     // G is let go while spinning, as the condition wait does; a thread whose spins keep ending with no wake spins again only every 16th wait, until one is woken in it
-    if (g_spin_on && g_spin_us && !det_wait && (t->spin_fail < 8 || !(t->nblock & 15))) {
+    if (g_spin_on && g_spin_us && !det_wait && (t->spin_fail < 4 || !(t->nblock & 31))) {
         pthread_mutex_unlock(&G);
         uint64_t s0 = now_ns(), lim = (uint64_t)g_spin_us * 1000; unsigned n = 0;
-        while (!__atomic_load_n(&t->woke, __ATOMIC_ACQUIRE)) { cpu_relax(); if (!(++n & 63) && now_ns() - s0 > lim) break; }
+        while (!__atomic_load_n(&t->woke, __ATOMIC_ACQUIRE)) { cpu_relax(); if (!(++n & 31) && now_ns() - s0 > lim) break; }
         G_lock();
         if (t->woke) { t->spin_fail = 0; uint64_t k = atomic_fetch_add(&g_spin_ok, 1) + 1;
                        if (k >= 4096 && !(k & (k - 1))) LOG("[thread] waits ended within the spin: %llu, parked after it: %llu", (unsigned long long)k, (unsigned long long)atomic_load(&g_spin_parked)); }

@@ -85,7 +85,11 @@ static void gpu_turbo(void) {
     if (want != g_turbo_on) {
         if (turbo_set(want)) {
             g_turbo_dead = 1;
-            LOG("[RED] [perf] DM_GPU_TURBO=%s: the GPU's power control could not be set (%s); not tried again", e ? e : "0", strerror(errno));
+            if (errno != ENOENT && errno != EACCES && errno != EPERM) {
+                LOG("[RED] [perf] DM_GPU_TURBO=%s: the GPU's power control could not be set (%s); not tried again", e ? e : "0", strerror(errno));
+            } else {
+                LOG("[perf] DM_GPU_TURBO=%s: KGSL unavailable on this GPU/device (%s); relying on Android ADPF", e ? e : "0", strerror(errno));
+            }
         } else {
             g_turbo_on = want; LOG("[perf] DM_GPU_TURBO=%d: %s", want, want ? "the GPU at its highest clock (power control off)" : "the GPU's own clock control again");
         }
@@ -241,19 +245,28 @@ __attribute__((weak)) int dm_fps_ceiling(void) { return 0; }
 static int fps_pin(void);
 static int fps_cap_step(void) {
     static int s = -1;
-    if (s < 0) { s = dm_fps_ceiling() == 30 ? 2 : 0; if (s) LOG("[perf] frame rate capped at 30 fps (the profile's fps_ceiling; porter's --fps60 lifts it)"); }
+    if (s < 0) {
+        int c = dm_fps_ceiling();
+        s = c == 30 ? 2 : 0;
+        if (c == 30) LOG("[perf] frame rate capped at 30 fps (the profile's fps_ceiling; porter's --fps60 lifts it)");
+        else if (c == 45) LOG("[perf] frame rate capped at 45 fps (22.22 ms mid-range smooth pacing)");
+    }
     return s;
 }
 uint64_t dm_present_period_adapt(uint64_t period) {
     g_game_period = period;
     if (!period) return period;
+    int ceil_fps = dm_fps_ceiling();
+    uint64_t ceil_ns = ceil_fps == 45 ? 22222222ull : (ceil_fps == 30 ? 33333333ull : 0ull);
     if (!adaptive_enabled()) {
         g_step = fps_cap_step();   // the ceiling's present-thread wait is pacing, not work for ADPF load hints
-        return g_step && (uint64_t)STEPS[g_step] > period ? (uint64_t)STEPS[g_step] : period;
+        uint64_t want = g_step ? (uint64_t)STEPS[g_step] : ceil_ns;
+        return want > period ? want : period;
     }
     if (g_step < fps_cap_step() && fps_pin() < 0) g_step = fps_cap_step();
-    int64_t want = STEPS[g_step];
-    return (uint64_t)want > period ? (uint64_t)want : period;   // never faster than the game asks
+    uint64_t want = (uint64_t)STEPS[g_step];
+    if (ceil_ns > want) want = ceil_ns;
+    return want > period ? want : period;   // never faster than the game asks
 }
 static int fps_pin(void) { return g_fps_pin; }   // the presenting thread refreshes DM_FPS_PIN every 30 frames in game_mode_sync
 // The frame's replay and GPU time (gfx_vk_present.c, before dm_perf_frame): the rate is judged on the largest of them and the presenting thread's work. With the
@@ -274,11 +287,20 @@ static void hint_report(int64_t w, int64_t pq, int64_t pace, int64_t now, int64_
         H.wd_start(d, now - w); H.wd_total(d, w); H.wd_cpu(d, w > pq ? w - pq : 0); H.wd_gpu(d, g_frame_gpu > 0 ? g_frame_gpu : 0); if (H.report2(g_hint, d)) H.report(g_hint, w);
     } else H.report(g_hint, w);
     static int over; static int64_t last;
-    int64_t worst = w - pace > g_frame_gpu ? w - pace : g_frame_gpu;
-    over = worst > target * 105 / 100 ? over + 1 : 0;
-    if (H.increase && over >= 3 && now - last > 500000000ll) {
-        last = now; int r = H.increase(g_hint, true, g_frame_gpu > target * 70 / 100, "frame over its period");
-        static int n; if (n++ < 5) LOG("[perf] ADPF load increase signalled (work %.1f ms, GPU %.1f ms, target %.1f ms)%s", w / 1e6, g_frame_gpu / 1e6, target / 1e6, r ? " refused" : "");
+    int64_t cpu_work = w > pace ? w - pace : 0;
+    int64_t worst = cpu_work > g_frame_gpu ? cpu_work : g_frame_gpu;
+    // Responsive yet thermal-friendly ADPF (v1.1.2-hybrid24): ignore loading/menu frames (GPU < 3 ms or CPU > 50 ms);
+    // at 60 FPS (<= 17 ms target) catch Mali DVFS clock-drops early (GPU > 92% = 15.3 ms for 4 frames, 2.5 s cooldown)
+    // so 60 FPS stays rock-steady without 20-22 ms GPU spikes while keeping thermals cool.
+    int is_load = (g_frame_gpu < 3000000ll) || (cpu_work > 50000000ll);
+    int high_fps = (target > 0 && target <= 17000000ll);
+    int need_boost = !is_load && (high_fps
+        ? (g_frame_gpu > target * 92 / 100 || worst > target * 105 / 100)
+        : (worst > target * 110 / 100));
+    over = need_boost ? over + 1 : 0;
+    if (H.increase && over >= 4 && now - last > 2500000000ll) {
+        last = now; int r = H.increase(g_hint, cpu_work > target * 94 / 100, g_frame_gpu > target * 90 / 100, high_fps ? "60fps sustained load" : "frame over its period");
+        static int n; if (n++ < 8) LOG("[perf] ADPF load increase signalled (work %.1f ms, GPU %.1f ms, target %.1f ms)%s", w / 1e6, g_frame_gpu / 1e6, target / 1e6, r ? " refused" : "");
     }
 }
 // The frames' time on screen (hle_nvn.c, 8 presents late; ms, -1 = discarded by the system, 0 = no reading): a frame shown longer than 1.5 periods of the step,

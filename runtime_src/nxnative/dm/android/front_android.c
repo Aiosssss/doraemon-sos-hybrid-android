@@ -138,21 +138,24 @@ static _Atomic int g_ime_on;
 static _Atomic int g_tx_on;   // text entry open (front_text_input): the game is held as by the menu
 static void hold_sync(void) {
     pthread_mutex_lock(&g_hold_mu);
-    int want = atomic_load(&g_bg) || atomic_load(&g_menu) || atomic_load(&g_tx_on) || atomic_load(&g_ime_on);
+    // Keep guest clock running while g_ime_on (Java GameKeyboard) is open, matching hle_swkbd.c line 74
+    // so Unity's main/render threads never freeze or spin while waiting for ShowKeyboard.
+    int want = atomic_load(&g_bg) || atomic_load(&g_menu) || atomic_load(&g_tx_on);
     if (want != g_held) { g_held = want; if (want) { dm_movie_hold(1); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); } else { guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_movie_hold(0); } }
     pthread_mutex_unlock(&g_hold_mu);
 }
 static void shake_sensor(int on);   // the accelerometer, off in the background (input, below)
-static void go_background(void) { if (!atomic_load(&g_running) || atomic_exchange(&g_bg, 1)) return; dm_focus_set(2); dm_focus_set(3);   // through OutOfFocus, as a game sees HOME and then the suspension (front_mac.m does the same)
+static void go_background(void) { if (!atomic_load(&g_running) || atomic_load(&g_ime_on) || atomic_exchange(&g_bg, 1)) return; dm_focus_set(2); dm_focus_set(3);   // through OutOfFocus, as a game sees HOME and then the suspension (front_mac.m does the same)
     hold_sync(); dm_gfx_suspend(1); shake_sensor(0); }
 static void go_foreground(void) { if (!atomic_load(&g_running) || !atomic_exchange(&g_bg, 0)) return; dm_gfx_suspend(0); hold_sync(); dm_focus_set(2); shake_sensor(1); }
 void dm_perf_gpu_release(void);   // perf_android.c: the GPU's clock control back to its governor (DM_GPU_TURBO)
 // The clock control goes back after go_background: its dm_gfx_suspend waits for the presents in progress, and one of them could otherwise set the GPU's power control again
-static void on_pause(ANativeActivity *a) { (void)a; go_background(); dm_perf_gpu_release(); }
+__attribute__((weak)) void vk_pipeline_cache_save_async(void);
+static void on_pause(ANativeActivity *a) { (void)a; if (atomic_load(&g_ime_on)) return; go_background(); dm_perf_gpu_release(); if (vk_pipeline_cache_save_async) vk_pipeline_cache_save_async(); }
 // Back in front, the game is out of focus until the window has the input focus again (Android sends it after onResume): without this it stayed OutOfFocus for good,
 // and Blasphemous 2's Unity, which asks for focus notifications, kept its title paused and ignored every press after a trip to another app. A window losing focus while in
-// front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay
-static void on_window_focus(ANativeActivity *a, int focused) { (void)a; if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
+// front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay (except when our own Java swkbd dialog takes focus).
+static void on_window_focus(ANativeActivity *a, int focused) { (void)a; if (!focused && atomic_load(&g_ime_on)) return; if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
 // A save manager's request, or a RomFS the app cannot read (romfs_readable), asked the app to end (ANativeActivity_onCreate): Activity.finish() when it is resumed, through JNI on the main thread.
 // ANativeActivity_finish, from onCreate or from here, left the activity on the screen (Y700, Android 16), and porter's am start -W waited out its timeout
 static int g_quit;

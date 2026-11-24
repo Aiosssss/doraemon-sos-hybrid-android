@@ -135,7 +135,7 @@ public final class CoreAssetSync {
                     }
                     st.aocSummary = sb.toString();
                 } else {
-                    st.aocSummary = "None (Base + Update 1.1.2 only)";
+                    st.aocSummary = "None (0 DLC — Opsional)";
                 }
 
                 boolean filesIntact = new File(gameDir, "RomFS").isDirectory();
@@ -143,6 +143,13 @@ public final class CoreAssetSync {
                     if (!new File(gameDir, "mods/" + mod + ".patched.bin").isFile()) {
                         filesIntact = false;
                         break;
+                    }
+                }
+                if (filesIntact) {
+                    File aocDir = new File(gameDir, "aoc");
+                    if (!aocDir.exists()) {
+                        //noinspection ResultOfMethodCallIgnored
+                        aocDir.mkdirs();
                     }
                 }
                 st.gameExtracted = filesIntact && st.romfsFiles > 0 && !st.mainBuildId.isEmpty();
@@ -182,7 +189,7 @@ public final class CoreAssetSync {
         } else if (st.gameExtracted) {
             st.summary = "Game extracted — syncing updated core shaders & config...";
         } else {
-            st.summary = "Game files not extracted yet — select prod.keys, Base NSP, Update 1.1.2 NSP, and optional DLCs";
+            st.summary = "Game belum diekstrak — pilih prod.keys & Base Game (.nsp/.xci); Update v1.1.2 & DLC opsional";
         }
         return st;
     }

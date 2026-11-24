@@ -124,8 +124,24 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     int sth = dpl == 2 && !d->pkg_block_h && sparse_of(d) ? sparse_tile_h(t.bpb) : -1;
     if (sth >= 0 && (blk(w * sx, t.bw) * t.bpb < (128u >> sth) * 64 || blk(h * sy, t.bh) < 8u << sth)) sth = -1;
     if (sth >= 0) tileH = (unsigned)sth;
-    else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile(ah * 3 / 16); }
-    else if (dpl == 3) tileD = pick_tile(z + z / 2);
+    else if (dpl == 2) {
+        uint32_t ah = blk(h * sy, t.bh);
+        if (d->pkg_block_h) tileH = (unsigned)d->pkg_block_h - 1;
+        else {
+            tileH = pick_tile(ah * 3 / 16);
+            if (d->flags & 0x200) {   // NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT: cap block height at 2 GOBs (16 rows)
+                if (tileH > 1) tileH = 1;
+            } else if (tileH == 4 && t.bw == 1 && t.bh == 1 && d->levels <= 1) {
+                // Single-level uncompressed 2D textures with 17..24 GOB rows (128 < h <= 192, e.g. 320x180 RGBA8):
+                // tileH=4 (16 GOBs / 128 rows) rounds 23 GOBs up to 32 GOBs (256 rows = 0x50000), overflowing 0x40000 by 64 KB
+                // and falsely overlapping adjacent 256 KB targets (e.g. 1024x32 RGBA16F LUT at +0xFC0000).
+                // Clamping tileH to 3 (8 GOBs / 64 rows) rounds 23 GOBs cleanly to 24 GOBs (192 rows = 0x3C000 <= 0x40000).
+                uint32_t hg = (ah + 7u) / 8u;
+                if (hg > 16u && hg <= 24u) tileH = 3;
+            }
+        }
+    }
+    else if (dpl == 3) tileD = (d->flags & 0x200) ? 0 : pick_tile(z + z / 2);
     o->tileH = tileH; o->tileD = tileD;
     unsigned levels = d->levels ? d->levels : 1;
     uint64_t ls = level_offset(d, levels, dpl, w, h, z, tileH, tileD, t);

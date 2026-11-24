@@ -24,6 +24,7 @@ typedef struct {
     uint32_t version;
     uint8_t meta_type;   /* 0x80=Application, 0x81=Patch, 0x82=AddOnContent */
     uint64_t app_id;     /* ApplicationId for Patch/AOC, or title_id for Application */
+    char content_nca_id[33]; /* 32-hex NCA ID of primary Program (0x80/0x81) or Data (0x82) NCA, or "" */
 } nx_cnmt_info;
 
 typedef struct {
@@ -84,18 +85,25 @@ typedef struct {
 typedef void (*nx_progress_fn)(void *user, const char *stage, uint64_t files_done,
                                uint64_t files_total, uint64_t bytes_done, uint64_t bytes_total);
 
-/* Open/close NSP (PFS0) from raw fd */
+/* Open/close NSP (PFS0) or XCI/SuperXCI (HEAD -> HFS0 secure partition) from raw fd */
 int nx_nsp_open(int fd, nx_nsp *nsp, char *err, size_t errcap);
 void nx_nsp_close(nx_nsp *nsp);
 
-/* Open a specific NCA inside an NSP (resolves titlekey from .tik or key_area from prod.keys) */
+/* Open a specific NCA inside an NSP/XCI (resolves titlekey from .tik or key_area from prod.keys) */
 int nx_nca_open(const nx_nsp *nsp, const nx_pfs0_entry *ent, const nx_keyset *ks,
                 nx_nca *nca, char *err, size_t errcap);
 
-/* Find and parse CNMT metadata from an NSP's Meta NCA (.cnmt.nca) */
+/* Find and parse first CNMT metadata from an NSP/XCI's Meta NCA (.cnmt.nca) */
 int nx_nsp_read_cnmt(const nx_nsp *nsp, const nx_keyset *ks, nx_cnmt_info *info, char *err, size_t errcap);
 
-/* Pick an NCA of given content_type (and optional title_id if != 0) inside an NSP */
+/* Scan ALL Meta NCAs inside an NSP/XCI (supports Merged/Super NSP & SuperXCI). Returns count >= 0, or < 0 on error. */
+int nx_nsp_scan_cnmts(const nx_nsp *nsp, const nx_keyset *ks, nx_cnmt_info *out, int max_out, char *err, size_t errcap);
+
+/* Open a specific NCA by its 32-hex NCA ID prefix inside an NSP/XCI */
+int nx_nsp_open_nca_by_id(const nx_nsp *nsp, const nx_keyset *ks, const char nca_id_hex[33],
+                          nx_nca *nca, char *err, size_t errcap);
+
+/* Pick an NCA of given content_type (and optional title_id if != 0) inside an NSP/XCI */
 int nx_nsp_open_nca_by_type(const nx_nsp *nsp, const nx_keyset *ks, uint8_t content_type,
                             uint64_t match_tid, nx_nca *nca, char *err, size_t errcap);
 

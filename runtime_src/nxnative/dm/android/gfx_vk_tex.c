@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #include "../gfx/tex/nvn_bc.h"
 
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp);
@@ -105,8 +106,170 @@ static int bc_cache_dir(char *out, size_t cap) {
 static uint64_t g_bc_cache_hits, g_bc_cache_misses, g_bc_cache_bytes;
 static const uint64_t BC_CACHE_MAX_BYTES = 512ull << 20;
 
+// Asynchronous BC disk cache writer thread: eliminates 20-80 ms flash I/O stalls on the render thread
+// during gameplay when newly encountered BC textures miss the cache (bounded 16 MiB RAM queue).
+enum { BC_WQ_MAX = 16, BC_WQ_MAX_BYTES = 16u << 20 };
+typedef struct { char path[720]; uint8_t *data; size_t len; } bc_wjob_t;
+static bc_wjob_t g_bc_wq[BC_WQ_MAX];
+static int g_bc_wq_h, g_bc_wq_t, g_bc_wq_on;
+static size_t g_bc_wq_bytes;
+static pthread_mutex_t g_bc_wq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_bc_wq_cv = PTHREAD_COND_INITIALIZER;
+static void *bc_cache_writer_main(void *arg) {
+    (void)arg;
+    pthread_setname_np(pthread_self(), "bc-cache-io");
+    setpriority(PRIO_PROCESS, 0, 10);
+    for (;;) {
+        pthread_mutex_lock(&g_bc_wq_mu);
+        while (g_bc_wq_h == g_bc_wq_t) pthread_cond_wait(&g_bc_wq_cv, &g_bc_wq_mu);
+        bc_wjob_t job = g_bc_wq[g_bc_wq_t % BC_WQ_MAX];
+        g_bc_wq_t++;
+        g_bc_wq_bytes = g_bc_wq_bytes >= job.len ? g_bc_wq_bytes - job.len : 0;
+        pthread_mutex_unlock(&g_bc_wq_mu);
+        char tmp[760];
+        snprintf(tmp, sizeof tmp, "%s.%d.tmp", job.path, (int)getpid());
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            size_t put = 0;
+            while (put < job.len) { ssize_t r = write(fd, job.data + put, job.len - put); if (r <= 0) break; put += (size_t)r; }
+            close(fd);
+            if (put == job.len && rename(tmp, job.path) == 0) __atomic_add_fetch(&g_bc_cache_bytes, job.len, __ATOMIC_RELAXED);
+            else unlink(tmp);
+        }
+        free(job.data);
+    }
+    return NULL;
+}
+static void bc_cache_write_async(const char *cpath, const uint8_t *dst, size_t dst_bytes) {
+    uint64_t cur = __atomic_load_n(&g_bc_cache_bytes, __ATOMIC_RELAXED);
+    if (cur + dst_bytes > BC_CACHE_MAX_BYTES) return;
+    pthread_mutex_lock(&g_bc_wq_mu);
+    if (g_bc_wq_h - g_bc_wq_t >= BC_WQ_MAX || g_bc_wq_bytes + dst_bytes > BC_WQ_MAX_BYTES) {
+        pthread_mutex_unlock(&g_bc_wq_mu);
+        return;
+    }
+    uint8_t *copy = (uint8_t *)malloc(dst_bytes);
+    if (!copy) { pthread_mutex_unlock(&g_bc_wq_mu); return; }
+    memcpy(copy, dst, dst_bytes);
+    if (!g_bc_wq_on) {
+        g_bc_wq_on = 1;
+        pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&th, &a, bc_cache_writer_main, NULL)) g_bc_wq_on = 0;
+        pthread_attr_destroy(&a);
+        if (!g_bc_wq_on) { free(copy); pthread_mutex_unlock(&g_bc_wq_mu); return; }
+    }
+    bc_wjob_t *slot = &g_bc_wq[g_bc_wq_h % BC_WQ_MAX];
+    snprintf(slot->path, sizeof slot->path, "%s", cpath);
+    slot->data = copy; slot->len = dst_bytes;
+    g_bc_wq_h++; g_bc_wq_bytes += dst_bytes;
+    pthread_cond_signal(&g_bc_wq_cv);
+    pthread_mutex_unlock(&g_bc_wq_mu);
+}
+
+// Persistent parallel BC decode worker pool (3 helpers + caller = 4-way row-strip parallelism for large BC textures).
+// Dramatically cuts CPU decode spikes (e.g. 1024x1024 BC7 ~45 ms -> ~14 ms) on low-end ARM Mali-G52/G57 phones.
+enum { BC_DEC_HELPERS = 3 };
+typedef struct {
+    int fmt;
+    unsigned w, h_strip;
+    const uint8_t *src;
+    size_t src_bytes, pitch, src_slice;
+    uint8_t *dst;
+    size_t dst_bytes, row, dst_slice;
+    int err;
+} bc_strip_t;
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv_go, cv_done;
+    int started, gen, pending;
+    bc_strip_t strip[BC_DEC_HELPERS];
+} g_bc_dec = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER };
+static void *bc_dec_worker(void *arg) {
+    int id = (int)(intptr_t)arg;
+    char tnm[16]; snprintf(tnm, sizeof tnm, "bc-dec-%d", id);
+    pthread_setname_np(pthread_self(), tnm);
+    setpriority(PRIO_PROCESS, 0, 5);
+    int my_gen = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_bc_dec.mu);
+        while (g_bc_dec.gen == my_gen) pthread_cond_wait(&g_bc_dec.cv_go, &g_bc_dec.mu);
+        my_gen = g_bc_dec.gen;
+        bc_strip_t s = g_bc_dec.strip[id];
+        pthread_mutex_unlock(&g_bc_dec.mu);
+        int err = 0;
+        if (s.h_strip > 0) {
+            err = nvn_bc_decode(s.fmt, s.w, s.h_strip, 1,
+                                s.src, s.src_bytes, s.pitch, s.src_slice,
+                                s.dst, s.dst_bytes, s.row, s.dst_slice);
+        }
+        pthread_mutex_lock(&g_bc_dec.mu);
+        if (err) g_bc_dec.strip[id].err = err;
+        if (--g_bc_dec.pending == 0) pthread_cond_signal(&g_bc_dec.cv_done);
+        pthread_mutex_unlock(&g_bc_dec.mu);
+    }
+    return NULL;
+}
+static int bc_decode_parallel(int fmt, uint32_t w, uint32_t h, const uint8_t *src, size_t pitch, uint8_t *dst, size_t row) {
+    size_t ny = (h + 3u) / 4u;
+    if (ny < 32) {
+        return nvn_bc_decode(fmt, w, h, 1, src, pitch * ny, pitch, pitch * ny, dst, row * h, row, row * h);
+    }
+    static pthread_mutex_t g_bc_call_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&g_bc_call_mu);
+    pthread_mutex_lock(&g_bc_dec.mu);
+    if (!g_bc_dec.started) {
+        g_bc_dec.started = 1;
+        for (int i = 0; i < BC_DEC_HELPERS; i++) {
+            pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+            if (pthread_create(&th, &a, bc_dec_worker, (void *)(intptr_t)i)) { g_bc_dec.started = -1; pthread_attr_destroy(&a); break; }
+            pthread_attr_destroy(&a);
+        }
+    }
+    if (g_bc_dec.started < 0) {
+        pthread_mutex_unlock(&g_bc_dec.mu);
+        pthread_mutex_unlock(&g_bc_call_mu);
+        return nvn_bc_decode(fmt, w, h, 1, src, pitch * ny, pitch, pitch * ny, dst, row * h, row, row * h);
+    }
+    const size_t parts = BC_DEC_HELPERS + 1;
+    size_t y_blk = 0;
+    bc_strip_t main_s = {0};
+    for (size_t p = 0; p < parts; p++) {
+        size_t y_end = ((p + 1) * ny) / parts;
+        size_t nb = y_end > y_blk ? y_end - y_blk : 0;
+        uint32_t y_px = (uint32_t)(y_blk * 4u);
+        uint32_t h_st = 0;
+        if (nb > 0 && y_px < h) {
+            uint32_t rem = h - y_px;
+            h_st = (uint32_t)(nb * 4u) < rem ? (uint32_t)(nb * 4u) : rem;
+        }
+        bc_strip_t st = {
+            .fmt = fmt, .w = w, .h_strip = h_st,
+            .src = src + y_blk * pitch, .src_bytes = nb * pitch, .pitch = pitch, .src_slice = nb * pitch,
+            .dst = dst + (size_t)y_px * row, .dst_bytes = (size_t)h_st * row, .row = row, .dst_slice = (size_t)h_st * row,
+            .err = 0
+        };
+        if (p == 0) main_s = st;
+        else g_bc_dec.strip[p - 1] = st;
+        y_blk = y_end;
+    }
+    g_bc_dec.pending = BC_DEC_HELPERS;
+    g_bc_dec.gen++;
+    pthread_cond_broadcast(&g_bc_dec.cv_go);
+    pthread_mutex_unlock(&g_bc_dec.mu);
+    int err = main_s.h_strip ? nvn_bc_decode(main_s.fmt, main_s.w, main_s.h_strip, 1,
+                                             main_s.src, main_s.src_bytes, main_s.pitch, main_s.src_slice,
+                                             main_s.dst, main_s.dst_bytes, main_s.row, main_s.dst_slice) : 0;
+    pthread_mutex_lock(&g_bc_dec.mu);
+    while (g_bc_dec.pending > 0) pthread_cond_wait(&g_bc_dec.cv_done, &g_bc_dec.mu);
+    for (int i = 0; i < BC_DEC_HELPERS; i++) if (g_bc_dec.strip[i].err) err = g_bc_dec.strip[i].err;
+    pthread_mutex_unlock(&g_bc_dec.mu);
+    pthread_mutex_unlock(&g_bc_call_mu);
+    return err;
+}
+
 // Decodes BC blocks (rows of whole blocks pitch bytes apart, (h + 3) / 4 rows a slice, z slices) into w x h x z texels of f->vk, rows of w * f->dbpp bytes
-static void bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst) {
+// ds_shift > 0 uses a separate disk cache prefix (ds1_ / ds2_) so Low-RAM downscaled textures never collide with full-res caches.
+static void bc_decode_ex(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst, uint8_t ds_shift) {
     // Retain the renderer's tight-output interface; the shared decoder also
     // accepts explicit row/slice pitches and buffer bounds for copy paths.
     static const uint8_t formats[] = {0, 0x41, 0x42, 0x43, 0x44, 0x49, 0x4a, 0x4b, 0x4c, 0x50, 0x4f, 0x4d};
@@ -123,7 +286,8 @@ static void bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32
     int use_cache = (dst_bytes >= 16384 && dst_bytes <= (32u << 20)) && bc_cache_dir(cdir, sizeof cdir);
     if (use_cache) {
         key = bc_cache_fnv(formats[f->dec], w, h, z, src, src_bytes);
-        snprintf(cpath, sizeof cpath, "%s/%016llx_%u.bc", cdir, (unsigned long long)key, (unsigned)dst_bytes);
+        if (ds_shift) snprintf(cpath, sizeof cpath, "%s/ds%u_%016llx_%u.bc", cdir, (unsigned)ds_shift, (unsigned long long)key, (unsigned)dst_bytes);
+        else snprintf(cpath, sizeof cpath, "%s/%016llx_%u.bc", cdir, (unsigned long long)key, (unsigned)dst_bytes);
         int fd = open(cpath, O_RDONLY);
         if (fd >= 0) {
             size_t got = 0;
@@ -137,27 +301,18 @@ static void bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32
             }
         }
     }
-    if (nvn_bc_decode(formats[f->dec], w, h, z, src, src_bytes, pitch, slice,
-                      dst, dst_bytes, row, row * h)) die("[vk] invalid CPU BC decode layout");
+    int dec_rc = (z == 1 && h >= 128 && dst_bytes >= 65536)
+        ? bc_decode_parallel(formats[f->dec], w, h, src, pitch, dst, row)
+        : nvn_bc_decode(formats[f->dec], w, h, z, src, src_bytes, pitch, slice, dst, dst_bytes, row, row * h);
+    if (dec_rc) die("[vk] invalid CPU BC decode layout");
     if (use_cache) {
         uint64_t misses = __atomic_add_fetch(&g_bc_cache_misses, 1, __ATOMIC_RELAXED);
-        uint64_t cur = __atomic_load_n(&g_bc_cache_bytes, __ATOMIC_RELAXED);
-        if (cur + dst_bytes <= BC_CACHE_MAX_BYTES) {
-            char tmp[760];
-            snprintf(tmp, sizeof tmp, "%s.%d.tmp", cpath, (int)getpid());
-            int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (fd >= 0) {
-                size_t put = 0;
-                while (put < dst_bytes) { ssize_t r = write(fd, dst + put, dst_bytes - put); if (r <= 0) break; put += (size_t)r; }
-                close(fd);
-                if (put == dst_bytes && rename(tmp, cpath) == 0) __atomic_add_fetch(&g_bc_cache_bytes, dst_bytes, __ATOMIC_RELAXED);
-                else unlink(tmp);
-            }
-        }
+        bc_cache_write_async(cpath, dst, dst_bytes);
         if (misses == 1 || (misses <= 512 && !(misses & (misses - 1))))
-            VKLOG("BC disk cache miss #%llu (hits=%llu, written=%.1f MB)", (unsigned long long)misses, (unsigned long long)__atomic_load_n(&g_bc_cache_hits, __ATOMIC_RELAXED), __atomic_load_n(&g_bc_cache_bytes, __ATOMIC_RELAXED) / 1048576.0);
+            VKLOG("BC disk cache miss #%llu (hits=%llu, written=%.1f MB, async queued)", (unsigned long long)misses, (unsigned long long)__atomic_load_n(&g_bc_cache_hits, __ATOMIC_RELAXED), __atomic_load_n(&g_bc_cache_bytes, __ATOMIC_RELAXED) / 1048576.0);
     }
 }
+static void bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst) { bc_decode_ex(f, src, pitch, w, h, z, dst, 0); }
 void vk_bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst) { bc_decode(f, src, pitch, w, h, z, dst); }
 static pthread_mutex_t g_fmt_mu = PTHREAD_MUTEX_INITIALIZER;
 const vkfmt_t *vk_fmt(int f) {
@@ -296,24 +451,98 @@ VkFormat vk_int_fmt(uint32_t bytes, int sint) {
 // size, for storage views that read or write their raw bits (tex_desc_for). A cross-class list may make Adreno / Turnip drop UBWC on those images, which was not
 // measured, so only a profile that needs it turns it on (DM_VK_UBWC=7); without it such a view falls back to the image's own format (vk_tex_view_as)
 static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = (e && *e) ? atoi(e) : (vk_quirk(VQ_NO_UBWC) ? 0 : 3); } return v; }
-// DM_VK_DISABLE_MSAA: 1 forces 1x sample count (experimental opt-in only);
-// default 0 (native MSAA) on ALL GPUs including ARM Mali so 2x MSAA passes, CommandBufferDownsample
-// resolves, and sampler2DMS (OpTypeImage MS=1) fragment shaders render accurately without red-screen artifacts.
+// DM_VK_DISABLE_MSAA: "auto" (default) = native 2x MSAA on high-end GPUs (>=6 GB), 1x MSAA on low-end Mali
+// (Mali-G52/G57/G68, subgroups <= 8, driver < 40.0) or DM_LOW_RAM >= 1; 1 = force 1x; 0 = force native 2x MSAA.
 int vk_disable_msaa(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DM_VK_DISABLE_MSAA");
-        v = (e && *e) ? (atoi(e) != 0) : 0;
-        if (v) VKLOG("MSAA disabled (DM_VK_DISABLE_MSAA=1, experimental): multisample targets forced to 1x");
+        if (e && *e && strcmp(e, "auto") != 0) {
+            v = atoi(e) != 0;
+        } else {
+            v = (vk_mali_low_end() || vk_low_ram_tier() >= 1) ? 1 : 0;
+        }
+        if (v) VKLOG("MSAA disabled (%s): multisample targets forced to 1x & resolve bypassed",
+                     (e && *e && strcmp(e, "auto") != 0) ? "DM_VK_DISABLE_MSAA=1" : "auto low-end Mali / Low-RAM");
     }
     return v;
 }
-static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
+static uint8_t tex_downscale_shift(const tex_t *t, const vkfmt_t *f, uint32_t orig_w, uint32_t orig_h, uint32_t orig_levels) {
+    if (!f || !f->dec) return 0;   // CPU-decoded BC1-BC7 textures only (uncompressed UI/fonts/LUTs/RTs stay 100% native)
+    int ds = vk_tex_downscale();
+    if (ds <= 1) return 0;
+    const nvn_texdesc *d = &t->d;
+    // Strict whitelist: only mipmapped (>=3 levels) >=256x256 3D world BC textures.
+    // Never downscale UI/HUD/fonts/sprites (<3 mips or <256x256), LUTs (1024x32), render targets, or storage images.
+    if (orig_levels < 3u || orig_w < 256u || orig_h < 256u) return 0;
+    if (d->target != NVN_TEXTURE_TARGET_2D && d->target != NVN_TEXTURE_TARGET_2D_ARRAY && d->target != NVN_TEXTURE_TARGET_CUBEMAP) return 0;
+    if (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE)) return 0;
+    uint8_t shift = (ds >= 4) ? 2u : 1u;
+    if (shift >= orig_levels) shift = (uint8_t)(orig_levels - 1u);
+    return shift;
+}
+static int packaged_tex(const tex_t *t);
+static int cpu_content_tex(const tex_t *t, const vkfmt_t *f);
+int nvn_ft_written(const tex_t *t);
+static vkimg_t *img_new_ex(const tex_t *t, const vkfmt_t *f, int allow_scale) {
     vkimg_t *im = calloc(1, sizeof *im);
     const nvn_texdesc *d = &t->d;
-    im->w = d->width ? d->width : 1; im->h = d->target == 0 || d->target == 3 ? 1 : (d->height ? d->height : 1);
+    uint32_t orig_w = d->width ? d->width : 1;
+    uint32_t orig_h = d->target == 0 || d->target == 3 ? 1 : (d->height ? d->height : 1);
+    uint32_t orig_levels = d->levels ? d->levels : 1;
+    im->orig_w = orig_w; im->orig_h = orig_h;
+    im->w = orig_w; im->h = orig_h;
     im->d = d->target == 2 ? (d->depth ? d->depth : 1) : 1; im->layers = layers_of(d);
-    im->levels = d->levels ? d->levels : 1; im->samples = (d->samples > 1 && !vk_disable_msaa()) ? d->samples : 1; im->target = d->target; im->nvn_format = d->format;
+    im->levels = orig_levels; im->samples = (d->samples > 1 && !vk_disable_msaa()) ? d->samples : 1; im->target = d->target; im->nvn_format = d->format;
+    im->no_scale = !allow_scale;
+    im->ds_shift = allow_scale ? tex_downscale_shift(t, f, orig_w, orig_h, orig_levels) : 0;
+    if (im->ds_shift) {
+        im->w = (orig_w >> im->ds_shift) ? (orig_w >> im->ds_shift) : 1u;
+        im->h = (orig_h >> im->ds_shift) ? (orig_h >> im->ds_shift) : 1u;
+        im->levels = orig_levels > im->ds_shift ? orig_levels - im->ds_shift : 1u;
+        static uint64_t ds_cnt;
+        if (++ds_cnt <= 8) VKLOG("[low-ram] BC texture downscale 1/%ux: %ux%u (%u mips) -> %ux%u (%u mips) fmt %#x",
+                                 1u << im->ds_shift, orig_w, orig_h, orig_levels, im->w, im->h, im->levels, d->format);
+    } else if (allow_scale) {
+        float rsc = vk_render_scale();
+        int is_gpu_rt = ((d->flags & (NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE)) != 0) || f->depth || f->stencil || d->samples > 1;
+        // Scale ONLY intermediate 16:9 3D GPU render targets (320x180 .. 1280x720, bpb >= 2 or depth/stencil,
+        // single-level, uncompressed, non-display, non-packaged, non-CPU-written) on Mid/Low/Ultra-Low GPUs.
+        // Requiring is_gpu_rt && !nvn_ft_written(t) prevents CPU-filled 1280x720 2D/UI/video textures from being
+        // falsely scaled and immediately unscaled by pkg_upload_() / CopyBufferToTexture!
+        if (rsc < 0.995f && is_gpu_rt && (d->target == NVN_TEXTURE_TARGET_2D || d->target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE) &&
+            orig_levels <= 1 && im->d <= 1 && !f->compressed && !f->dec && (f->bpb >= 2 || f->depth || f->stencil) &&
+            !(d->flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) &&
+            !t->has_pkg_data && !t->has_layout && !packaged_tex(t) && !nvn_ft_written(t) && !cpu_content_tex(t, f) &&
+            orig_w >= 320u && orig_w <= 1280u && orig_h >= 180u && orig_h <= 720u && orig_w * 9u == orig_h * 16u) {
+            uint32_t sw = ((uint32_t)(orig_w * rsc + 1.0f)) & ~1u;
+            uint32_t sh = ((uint32_t)(orig_h * rsc + 1.0f)) & ~1u;
+            if (sw < 16u) sw = 16u;
+            if (sh < 16u) sh = 16u;
+            im->w = sw; im->h = sh;
+            static uint64_t rs_cnt;
+            if (++rs_cnt <= 8) VKLOG("[low-ram] 3D render target scale %.2fx: %ux%u -> %ux%u fmt %#x flags=%#x samp=%u",
+                                     rsc, orig_w, orig_h, im->w, im->h, d->format, d->flags, im->samples);
+        } else {
+            // Shadow Target Downscale (DM_VK_SHADOW_SCALE=auto|0.5):
+            // Cuts shadow fillrate & Z/VSM bandwidth by 75% on Mid/Low/Ultra-Low GPUs (Tier 1-3) for large square
+            // shadow render targets (>=1024x1024), covering BOTH depth/depth-stencil AND COMPRESSIBLE color/VSM
+            // shadow RTs (e.g. Doraemon SoS 1024x1024 VkFormat 37 RGBA8_UNORM -> 512x512).
+            float ssc = vk_shadow_scale();
+            if (ssc < 0.995f && d->target == NVN_TEXTURE_TARGET_2D && orig_levels <= 1 && im->d <= 1 &&
+                !f->compressed && !f->dec && (f->depth || (d->flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE)) &&
+                !(d->flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) &&
+                !t->has_pkg_data && !t->has_layout && !packaged_tex(t) && !nvn_ft_written(t) && !cpu_content_tex(t, f) &&
+                orig_w == orig_h && orig_w >= 1024u && orig_w <= 4096u) {
+                uint32_t sw = ((uint32_t)(orig_w * ssc + 1.0f)) & ~1u;
+                if (sw < 256u) sw = 256u;
+                im->w = sw; im->h = sw;
+                static uint64_t ss_cnt;
+                if (++ss_cnt <= 8) VKLOG("[low-end] shadow target scaled %.2fx: %ux%u -> %ux%u fmt %#x (vk %d) flags=%#x",
+                                         ssc, orig_w, orig_h, im->w, im->h, d->format, f->vk, d->flags);
+            }
+        }
+    }
     im->fmt = f->vk; im->vtype = vtype_of(d->target); im->aspect = aspect_of(f);
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, f->vk, &fp);
     VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -359,6 +588,152 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     VKCHK(vkBindImageMemory(V.dev, im->img, im->mem, moff));
     im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     return im;
+}
+static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) { return img_new_ex(t, f, 1); }
+static void vk_tex_view_drop_all(vkimg_t *im);
+int vk_tex_unscale_cb(VkCommandBuffer cb, vkimg_t *im, const tex_t *t) {
+    if (!vk_img_valid(im) || !t || im->ds_shift) return 0;
+    if (!im->orig_w || !im->orig_h || (im->w == im->orig_w && im->h == im->orig_h)) return 0;
+    const vkfmt_t *f = vk_fmt(im->nvn_format);
+    if (!f) f = vk_fmt(t->d.format);
+    if (!f) return 0;
+    vkimg_t *fresh = img_new_ex(t, f, 0);
+    if (!fresh) return 0;
+    static uint64_t unscale_n;
+    if (++unscale_n <= 16) VKLOG("[low-ram] unscaled image %ux%u -> %ux%u fmt %#x (1:1 for CopyBufferToTexture / deswizzle)", im->w, im->h, fresh->w, fresh->h, im->nvn_format);
+    // Preserve already-rendered 3D colour pixels when unscaling a live GPU render target (e.g. 858x482 -> 1280x720
+    // on scene transitions / CopyTextureToBuffer) so the unscaled image is NEVER black/UNDEFINED for 1 frame!
+    int preserved = 0;
+    if (cb && im->gpu_w && im->layout == VK_IMAGE_LAYOUT_GENERAL && (im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) &&
+        !f->compressed && im->samples == 1 && fresh->samples == 1 && im->vtype == VK_IMAGE_VIEW_TYPE_2D) {
+        VkImageMemoryBarrier pre[2] = {
+            {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+             VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+             VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+             im->img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, im->layers}},
+            {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+             0, VK_ACCESS_TRANSFER_WRITE_BIT,
+             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+             fresh->img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, fresh->levels, 0, fresh->layers}}
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
+        uint32_t nl = im->layers < fresh->layers ? im->layers : fresh->layers;
+        VkImageBlit bl = {
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, nl}, {{0, 0, 0}, {(int32_t)im->w, (int32_t)im->h, 1}},
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, nl}, {{0, 0, 0}, {(int32_t)fresh->w, (int32_t)fresh->h, 1}}
+        };
+        vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, fresh->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+                       f->is_int ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+        VkImageMemoryBarrier post = {
+            VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            fresh->img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, fresh->levels, 0, fresh->layers}
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &post);
+        preserved = 1;
+    }
+    vk_lrz_forget(im);
+    vk_tex_view_drop_all(im);
+    if (im->fb_copy) {
+        vk_tex_view_drop_all(im->fb_copy);
+        if (im->fb_copy->sub) vk_defer_free_image_sub(im->fb_copy->img, im->fb_copy->sub);
+        else vk_defer_free_image(im->fb_copy->img, im->fb_copy->mem);
+        free(im->fb_copy); im->fb_copy = NULL;
+    }
+    if (im->sub) vk_defer_free_image_sub(im->img, im->sub);
+    else vk_defer_free_image(im->img, im->mem);
+    im->img = fresh->img; im->mem = fresh->mem; im->sub = fresh->sub;
+    im->w = fresh->w; im->h = fresh->h; im->d = fresh->d;
+    im->levels = fresh->levels; im->layers = fresh->layers; im->samples = fresh->samples;
+    im->usage = fresh->usage; im->cflags = fresh->cflags;
+    im->fixed_fmt = fresh->fixed_fmt; im->fmt2 = fresh->fmt2;
+    im->fmt_cls[0] = fresh->fmt_cls[0]; im->fmt_cls[1] = fresh->fmt_cls[1];
+    im->layout = preserved ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    im->no_scale = 1;
+    free(fresh);
+    return 1;
+}
+int vk_tex_unscale(vkimg_t *im, const tex_t *t) { return vk_tex_unscale_cb(NULL, im, t); }
+vkimg_t *vk_tex_feedback_snapshot(VkCommandBuffer cb, vkimg_t *im) {
+    if (!vk_img_valid(im) || !cb || im->samples > 1 || im->vtype == VK_IMAGE_VIEW_TYPE_3D) return NULL;
+    if (!im->fb_copy || im->fb_copy->w != im->w || im->fb_copy->h != im->h || im->fb_copy->fmt != im->fmt) {
+        if (im->fb_copy) {
+            vk_tex_view_drop_all(im->fb_copy);
+            if (im->fb_copy->sub) vk_defer_free_image_sub(im->fb_copy->img, im->fb_copy->sub);
+            else vk_defer_free_image(im->fb_copy->img, im->fb_copy->mem);
+            free(im->fb_copy); im->fb_copy = NULL;
+        }
+        vkimg_t *fb = calloc(1, sizeof *fb);
+        if (!fb) return NULL;
+        *fb = *im;
+        fb->img = VK_NULL_HANDLE; fb->mem = VK_NULL_HANDLE; fb->sub = NULL;
+        fb->full = VK_NULL_HANDLE; fb->tbuf = VK_NULL_HANDLE; fb->bc_draw = NULL; fb->bc_of = NULL;
+        fb->fb_copy = NULL; fb->novl = 0; fb->packaged = 0; fb->pkg_mem = NULL; fb->lin_mem = NULL;
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, im->cflags,
+            VK_IMAGE_TYPE_2D, im->fmt, {im->w, im->h, 1}, im->levels, im->layers, VK_SAMPLE_COUNT_1_BIT,
+            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkFormat fl[4] = {im->fmt, im->fmt2, im->fmt_cls[0], im->fmt_cls[1]};
+        uint32_t nfl = 1;
+        if (im->fmt2) fl[nfl++] = im->fmt2;
+        if (im->fmt_cls[0]) fl[nfl++] = im->fmt_cls[0];
+        if (im->fmt_cls[1]) fl[nfl++] = im->fmt_cls[1];
+        VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, nfl, fl};
+        if (im->fixed_fmt) ci.pNext = &fli;
+        if (vkCreateImage(V.dev, &ci, NULL, &fb->img) != VK_SUCCESS) { free(fb); return NULL; }
+        VkMemoryRequirements rq; vkGetImageMemoryRequirements(V.dev, fb->img, &rq);
+        VkDeviceSize moff = 0;
+        fb->mem = vk_image_memory(&rq, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT), &moff, &fb->sub);
+        if (!fb->mem) { vkDestroyImage(V.dev, fb->img, NULL); free(fb); return NULL; }
+        VKCHK(vkBindImageMemory(V.dev, fb->img, fb->mem, moff));
+        fb->usage = ci.usage; fb->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        im->fb_copy = fb;
+        static uint64_t fb_cnt;
+        if (++fb_cnt <= 8) VKLOG("self-feedback snapshot image %ux%u fmt %d allocated (eliminates Mali TBDR attachment+sampler UB)", im->w, im->h, im->fmt);
+    }
+    vkimg_t *fb = im->fb_copy;
+    vk_tex_prepare(cb, im);
+    if (fb->layout != VK_IMAGE_LAYOUT_GENERAL) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            fb->img, {fb->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        fb->layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    // Targeted per-image barriers (replaces 2x global ALL_COMMANDS stalls): order active attachment write -> copy -> fragment read,
+    // including TRANSFER_WRITE WAW sync on fb->img from any prior snapshot in the same submission.
+    VkImageMemoryBarrier pre[2] = {
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+         im->img, {im->aspect, 0, 1, 0, im->layers}},
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+         fb->img, {fb->aspect, 0, 1, 0, fb->layers}}
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
+    VkImageCopy cp = {{im->aspect, 0, 0, im->layers}, {0, 0, 0}, {fb->aspect, 0, 0, fb->layers}, {0, 0, 0}, {im->w, im->h, 1}};
+    vkCmdCopyImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, fb->img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    VkImageMemoryBarrier post[2] = {
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+         fb->img, {fb->aspect, 0, 1, 0, fb->layers}},
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+         VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+         im->img, {im->aspect, 0, 1, 0, im->layers}}
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, NULL, 0, NULL, 2, post);
+    return fb;
 }
 typedef struct { uint32_t fmt, samples, aspect; } msaa_rp_key;
 static nvn_hmap g_msaa_clear_rps = {.klen = sizeof(msaa_rp_key)};
@@ -439,7 +814,7 @@ void vk_clear_msaa_subresource(VkCommandBuffer cb, vkimg_t *im, uint32_t mip, ui
     vk_img_barrier_all(cb);
 }
 void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) {
-    if (im->layout == VK_IMAGE_LAYOUT_GENERAL) return;
+    if (!vk_img_valid(im) || im->layout == VK_IMAGE_LAYOUT_GENERAL) return;
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im->img, {im->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
@@ -460,7 +835,12 @@ void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) {
     if (im->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) { VkClearDepthStencilValue z = {0, 0}; vkCmdClearDepthStencilImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r); }
     else { VkClearColorValue z = {{0, 0, 0, 0}}; vkCmdClearColorImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r); }
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+        (im->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                                                : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)),
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im->img, r};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 1, &ib);
 }
 // Upload a packaged texture from guest memory: each level and layer deswizzled into scratch memory, copied in by the upload command buffer.
 // A texture of a sparse virtual pool (hle_nvn.c: OCTOPATH TRAVELER streams each texture into a virtual pool of its own and maps its tiles from physical pools) has no memory at its
@@ -470,6 +850,7 @@ int nvn_sparse_pool(const void *pool); uint64_t nvn_sparse_gen(void); uint64_t n
 int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp); void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n);
 static int sparse_tex(const tex_t *t) { return t->pool && nvn_sparse_pool(t->pool); }
 uint64_t g_pkg_n, g_pkg_bytes, g_pkg_ns;   // packaged texture uploads: count, bytes, CPU time (the replay's per-frame line)
+static uint64_t g_wseq;                    // monotonic content-write sequence (attachments, copies, clears, CPU pkg/lin uploads)
 static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
 static uint64_t pkg_hash(const uint8_t *m, size_t n) {   // FNV-1a over 8-byte words
     uint64_t h = 1469598103934665603ull; size_t i = 0;
@@ -480,6 +861,7 @@ static uint64_t pkg_hash(const uint8_t *m, size_t n) {   // FNV-1a over 8-byte w
 static void pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
     pkg_upload_(im, t, f);
+    im->wseq = ++g_wseq;   // CPU re-upload refreshes content age over any older freed overlapping RT in the same pool
     clock_gettime(CLOCK_MONOTONIC, &b); g_pkg_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); g_pkg_n++; g_pkg_bytes += t->L.size;
 }
 static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
@@ -488,6 +870,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
               (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
               (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_block_h, im->packaged > 1 ? " (again)" : ""); } }
     if (im->packaged < 100) im->packaged++;
+    if (!im->ds_shift && (im->orig_w != im->w || im->orig_h != im->h)) vk_tex_unscale(im, t);
     VkCommandBuffer cb = vk_upload_cmd();
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
     const uint8_t *mem = t->mem; uint8_t *copy = NULL;
@@ -500,6 +883,9 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
             VKLOG("sparse upload: serial %llu %ux%ux%u format %#x levels %u flags %#x size %#llx mem %p pool %p tileH %u: %#llx bytes not mapped%s", (unsigned long long)t->serial, t->d.width, t->d.height,
                   t->d.depth, t->d.format, im->levels, t->d.flags, (unsigned long long)t->L.size, (const void *)t->mem, t->pool, t->L.tileH, (unsigned long long)miss, im->packaged > 1 ? " (again)" : ""); } }
     } else {
+        // Ban texture-overlapping 64 KB blocks from copied-pool hot_blocks so CPU writes to dynamic textures/LUTs
+        // ALWAYS fault and advance nvn_dirty_since_span() (fixes skipped re-uploads under safe_sync=1).
+        vk_pool_ban_hot(t->mem, t->L.size);
         nvn_dirty_protect(t->mem, t->L.size);
         im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
         im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0; im->pkg_hash = pkg_hash(t->mem, t->L.size);
@@ -508,6 +894,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1, bpb = f->bpb;
     if (!bpb) { free(copy); VKRED_ONCE(12, "packaged texture format %#x has no block size", t->d.format); return; }
     for (unsigned lv = 0; lv < im->levels; lv++) {
+        unsigned src_lv = lv + (unsigned)im->ds_shift;
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = im->d >> lv ? im->d >> lv : 1;
         uint32_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh; size_t pitch = (size_t)bx * bpb, slab = pitch * by * z;
         for (unsigned ly = 0; ly < im->layers; ly++) {
@@ -516,11 +903,28 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
             if (linear) {   // linear storage: rows of the texture's stride, one level, one layer
                 size_t stride = t->d.stride ? t->d.stride : pitch;
                 for (uint32_t y = 0; y < by * z; y++) memcpy(dst + y * pitch, mem + (size_t)y * stride, pitch);
-            } else if (nvn_deswizzle(&t->d, lv, ly, mem, dst, pitch)) { free(blocks); free(copy); VKRED_ONCE(13, "deswizzle refused texture format %#x target %d", t->d.format, t->d.target); return; }
-            if (blocks) { dst = vk_scratch((size_t)w * h * z * f->dbpp, 16, &sb, &so); bc_decode(f, blocks, pitch, w, h, z, dst); free(blocks); }   // (BC the device lacks)
+            } else if (nvn_deswizzle(&t->d, src_lv, ly, mem, dst, pitch)) { free(blocks); free(copy); VKRED_ONCE(13, "deswizzle refused texture format %#x target %d", t->d.format, t->d.target); return; }
+            if (blocks) { dst = vk_scratch((size_t)w * h * z * f->dbpp, 16, &sb, &so); bc_decode_ex(f, blocks, pitch, w, h, z, dst, im->ds_shift); free(blocks); }   // (BC the device lacks)
             VkBufferImageCopy r = {so, 0, 0, {im->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, z}};
             vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
         }
+    }
+    // Explicit per-image TRANSFER_WRITE -> SHADER_READ/ATTACHMENT barrier on Mali AFBC/L2 (covers 1024x32 LUT,
+    // 16x16 auto-exposure, and streamed textures uploaded into s->up even with strict_barriers=0).
+    {
+        VkImageMemoryBarrier pb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+            ((im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                                                      : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)),
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            im->img, {im->aspect, 0, im->levels, 0, im->layers}};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             ((im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                                                       : (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)),
+                             0, 0, NULL, 0, NULL, 1, &pb);
     }
     free(copy);
 }
@@ -531,11 +935,19 @@ static void vk_tex_view_drop_all(vkimg_t *im);
 // Images over the same memory with different descriptions (the storage key differs) are separate Vulkan images: on the Switch a texture sees what another
 // one over its memory rendered, here it does not. They are linked both ways at creation (up to 8 each), and a sampled image older than an overlapping
 // image's last rendering is logged ([alias] stale read), to find what a game reinterprets
-static uint64_t g_wseq;
+void vk_tex_mark_written(vkimg_t *im) {
+    if (!vk_img_valid(im)) return;
+    im->wseq = ++g_wseq;
+    im->gpu_w = 1;
+}
+extern uint64_t g_tex_frame;   // presents so far, for alias lifetime and packaged textures' last use (vk_tex_sweep)
 static void alias_link(vkimg_t *im) {
     for (uint32_t i = 0; i < g_by_key.cap; i++) {
         vkimg_t *o = g_by_key.vals[i]; if (!o || o == im || o->pool != im->pool || o->off >= im->off + im->size || im->off >= o->off + o->size) continue;
         if (im->novl < 8 && o->novl < 8) { im->ovl[im->novl++] = o; o->ovl[o->novl++] = im; }
+        // A newly created texture over pool memory last used >10 presents ago is sequential pool reuse
+        // (e.g. scene transition reusing a freed 1280x720 RT for a 1024x32 LUT), not a live stale alias.
+        if (g_tex_frame > o->used + 10u && o->wseq > im->rseen) im->rseen = o->wseq;
     }
 }
 static void alias_unlink(vkimg_t *im) {
@@ -546,23 +958,28 @@ static void alias_check(vkimg_t *im) {   // im is about to be sampled
     for (int i = 0; i < im->novl; i++) {
         vkimg_t *o = im->ovl[i]; if (o->wseq <= im->wseq || o->wseq <= im->rseen) continue;
         im->rseen = o->wseq;
+        // Skip freed transient RTs untouched for >10 frames (sequential allocator reuse across scene transitions).
+        if (g_tex_frame > o->used + 10u) continue;
         static int n; if (n++ < 200) VKLOG("[alias] stale read: %ux%u fmt %#x levels %u at %+lld..%+lld sampled, but %ux%u fmt %#x levels %u at %+lld..%+lld rendered over its memory later",
             im->w, im->h, im->nvn_format, im->levels, (long long)im->off, (long long)(im->off + im->size), o->w, o->h, o->nvn_format, o->levels, (long long)o->off, (long long)(o->off + o->size));
     }
 }
-extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' last use (vk_tex_sweep)
 // Images are kept per storage key until their pool goes, so a texture the game streams into memory another texture had before gets an image of its own and the old one
 // stayed: Xenoblade Chronicles 3 streams its field textures through pools that live for good, the device's GPU memory grew by about 470 MB a minute while walking (6.3 GB
 // after 20 minutes) and Android's low-memory killer ended the game. A new image takes over: the images of the same pool over its memory that were not looked up in the
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
-enum { EVICT_KEEP = 300 };
+enum { EVICT_KEEP = 900 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
 static void img_drop(vkimg_t *im) { if (im->bc_draw) { vkimg_t *d = im->bc_draw; vk_lrz_forget(d); vk_tex_view_drop_all(d); if (d->sub) vk_defer_free_image_sub(d->img, d->sub); else vk_defer_free_image(d->img, d->mem); free(d); }
-    vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem && !vk_pool_is_copied(im->pkg_mem, im->pkg_len)) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+    if (im->fb_copy) { vkimg_t *fb = im->fb_copy; vk_lrz_forget(fb); vk_tex_view_drop_all(fb); if (fb->sub) vk_defer_free_image_sub(fb->img, fb->sub); else vk_defer_free_image(fb->img, fb->mem); free(fb); }
+    vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem && !vk_pool_is_copied(im->pkg_mem, im->pkg_len)) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; uint64_t vb = im->vram_bytes ? im->vram_bytes : (im->size > 0 ? (uint64_t)im->size : 0); g_img_bytes = g_img_bytes >= vb ? g_img_bytes - vb : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
-        vkimg_t *o = g_by_key.vals[i]; if (!o || o->pool != pool || o->off >= off + size || off >= o->off + o->size || g_tex_frame - o->used < EVICT_KEEP) continue;
+        vkimg_t *o = g_by_key.vals[i]; if (!o || o->pool != pool || o->off >= off + size || off >= o->off + o->size || g_tex_frame <= o->used || g_tex_frame - o->used < EVICT_KEEP) continue;
+        // Never prematurely evict active/recent GPU render targets (e.g. 512x512 RGBA16F/R16F fluid/wind RTs) or 1024x32 Color Grading LUTs.
+        if (o->orig_w == 1024u && o->orig_h == 32u) continue;
+        if (o->gpu_w && o->rt_last && g_tex_frame - o->used < 3600u) continue;
         memcpy(&ks[n++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof(akey));
     }
     for (int j = 0; j < n; j++) { vkimg_t *o = nvn_hm_get(&g_by_key, &ks[j]); if (!o) continue; nvn_hm_del(&g_by_key, &ks[j]); img_drop(o); g_img_evicted++; }
@@ -590,7 +1007,13 @@ static vkimg_t *vk_tex_(const tex_t *t) {
         if (keyed) evict_overlaps(k.pool, t->off, (int64_t)t->L.size);
         im = img_new(t, vk_fmt(k.d.format)); if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
         if (k.family) im->family_formats = texture_family_bit(t->d.format);
-        im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = t->d.flags; g_img_n++; g_img_bytes += t->L.size;
+        im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = t->d.flags;
+        uint64_t vb = t->L.size;
+        if (im->ds_shift) vb = vb >> (2u * im->ds_shift);
+        else if (im->orig_w && im->orig_h && (im->w != im->orig_w || im->h != im->orig_h)) vb = (vb * im->w / im->orig_w) * im->h / im->orig_h;
+        if (t->L.size && vb < 4096) vb = 4096;
+        im->vram_bytes = vb;
+        g_img_n++; g_img_bytes += vb;
         if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);
     }
     im->used = g_tex_frame;
@@ -660,6 +1083,49 @@ void vk_tex_sweep(void) {
             runs = nvn_dirty_runs();
         }
     }
+    int low_ram = vk_low_ram_tier();
+    uint64_t done_f = vk_fence_done();
+    if (low_ram >= 1) {
+        // Aggressive anti-LMK texture eviction on 3-4 GB RAM devices: keep live VRAM compact (96 MB / 64 MB)
+        // and release stale area textures after 5-10 s of disuse once GPU fence completes.
+        uint64_t budget = (low_ram >= 2) ? (64ull << 20) : (96ull << 20);
+        uint64_t max_age = (low_ram >= 2) ? 240ull : 300ull;
+        if (g_img_bytes > budget) {
+            akey ev[64]; int nev = 0;
+            for (uint32_t i = 0; i < g_by_key.cap && nev < 64; i++) {
+                vkimg_t *im = g_by_key.vals[i];
+                if (!im || !im->packaged || im->gpu_w || im->rt_last) continue;
+                if (im->orig_w == 1024u && im->orig_h == 32u) continue;
+                if (im->last_use > done_f) continue;   // never evict textures still referenced by in-flight GPU work
+                if (g_tex_frame > im->pkg_used && g_tex_frame - im->pkg_used >= max_age) {
+                    memcpy(&ev[nev++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof ev[0]);
+                }
+            }
+            for (int i = 0; i < nev; i++) {
+                vkimg_t *im = nvn_hm_del(&g_by_key, &ev[i]);
+                if (im) { img_drop(im); g_img_evicted++; }
+            }
+            if (nev) VKLOG("[low-ram] evicted %d stale packaged textures (live %.0f MB, tier %d)", nev, g_img_bytes / 1048576.0, low_ram);
+        }
+    } else if (g_img_bytes > (600ull << 20)) {
+        // Tier 0 (>=6 GB RAM): never run aggressive 128 MB low-RAM eviction (even on Mali-G52/G57);
+        // only trim truly stale packaged textures (>60 s unused and GPU-idle) if live VRAM exceeds 600 MB.
+        akey ev[32]; int nev = 0;
+        for (uint32_t i = 0; i < g_by_key.cap && nev < 32; i++) {
+            vkimg_t *im = g_by_key.vals[i];
+            if (!im || !im->packaged || im->gpu_w || im->rt_last) continue;
+            if (im->orig_w == 1024u && im->orig_h == 32u) continue;
+            if (im->last_use > done_f) continue;
+            if (g_tex_frame > im->pkg_used && g_tex_frame - im->pkg_used >= 3600ull) {
+                memcpy(&ev[nev++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof ev[0]);
+            }
+        }
+        for (int i = 0; i < nev; i++) {
+            vkimg_t *im = nvn_hm_del(&g_by_key, &ev[i]);
+            if (im) { img_drop(im); g_img_evicted++; }
+        }
+        if (nev) VKLOG("[vram-guard] trimmed %d stale packaged textures (live %.0f MB, tier 0)", nev, g_img_bytes / 1048576.0);
+    }
     pthread_mutex_unlock(&g_img_mu);
     free(v);
     static uint64_t total; total += idle + lru;
@@ -703,7 +1169,7 @@ static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {   // 1 = th
     if (stride % f->bpb || stride < (size_t)im->w * f->bpb || !vk_buf_at((uint64_t)(uintptr_t)t->mem, (uint64_t)stride * (im->h - 1) + (uint64_t)im->w * f->bpb, &b, &o) || o % f->bpb) return 0;
     // the GPU wrote it (a clear, a copy, a storage write): it holds that until the CPU writes its storage again, which its pages, set read-only, tell
     size_t len = stride * (im->h - 1) + (size_t)im->w * f->bpb;
-    if (im->gpu_w && !im->lin_mem) { nvn_dirty_protect(t->mem, len); im->lin_stamp = nvn_dirty_now(); im->lin_span = nvn_dirty_span(t->mem, len); im->lin_mem = t->mem; im->lin_len = len; return 1; }
+    if (im->gpu_w && !im->lin_mem) { vk_pool_ban_hot(t->mem, len); nvn_dirty_protect(t->mem, len); im->lin_stamp = nvn_dirty_now(); im->lin_span = nvn_dirty_span(t->mem, len); im->lin_mem = t->mem; im->lin_len = len; return 1; }
     if (im->gpu_w) { if (!nvn_dirty_since_span(im->lin_span, t->mem, len, im->lin_stamp)) return 1; nvn_dirty_release(im->lin_mem, im->lin_len); im->lin_mem = NULL; im->gpu_w = 0; im->lin_gen = 0; }
     VkCommandBuffer cb = vk_upload_cmd();
     if (im->lin_gen == g_up_gen) return 1;
@@ -712,6 +1178,7 @@ static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {   // 1 = th
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
     VkBufferImageCopy r = {o, (uint32_t)(stride / f->bpb), 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, 1}};
     vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    im->wseq = ++g_wseq;   // CPU linear upload refreshes content age over any older freed overlapping RT in the same pool
     return 1;
 }
 // A texture the CPU filled before its first use, as nxnative's tex_cpu_content (nvn_mtl.m) takes it: a sampled block-compressed texture (BC and ASTC are not colour-renderable, so
@@ -856,11 +1323,16 @@ static int bc_standin_ok(const vkimg_t *im, const vkfmt_t *cf, const vkfmt_t *vf
 VkImageView vk_tex_view_as(const tex_t *t, const view_t *vw, int dim, int arrayed, int as_attachment, vkimg_t **img_out, VkFormat vfmt) {
     vkimg_t *im = vk_tex(t); if (img_out) *img_out = im;
     if (!im) return VK_NULL_HANDLE;
-    if (as_attachment) { im->wseq = ++g_wseq; im->gpu_w = 1; } else if (im->novl) alias_check(im);
+    if (as_attachment) { im->wseq = ++g_wseq; im->gpu_w = 1; }
+    else { im->ever_sampled = 1; if (im->novl) alias_check(im); }
     vk_watch(im, as_attachment ? "attachment" : "sampled or image");
     if (!as_attachment) { void vk_texdump_note(vkimg_t *im); vk_texdump_note(im); }
     const vkfmt_t *f = vk_fmt(vw && vw->set_format ? vw->format : t->d.format); if (!f) f = vk_fmt(t->d.format);
     uint32_t lv0 = vw && vw->set_levels ? vw->base_level : 0, nlv = vw && vw->set_levels ? vw->nlevels : im->levels - lv0;
+    if (im->ds_shift) {
+        if (lv0 >= im->ds_shift) lv0 -= im->ds_shift;
+        else { if (nlv > im->ds_shift - lv0) nlv -= (im->ds_shift - lv0); else nlv = 1; lv0 = 0; }
+    }
     if (lv0 >= im->levels) lv0 = im->levels - 1; if (!nlv || lv0 + nlv > im->levels) nlv = im->levels - lv0;
     // a 3D image drawn into: the view's layers are depth slices of its level (the image is 2D-array compatible). Xenoblade Chronicles 3 renders its 16x16x16 colour grading
     // LUT one slice per pass through 2D views at layers 0-15; clamped to the image's one layer, every slice went to slice 0, and the graded title sky came out flat blue
@@ -942,6 +1414,45 @@ VkImageView vk_tex_view_as(const tex_t *t, const view_t *vw, int dim, int arraye
     nvn_hm_put(&g_views, &im, nv);
     pthread_mutex_unlock(&g_view_mu);
     vk_view_fmt = fmt; vk_view_layers = nly; vk_view_usage = uci.usage;
+    return view;
+}
+VkImageView vk_tex_view_of_img(vkimg_t *im, const tex_t *t, const view_t *vw, int dim, int arrayed) {
+    if (!vk_img_valid(im) || !t) return VK_NULL_HANDLE;
+    const vkfmt_t *f = vk_fmt(vw && vw->set_format ? vw->format : t->d.format); if (!f) f = vk_fmt(t->d.format);
+    if (!f) return VK_NULL_HANDLE;
+    uint32_t lv0 = vw && vw->set_levels ? vw->base_level : 0, nlv = vw && vw->set_levels ? vw->nlevels : im->levels - lv0;
+    if (lv0 >= im->levels) lv0 = im->levels - 1; if (!nlv || lv0 + nlv > im->levels) nlv = im->levels - lv0;
+    uint32_t ly0 = vw && vw->set_layers ? vw->min_layer : 0, nly = vw && vw->set_layers ? vw->nlayers : im->layers - ly0;
+    if (ly0 >= im->layers) ly0 = im->layers - 1; if (!nly || ly0 + nly > im->layers) nly = im->layers - ly0;
+    int target = vw && vw->set_target ? vw->target : im->target;
+    VkImageViewType type = vtype_of(target);
+    if (dim != 0xff) {
+        VkImageViewType want = dim == 0 ? (arrayed ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D) : dim == 1 ? (arrayed ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D) :
+                               dim == 2 ? VK_IMAGE_VIEW_TYPE_3D : dim == 3 ? (arrayed ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE) : type;
+        if (want == VK_IMAGE_VIEW_TYPE_2D && type == VK_IMAGE_VIEW_TYPE_2D_ARRAY) nly = 1;
+        type = want;
+    }
+    if (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_3D) nly = 1;
+    VkImageAspectFlags aspect = im->aspect;
+    if (aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+        aspect = (!f->depth || t->stencil || (vw && vw->set_dsmode && vw->dsmode == 1)) ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+    VkComponentMapping swz = sample_swizzle(&f->swz, t, vw, 0);
+    VkFormat fmt = f->vk;
+    if (im->fixed_fmt && fmt != im->fmt && fmt != srgb_twin(im->fmt) && fmt != im->fmt_cls[0] && fmt != im->fmt_cls[1]) fmt = im->fmt;
+    pthread_mutex_lock(&g_view_mu);
+    vview *head = nvn_hm_get(&g_views, &im);
+    for (vview *v = head; v; v = v->next)
+        if (v->type == type && v->fmt == fmt && v->lv0 == lv0 && v->nlv == nlv && v->ly0 == ly0 && v->nly == nly && v->aspect == aspect && !v->attach && !memcmp(&v->swz, &swz, sizeof swz)) {
+            pthread_mutex_unlock(&g_view_mu); return v->v;
+        }
+    VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, im->img, type, fmt, swz, {aspect, lv0, nlv, ly0, nly}};
+    VkImageView view = VK_NULL_HANDLE;
+    if (vkCreateImageView(V.dev, &ci, NULL, &view) == VK_SUCCESS) {
+        vview *nv = calloc(1, sizeof *nv); *nv = (vview){view, type, fmt, lv0, nlv, ly0, nly, swz, aspect, 0, uci.usage, head};
+        nvn_hm_put(&g_views, &im, nv);
+    }
+    pthread_mutex_unlock(&g_view_mu);
     return view;
 }
 
@@ -1034,6 +1545,10 @@ static VkSampler make_sampler(const samp_par *p) {
         else if ((b[0] || b[1] || b[2] || b[3]) && V.has_custom_border) {
             ci.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT; memcpy(cb.customBorderColor.float32, b, 16); cb.format = VK_FORMAT_UNDEFINED;
             cb.pNext = (void *)ci.pNext; ci.pNext = &cb;
+        } else if (p->cmp_mode == 1 && b[0] >= 0.5f) {
+            // Depth shadow samplers commonly set border=(1,0,0,0) (far plane = unshadowed); on devices without
+            // VK_EXT_custom_border_color, falling back to TRANSPARENT_BLACK (0) falsely shadows outside the frustum.
+            ci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
         }
     }
     VkSampler s; VkResult sr = vkCreateSampler(V.dev, &ci, NULL, &s);

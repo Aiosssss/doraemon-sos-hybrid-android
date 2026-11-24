@@ -121,48 +121,123 @@ int nx_extract_hybrid_game(const nx_extract_params *p, nx_extract_result *res,
     nx_keyset ks;
     if (nx_keyset_load_fd(p->keys_fd, &ks, err, errcap) != 0) return -4;
 
-    /* 3. Open & validate Base NSP and Update NSP via CNMT BEFORE writing gigabytes */
+    /* 3. Open & scan Base NSP/XCI (and optional separate Update NSP/XCI) via CNMT BEFORE writing gigabytes */
     emit_prog(p, "validate_nsp", 0, 2, 0, 2);
     nx_nsp base_nsp, upd_nsp;
     memset(&base_nsp, 0, sizeof base_nsp);
     memset(&upd_nsp, 0, sizeof upd_nsp);
+    int has_sep_upd = (p->update_fd >= 0);
 
     if (nx_nsp_open(p->base_fd, &base_nsp, err, errcap) != 0) return -5;
-    if (nx_nsp_open(p->update_fd, &upd_nsp, err, errcap) != 0) {
+    if (has_sep_upd && nx_nsp_open(p->update_fd, &upd_nsp, err, errcap) != 0) {
         nx_nsp_close(&base_nsp);
         return -6;
     }
 
-    nx_cnmt_info base_cnmt, upd_cnmt;
-    if (nx_nsp_read_cnmt(&base_nsp, &ks, &base_cnmt, err, errcap) != 0) {
+    nx_cnmt_info base_cnmts[32];
+    int n_base_cnmt = nx_nsp_scan_cnmts(&base_nsp, &ks, base_cnmts, 32, err, errcap);
+    if (n_base_cnmt <= 0) {
         nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -7;
     }
-    if (base_cnmt.meta_type != 0x80 || base_cnmt.title_id != NX_EXPECTED_BASE_TID) {
-        snprintf(err, errcap, "Base NSP mismatch: expected Application %016llx, got type=0x%02x tid=%016llx",
-                 (unsigned long long)NX_EXPECTED_BASE_TID, base_cnmt.meta_type, (unsigned long long)base_cnmt.title_id);
+
+    nx_cnmt_info base_cnmt, upd_cnmt;
+    memset(&base_cnmt, 0, sizeof base_cnmt);
+    memset(&upd_cnmt, 0, sizeof upd_cnmt);
+    int found_base = 0, found_upd = 0, upd_from_base = 0;
+    uint32_t wrong_upd_ver = 0;
+
+    typedef struct {
+        int aoc_idx;
+        int from_base;
+        int ext_dlc_pos;
+        char nca_id[33];
+    } aoc_src_t;
+    aoc_src_t aoc_srcs[32];
+    int aoc_n = 0;
+
+    for (int i = 0; i < n_base_cnmt; i++) {
+        const nx_cnmt_info *ci = &base_cnmts[i];
+        if (ci->meta_type == 0x80 && ci->title_id == NX_EXPECTED_BASE_TID) {
+            base_cnmt = *ci;
+            found_base = 1;
+        } else if (ci->meta_type == 0x81 && ci->title_id == NX_EXPECTED_UPD_TID && ci->app_id == NX_EXPECTED_BASE_TID) {
+            if (ci->version == NX_EXPECTED_UPD_VER) {
+                if (!has_sep_upd) { upd_cnmt = *ci; found_upd = 1; upd_from_base = 1; }
+            } else {
+                wrong_upd_ver = ci->version;
+            }
+        } else if (ci->meta_type == 0x82 && ci->app_id == NX_EXPECTED_BASE_TID && aoc_n < 32) {
+            int idx = (int)(ci->title_id & 0xFFFull);
+            if (idx > 0 && idx <= 2000) {
+                int dup = 0;
+                for (int j = 0; j < aoc_n; j++) if (aoc_srcs[j].aoc_idx == idx) dup = 1;
+                if (!dup) {
+                    aoc_srcs[aoc_n].aoc_idx = idx;
+                    aoc_srcs[aoc_n].from_base = 1;
+                    aoc_srcs[aoc_n].ext_dlc_pos = -1;
+                    memcpy(aoc_srcs[aoc_n].nca_id, ci->content_nca_id, 33);
+                    aoc_n++;
+                }
+            }
+        }
+    }
+
+    if (!found_base) {
+        snprintf(err, errcap, "Base NSP/XCI mismatch: expected Application %016llx, got type=0x%02x tid=%016llx",
+                 (unsigned long long)NX_EXPECTED_BASE_TID, base_cnmts[0].meta_type, (unsigned long long)base_cnmts[0].title_id);
         nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -8;
     }
-    if (nx_nsp_read_cnmt(&upd_nsp, &ks, &upd_cnmt, err, errcap) != 0) {
-        nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -9;
-    }
-    if (upd_cnmt.meta_type != 0x81 || upd_cnmt.title_id != NX_EXPECTED_UPD_TID ||
-        upd_cnmt.app_id != NX_EXPECTED_BASE_TID || upd_cnmt.version != NX_EXPECTED_UPD_VER) {
-        snprintf(err, errcap, "Update NSP mismatch: expected Patch %016llx v%u (1.1.2), got type=0x%02x tid=%016llx v%u",
-                 (unsigned long long)NX_EXPECTED_UPD_TID, NX_EXPECTED_UPD_VER,
-                 upd_cnmt.meta_type, (unsigned long long)upd_cnmt.title_id, upd_cnmt.version);
+
+    if (has_sep_upd) {
+        nx_cnmt_info upd_cnmts[16];
+        int n_upd_cnmt = nx_nsp_scan_cnmts(&upd_nsp, &ks, upd_cnmts, 16, err, errcap);
+        if (n_upd_cnmt <= 0) {
+            nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -9;
+        }
+        for (int i = 0; i < n_upd_cnmt; i++) {
+            const nx_cnmt_info *ci = &upd_cnmts[i];
+            if (ci->meta_type == 0x81 && ci->title_id == NX_EXPECTED_UPD_TID &&
+                ci->app_id == NX_EXPECTED_BASE_TID && ci->version == NX_EXPECTED_UPD_VER) {
+                upd_cnmt = *ci;
+                found_upd = 1;
+                upd_from_base = 0;
+                break;
+            }
+        }
+        if (!found_upd) {
+            snprintf(err, errcap, "UPDATE_112_MISSING:Update NSP mismatch: expected Patch %016llx v%u (1.1.2), got type=0x%02x tid=%016llx v%u",
+                     (unsigned long long)NX_EXPECTED_UPD_TID, NX_EXPECTED_UPD_VER,
+                     upd_cnmts[0].meta_type, (unsigned long long)upd_cnmts[0].title_id, upd_cnmts[0].version);
+            nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -10;
+        }
+    } else if (!found_upd) {
+        if (wrong_upd_ver != 0) {
+            snprintf(err, errcap, "UPDATE_112_MISSING:Merged file contains Update v%u, but this port requires Update v1.1.2 (v%u). Please select Update v1.1.2 (.nsp) or a Merged/Super NSP/XCI with v1.1.2.",
+                     wrong_upd_ver, NX_EXPECTED_UPD_VER);
+        } else {
+            snprintf(err, errcap, "UPDATE_112_MISSING:Base Game v1.0.0 (%016llx v%u) detected without Update v1.1.2 (v%u). Please select Update v1.1.2 (.nsp) or a Merged/Super NSP/XCI with v1.1.2; DLC is optional.",
+                     (unsigned long long)base_cnmt.title_id, base_cnmt.version, NX_EXPECTED_UPD_VER);
+        }
         nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -10;
     }
 
-    /* Validate Base & Update Program NCAs before staging */
+    /* Validate Base & Update Program NCAs before staging (prefer exact CNMT NCA ID so Merged/Super containers never confuse Base vs Update Program NCA) */
     nx_nca base_prog, upd_prog;
-    if (nx_nsp_open_nca_by_type(&base_nsp, &ks, 0 /* Program */, NX_EXPECTED_BASE_TID, &base_prog, err, errcap) != 0 ||
-        nx_nsp_open_nca_by_type(&upd_nsp, &ks, 0 /* Program */, NX_EXPECTED_BASE_TID, &upd_prog, err, errcap) != 0) {
+    int base_ok = (base_cnmt.content_nca_id[0] != '\0')
+        ? (nx_nsp_open_nca_by_id(&base_nsp, &ks, base_cnmt.content_nca_id, &base_prog, err, errcap) == 0)
+        : (nx_nsp_open_nca_by_type(&base_nsp, &ks, 0 /* Program */, NX_EXPECTED_BASE_TID, &base_prog, err, errcap) == 0);
+    const nx_nsp *upd_container = upd_from_base ? &base_nsp : &upd_nsp;
+    int upd_ok = 0;
+    if (base_ok) {
+        upd_ok = (upd_cnmt.content_nca_id[0] != '\0')
+            ? (nx_nsp_open_nca_by_id(upd_container, &ks, upd_cnmt.content_nca_id, &upd_prog, err, errcap) == 0)
+            : (nx_nsp_open_nca_by_type(upd_container, &ks, 0 /* Program */, NX_EXPECTED_BASE_TID, &upd_prog, err, errcap) == 0);
+    }
+    if (!base_ok || !upd_ok) {
         nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -11;
     }
 
-    /* 4. Pre-validate all provided DLC (AOC) NSPs (reject corrupt, mismatched AppId, or duplicate AOC indices) */
-    int aoc_indices[32];
-    int aoc_n = 0;
+    /* 4. Pre-validate all optional external DLC (AOC) NSPs/XCIs (0 DLCs is 100% allowed) */
     if (p->dlc_count > 32) {
         snprintf(err, errcap, "too many DLC files (%d > 32)", p->dlc_count);
         nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -12;
@@ -187,14 +262,22 @@ int nx_extract_hybrid_game(const nx_extract_params *p, nx_extract_result *res,
             snprintf(err, errcap, "DLC #%d invalid AOC index %d", i + 1, aoc_idx);
             nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -16;
         }
+        int already_embedded = 0;
         for (int j = 0; j < aoc_n; j++) {
-            if (aoc_indices[j] == aoc_idx) {
+            if (aoc_srcs[j].aoc_idx == aoc_idx) {
+                if (aoc_srcs[j].from_base) { already_embedded = 1; break; } /* external DLC already inside SuperXCI: ignore duplicate safely */
                 snprintf(err, errcap, "duplicate DLC detected (AOC index %d, tid %016llx)",
                          aoc_idx, (unsigned long long)dcnmt.title_id);
                 nx_nsp_close(&base_nsp); nx_nsp_close(&upd_nsp); return -17;
             }
         }
-        aoc_indices[aoc_n++] = aoc_idx;
+        if (!already_embedded && aoc_n < 32) {
+            aoc_srcs[aoc_n].aoc_idx = aoc_idx;
+            aoc_srcs[aoc_n].from_base = 0;
+            aoc_srcs[aoc_n].ext_dlc_pos = i;
+            memcpy(aoc_srcs[aoc_n].nca_id, dcnmt.content_nca_id, 33);
+            aoc_n++;
+        }
     }
 
     /* 5. Prepare clean atomic staging folder: dest_root/extract_tmp */
@@ -278,29 +361,44 @@ int nx_extract_hybrid_game(const nx_extract_params *p, nx_extract_result *res,
         rc = is_cancelled(p) ? -99 : -27; goto cleanup;
     }
 
-    /* 9. Extract all validated DLCs into extract_tmp/aoc/<index>/ */
+    /* 9. Extract all validated DLCs (embedded in Merged/Super container or separate files) into extract_tmp/aoc/<index>/ */
     if (mkdir(aoc_dir, 0755) != 0 && errno != EEXIST) {
         snprintf(err, errcap, "cannot create aoc dir"); rc = -28; goto cleanup;
     }
-    for (int i = 0; i < p->dlc_count; i++) {
+    for (int i = 0; i < aoc_n; i++) {
         if (is_cancelled(p)) { snprintf(err, errcap, "cancelled"); rc = -99; goto cleanup; }
-        emit_prog(p, "aoc", (uint64_t)i, (uint64_t)p->dlc_count, (uint64_t)i, (uint64_t)p->dlc_count);
+        emit_prog(p, "aoc", (uint64_t)i, (uint64_t)aoc_n, (uint64_t)i, (uint64_t)aoc_n);
         nx_nsp dnsp;
-        if (nx_nsp_open(p->dlc_fds[i], &dnsp, err, errcap) != 0) { rc = -29; goto cleanup; }
+        memset(&dnsp, 0, sizeof dnsp);
+        const nx_nsp *src_nsp = NULL;
+        if (aoc_srcs[i].from_base) {
+            src_nsp = &base_nsp;
+        } else {
+            if (nx_nsp_open(p->dlc_fds[aoc_srcs[i].ext_dlc_pos], &dnsp, err, errcap) != 0) { rc = -29; goto cleanup; }
+            src_nsp = &dnsp;
+        }
         nx_nca dnca;
-        /* AOC data NCA is PublicData (5) or Data (4) */
-        if (nx_nsp_open_nca_by_type(&dnsp, &ks, 5, 0, &dnca, err, errcap) != 0 &&
-            nx_nsp_open_nca_by_type(&dnsp, &ks, 4, 0, &dnca, err, errcap) != 0) {
-            nx_nsp_close(&dnsp); rc = -30; goto cleanup;
+        int dnca_ok = 0;
+        if (aoc_srcs[i].nca_id[0] != '\0') {
+            dnca_ok = (nx_nsp_open_nca_by_id(src_nsp, &ks, aoc_srcs[i].nca_id, &dnca, err, errcap) == 0);
+        }
+        if (!dnca_ok) {
+            /* Fallback: AOC data NCA is PublicData (5) or Data (4) */
+            dnca_ok = (nx_nsp_open_nca_by_type(src_nsp, &ks, 5, 0, &dnca, err, errcap) == 0 ||
+                       nx_nsp_open_nca_by_type(src_nsp, &ks, 4, 0, &dnca, err, errcap) == 0);
+        }
+        if (!dnca_ok) {
+            if (!aoc_srcs[i].from_base) nx_nsp_close(&dnsp);
+            rc = -30; goto cleanup;
         }
         char sub[1152];
-        snprintf(sub, sizeof sub, "%s/%d", aoc_dir, aoc_indices[i]);
+        snprintf(sub, sizeof sub, "%s/%d", aoc_dir, aoc_srcs[i].aoc_idx);
         uint64_t df = 0, db = 0;
         int drc = nx_nca_extract_romfs(&dnca, 0, sub, NULL, NULL, p->cancel_flag, &df, &db, err, errcap);
-        nx_nsp_close(&dnsp);
+        if (!aoc_srcs[i].from_base) nx_nsp_close(&dnsp);
         if (drc != 0) { rc = is_cancelled(p) ? -99 : -31; goto cleanup; }
     }
-    emit_prog(p, "aoc", (uint64_t)p->dlc_count, (uint64_t)p->dlc_count, (uint64_t)p->dlc_count, (uint64_t)p->dlc_count);
+    emit_prog(p, "aoc", (uint64_t)aoc_n, (uint64_t)aoc_n, (uint64_t)aoc_n, (uint64_t)aoc_n);
 
     /* 10. Write atomic completion manifest .ready.json inside extract_tmp and fsync */
     emit_prog(p, "commit", 0, 1, 0, 1);
@@ -313,7 +411,7 @@ int nx_extract_hybrid_game(const nx_extract_params *p, nx_extract_result *res,
         char aoc_list[256] = "";
         for (int i = 0; i < aoc_n; i++) {
             char tmp_num[16];
-            snprintf(tmp_num, sizeof tmp_num, "%s%d", i ? "," : "", aoc_indices[i]);
+            snprintf(tmp_num, sizeof tmp_num, "%s%d", i ? "," : "", aoc_srcs[i].aoc_idx);
             strncat(aoc_list, tmp_num, sizeof(aoc_list) - strlen(aoc_list) - 1);
         }
         int jn = snprintf(jbuf, sizeof jbuf,
@@ -370,7 +468,7 @@ int nx_extract_hybrid_game(const nx_extract_params *p, nx_extract_result *res,
         res->romfs_files = romfs_files;
         res->romfs_bytes = romfs_bytes;
         res->aoc_count = aoc_n;
-        for (int i = 0; i < aoc_n; i++) res->aoc_indices[i] = aoc_indices[i];
+        for (int i = 0; i < aoc_n; i++) res->aoc_indices[i] = aoc_srcs[i].aoc_idx;
         memcpy(res->rtld_build_id,    bids[0], 33);
         memcpy(res->main_build_id,    bids[1], 33);
         memcpy(res->subsdk0_build_id, bids[2], 33);

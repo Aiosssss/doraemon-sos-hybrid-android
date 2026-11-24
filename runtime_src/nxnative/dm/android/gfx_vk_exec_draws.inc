@@ -17,6 +17,10 @@ static void set_dynamic(VkCommandBuffer cb) {
     int fresh = bc_fresh();
     float x = S.vp[0][0], y = S.vp[0][1], w = S.vp[0][2], h = S.vp[0][3];
     if (w == 0 && h == 0) { w = (float)S.pass_w; h = (float)S.pass_h; }
+    else {
+        if (S.pass_orig_w && S.pass_orig_w != S.pass_w) { float sx = (float)S.pass_w / (float)S.pass_orig_w; x *= sx; w *= sx; }
+        if (S.pass_orig_h && S.pass_orig_h != S.pass_h) { float sy = (float)S.pass_h / (float)S.pass_orig_h; y *= sy; h *= sy; }
+    }
     VkViewport vp = {x, y, w, h, S.dnear, S.dfar};
     if (g_lower_left && !g_flipy) { vp.y = (float)S.pass_h - y; vp.height = -h; }   // lower-left viewports count y from the bottom
     else if (!g_lower_left && g_flipy) { vp.y = y + h; vp.height = -h; }        // clip space y up over the same top-left rectangle
@@ -40,7 +44,7 @@ static void set_dynamic(VkCommandBuffer cb) {
         if (!g_bc.stencil || !BC_SAME(sr, S.sref)) { vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.sref[0]); vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.sref[1]); memcpy(g_bc.sr, S.sref, sizeof g_bc.sr); }
         g_bc.stencil = 1;
     }
-    if (!BC_SAME(po, S.pofs)) { vkCmdSetDepthBias(cb, S.pofs.units, S.pofs.clamp, S.pofs.factor); g_bc.po = S.pofs; }
+    if (!BC_SAME(po, S.pofs)) { vkCmdSetDepthBias(cb, S.pofs.units, V.has_depth_bias_clamp ? S.pofs.clamp : 0.0f, S.pofs.factor); g_bc.po = S.pofs; }
     if (fresh || !g_bc.line) { vkCmdSetLineWidth(cb, 1.0f); g_bc.line = 1; }
 }
 static int g_no_cull = -1, g_front_ovr = -2;   // DM_VK_FRONT=0|1 forces the Vulkan front face for every draw (0 = clockwise, 1 = counter-clockwise: k.front, build_pipeline); =2 inverts the rule below for every draw (Criterion's games: Burnout
@@ -61,25 +65,64 @@ static void rd_read(const uint64_t *a, int n) {
 }
 // everything a draw needs bound; 0 when the draw cannot be done (logged once per reason)
 // A shader that writes memory: a store through a pointer into a storage buffer, a uniform block (only BufferBlock storage can be written) or an image, an image write, an
-// atomic other than a load, a memory copy into such a pointer (SPIR-V scanned once). Without its SPIR-V: assumed to write
-static int spv_wmem(const uint32_t *w, uint32_t n) {
-    if (!w || n < 5 || w[0] != 0x07230203) return 1;
-    uint32_t bound = w[3]; uint8_t *mp = calloc(bound ? bound : 1, 1); if (!mp) return 1;   // 1: a pointer type into memory, 2: a pointer into memory
-    int wr = 0;
-    for (uint32_t i = 5; i < n && !wr;) {
+// atomic other than a load, a memory copy into such a pointer (SPIR-V scanned once). Also computes per-binding write mask (bit = SPIR-V OpDecorate Binding, ~0ull if unknown/indirect).
+// Without its SPIR-V: assumed to write all bindings.
+static int spv_wmem(const uint32_t *w, uint32_t n, uint64_t *bind_mask_out) {
+    if (!w || n < 5 || w[0] != 0x07230203) { if (bind_mask_out) *bind_mask_out = ~0ull; return 1; }
+    uint32_t bound = w[3] ? w[3] : 1u;
+    uint8_t *mp = calloc(bound, 1);           // 1: memory pointer type, 2: pointer value into memory
+    int32_t *vbind = malloc((size_t)bound * sizeof *vbind);
+    uint32_t *rvar = calloc(bound, sizeof *rvar);
+    if (!mp || !vbind || !rvar) { free(mp); free(vbind); free(rvar); if (bind_mask_out) *bind_mask_out = ~0ull; return 1; }
+    for (uint32_t k = 0; k < bound; k++) vbind[k] = -1;
+    int wr = 0; uint64_t mask = 0;
+    for (uint32_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (!wc || i + wc > n) break;
         const uint32_t *o = w + i;
-        if (op == 32 && wc >= 4 && o[1] < bound && (o[2] == 2 || o[2] == 11 || o[2] == 12 || o[2] == 5349)) mp[o[1]] = 1;   // OpTypePointer: Uniform, Image, StorageBuffer, PhysicalStorageBuffer
-        else if ((op == 59 || op == 65 || op == 66 || op == 67 || op == 60) && wc >= 3 && o[1] < bound && o[2] < bound && mp[o[1]] == 1) mp[o[2]] = 2;   // OpVariable, access chains, OpImageTexelPointer
-        else if (op == 62 && wc >= 3 && o[1] < bound && mp[o[1]] == 2) wr = 1;   // OpStore
-        else if (op == 63 && wc >= 3 && o[1] < bound && mp[o[1]] == 2) wr = 1;   // OpCopyMemory
-        else if (op == 99) wr = 1;   // OpImageWrite
-        else if ((op >= 228 && op <= 242) || op == 5614 || op == 5615 || op == 6035) wr = 1;   // atomics but OpAtomicLoad (227)
+        if (op == 71 && wc >= 4 && o[1] < bound && o[2] == 33) {   // OpDecorate <id> Binding <n>
+            vbind[o[1]] = (int32_t)o[3];
+        } else if (op == 32 && wc >= 4 && o[1] < bound && (o[2] == 2 || o[2] == 11 || o[2] == 12 || o[2] == 5349)) {
+            mp[o[1]] = 1;   // OpTypePointer: Uniform, Image, StorageBuffer, PhysicalStorageBuffer
+        } else if (op == 59 && wc >= 4 && o[1] < bound && o[2] < bound) {   // OpVariable
+            if (mp[o[1]] == 1) mp[o[2]] = 2;
+            rvar[o[2]] = o[2];
+        } else if ((op == 60 || op == 65 || op == 66 || op == 67 || op == 70 || op == 83 || op == 124) && wc >= 4 && o[1] < bound && o[2] < bound) {
+            if (mp[o[1]] == 1) mp[o[2]] = 2;
+            if (o[3] < bound && rvar[o[3]]) rvar[o[2]] = rvar[o[3]];
+        } else if (op == 61 && wc >= 4 && o[2] < bound && o[3] < bound) {   // OpLoad (tracks storage-image handles for OpImageWrite)
+            if (rvar[o[3]]) rvar[o[2]] = rvar[o[3]];
+        } else if ((op == 55 || op == 245) && wc >= 3 && o[1] < bound && o[2] < bound && mp[o[1]] == 1) {
+            mp[o[2]] = 2;   // OpFunctionParameter / OpPhi pointer -> unknown root (conservative ~0ull on write)
+        } else if ((op == 62 || op == 63 || op == 64) && wc >= 3 && o[1] < bound && mp[o[1]] == 2) {   // OpStore / OpCopyMemory[Sized]
+            wr = 1;
+            uint32_t rv = rvar[o[1]]; int32_t bd = rv < bound ? vbind[rv] : -1;
+            if (bd >= 0 && bd < 64) mask |= 1ull << bd; else mask = ~0ull;
+        } else if (op == 99 && wc >= 2) {   // OpImageWrite
+            wr = 1;
+            uint32_t rv = o[1] < bound ? rvar[o[1]] : 0; int32_t bd = rv < bound ? vbind[rv] : -1;
+            if (bd >= 0 && bd < 64) mask |= 1ull << bd; else mask = ~0ull;
+        } else if ((op >= 228 && op <= 242) || op == 5614 || op == 5615 || op == 6035) {   // atomics other than OpAtomicLoad (227)
+            wr = 1;
+            uint32_t ptr = (op == 228) ? (wc >= 2 ? o[1] : 0) : (wc >= 4 ? o[3] : 0);
+            if (ptr < bound && mp[ptr] == 2) {
+                uint32_t rv = rvar[ptr]; int32_t bd = rv < bound ? vbind[rv] : -1;
+                if (bd >= 0 && bd < 64) mask |= 1ull << bd; else mask = ~0ull;
+            }
+        }
         i += wc;
     }
-    free(mp); return wr;
+    free(mp); free(vbind); free(rvar);
+    if (bind_mask_out) *bind_mask_out = wr ? mask : 0ull;
+    return wr;
 }
-static int shader_wmem(vkshader_t *s) { if (!s) return 0; if (!s->wmem) s->wmem = spv_wmem(s->spv, s->nspv) ? 1 : 2; return s->wmem == 1; }
+static int shader_wmem(vkshader_t *s) {
+    if (!s) return 0;
+    if (!s->wmem) { uint64_t m = 0; s->wmem = spv_wmem(s->spv, s->nspv, &m) ? 1 : 2; s->wmem_bind_mask = m; }
+    return s->wmem == 1;
+}
+static int shader_bind_writes(vkshader_t *s, uint16_t binding) {
+    return shader_wmem(s) && (binding >= 64u || ((s->wmem_bind_mask >> binding) & 1ull));
+}
 static int order_feedback(int nst) {   // a stage of the draw samples one of the open pass's attachments (its images by their storage)
     for (int st = 0; st < nst; st++) {
         if (!S.sh[st]) continue;
@@ -201,7 +244,72 @@ static int prepare_draw(int prim, int indexed) {
     else if (g_psplit > 0 && S.pass_open == 1 && g_pass_draws == (uint64_t)g_psplit && S.daspect && !g_psplit_depth) { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) has depth (format %d): not split", g_sub_pass - 1, S.pass_w, S.pass_h, S.dfmt); }
     { uint64_t fs = S.sh[1] ? S.sh[1]->key : 0; if (g_x_cutfs && S.pass_open == 1 && (fs == g_x_cutfs || g_prev_fs == g_x_cutfs)) vk_end_pass(); g_prev_fs = fs; }
     if (g_order_pending) { g_order_pending = 0; g_order_check = S.pass_open == 1; }   // an order-only barrier kept the pass open: decided below, once the draw's images are known
-    if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt++; return 0; }
+    if (!begin_pass()) { g_vkst.skip_rt++; return 0; }
+    // Self-feedback detection (e.g. PASS #1 512x512 RGBA16F & PASS #2 512x512 R16F fluid/wind advection):
+    // If the fragment shader samples an active single-sample colour attachment of this pass, snapshot that
+    // attachment into its cached fb_copy outside the render pass and bind the snapshot for sampling so Mali TBDR
+    // never hits Vulkan attachment+sampler feedback undefined behaviour.
+    g_fb_n = 0;
+    if (!S.rast_discard && S.sh[1] && S.ncol > 0) {
+        int any_1x_rt = 0;
+        for (int a = 0; a < S.ncol && a < 8; a++) {
+            vkimg_t *aim = P_att[a].im;
+            if (vk_img_valid(aim) && aim->samples == 1 && aim->vtype != VK_IMAGE_VIEW_TYPE_3D) { any_1x_rt = 1; break; }
+        }
+        if (any_1x_rt) {
+            static uint64_t fb_epoch, fb_bgen, fb_tgen; static int fb_pass, fb_ncol; static vkshader_t *fb_fs; static vkimg_t *fb_a0;
+            uint64_t tgen = g_tex_gen;
+            // Only hit memo inside an ALREADY-committed render pass (S.pass_open == 1) where P_att[0..7] cannot change!
+            int fb_clean_hit = (S.pass_open == 1 && fb_epoch == g_set_epoch && fb_pass == g_sub_pass && fb_ncol == S.ncol &&
+                                fb_fs == S.sh[1] && fb_bgen == g_bind_gen[1] && fb_tgen == tgen && fb_a0 == P_att[0].im);
+            if (!fb_clean_hit) {
+                vkimg_t *need_fb[8]; int nfb = 0;
+                vkshader_t *fs0 = S.sh[1];
+                for (int bi = 0; bi < fs0->nbind; bi++) {
+                    const dmsv_bind *db = &fs0->b[bi];
+                    if (db->kind != RK_TEX || db->reg < 0 || db->reg >= 256) continue;
+                    uint64_t h = S.tex[1][db->reg]; if (!h) continue;
+                    int tid = (int)(h & 0xfffffu); if (!tid) continue;
+                    uint64_t tpool = 0; int64_t toff = 0, tsz = 0; uint32_t tfmt = 0;
+                    // Probe lock-free per-submission texture view cache (g_tvc) first to avoid ~3,500 mutex locks/frame!
+                    unsigned ck = ((unsigned)tid * 2654435761u ^ (unsigned)db->dim * 97u ^ (unsigned)(db->flags & 1)) % TVC;
+                    if (g_tvc[ck].epoch == g_set_epoch && g_tvc[ck].gen == tgen && g_tvc[ck].tid == tid &&
+                        g_tvc[ck].dim == db->dim && g_tvc[ck].arr == (db->flags & 1) && g_tvc[ck].sc == 0 && vk_img_valid(g_tvc[ck].im)) {
+                        const vkimg_t *sim = g_tvc[ck].im;
+                        tpool = sim->pool; toff = sim->off; tsz = sim->size; tfmt = (uint32_t)sim->nvn_format;
+                    } else {
+                        const view_t *tv = NULL; const tex_t *tx = NULL;
+                        if (!vk_tex_by_id(tid, &tv, &tx) || !tx) continue;
+                        tpool = (uint64_t)(uintptr_t)tx->pool; toff = tx->off; tsz = (int64_t)tx->L.size; tfmt = (uint32_t)tx->d.format;
+                    }
+                    for (int a = 0; a < S.ncol && a < 8; a++) {
+                        vkimg_t *aim = P_att[a].im;
+                        if (!vk_img_valid(aim) || aim->samples > 1 || aim->vtype == VK_IMAGE_VIEW_TYPE_3D) continue;
+                        if (tpool == aim->pool && toff == aim->off && tsz == aim->size && tfmt == (uint32_t)aim->nvn_format) {
+                            int dup = 0; for (int k = 0; k < nfb; k++) if (need_fb[k] == aim) { dup = 1; break; }
+                            if (!dup && nfb < 8) need_fb[nfb++] = aim;
+                        }
+                    }
+                }
+                if (nfb == 0) {
+                    if (S.pass_open == 1) {
+                        fb_epoch = g_set_epoch; fb_pass = g_sub_pass; fb_ncol = S.ncol;
+                        fb_fs = fs0; fb_bgen = g_bind_gen[1]; fb_tgen = tgen; fb_a0 = P_att[0].im;
+                    }
+                } else {
+                    fb_epoch = 0;   // re-snapshot on subsequent draws into the same feedback RT
+                    if (S.pass_open == 1) { g_order_check = 0; vk_end_pass(); if (!begin_pass()) { g_vkst.skip_rt++; return 0; } }
+                    VkCommandBuffer fb_cb = vk_cmd();
+                    for (int k = 0; k < nfb; k++) {
+                        vkimg_t *snap = vk_tex_feedback_snapshot(fb_cb, need_fb[k]);
+                        if (snap) { g_fb_src[g_fb_n] = need_fb[k]; g_fb_dst[g_fb_n] = snap; g_fb_n++; }
+                    }
+                }
+            }
+        }
+    }
+    if (!pass_commit()) { g_fb_n = 0; g_vkst.skip_rt++; return 0; }
+    if (__builtin_expect(S.skip_tiny_pp, 0)) { g_fb_n = 0; return 0; }
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) g_tracing = 1;
     uint64_t t0 = tick();
     VkCommandBuffer cb = vk_cmd();
@@ -259,10 +367,13 @@ static int prepare_draw(int prim, int indexed) {
         k.attr[k.nattr++] = (typeof(k.attr[0])){(uint32_t)loc, a.stream, f, a.offset};
         used_streams |= 1u << a.stream;
     }
-    for (int s = 0; s < 16; s++) if (used_streams >> s & 1) k.bind[k.nbind++] = (typeof(k.bind[0])){(uint32_t)s, S.vstream[s].stride, S.vstream[s].divisor ? 1u : 0u, S.vstream[s].divisor};
+    for (int s = 0; s < 16; s++) if (used_streams >> s & 1) {
+        uint32_t dv = ((g_fi_expand_mask >> s) & 1u) ? 1u : S.vstream[s].divisor;
+        k.bind[k.nbind++] = (typeof(k.bind[0])){(uint32_t)s, S.vstream[s].stride, dv ? 1u : 0u, dv};
+    }
     if (need_zero) k.bind[k.nbind++] = (typeof(k.bind[0])){16, 0, 0, 0};
     // attachments and blending
-    k.ncol = (uint32_t)S.ncol; k.dfmt = S.dfmt; k.samples = S.samples ? S.samples : 1;
+    k.ncol = (uint32_t)S.ncol; k.dfmt = S.dfmt; k.samples = S.samples ? S.samples : 1; k.res_mask = S.pass_res_mask;
     // NVN only applies alpha-to-coverage when multisampling is enabled on a >1x colour pass;
     // on ARM Mali (DM_VK_NO_A2C=1 via VQ_NO_A2C), disable A2C so 2x MSAA cutout foliage using shader discard stays solid.
     k.a2c = (S.ms.enable && S.ms.a2c && k.samples > 1 && k.ncol > 0 && !g_no_a2c) ? 1u : 0u;
@@ -306,6 +417,7 @@ static int prepare_draw(int prim, int indexed) {
         uint64_t m0 = g_set_memo; int n0 = g_stn[st]; g_stn[st] = 0; g_coll_st = st;   // the images it is collected with (vk_watch); a memoized set keeps the last ones
         sets[S.sh[st]->set] = stage_set(st, S.sh[st], dofs[S.sh[st]->set], NULL); k.um[st] = g_num_um; k.im[st] = g_num_im;
         g_coll_st = -1; if (g_set_memo != m0) g_stn[st] = n0; }
+    g_fb_n = 0;
     if (g_order_check) {   // the order-only barrier before this draw (see g_order_keep): kept, or the pass ends here with it
         g_order_check = 0; vkshader_t *fs = k.raster_discard ? NULL : S.sh[1];
         if (g_pass_wmem || shader_wmem(S.sh[0]) || shader_wmem(fs) || shader_wmem(S.sh[2]) || order_feedback(3)) {
@@ -372,12 +484,19 @@ static int prepare_draw(int prim, int indexed) {
         if (fresh || g_bc.lay != layout || g_bc.nsets != (uint32_t)nsets || g_bc.ndofs != ndofs || memcmp(g_bc.sets, sets, sizeof *sets * (size_t)nsets) || memcmp(g_bc.dofs, dall, sizeof *dall * ndofs)) {
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, (uint32_t)nsets, sets, ndofs, dall);
             g_bc.lay = layout; g_bc.nsets = (uint32_t)nsets; g_bc.ndofs = ndofs; memcpy(g_bc.sets, sets, sizeof *sets * (size_t)nsets); memcpy(g_bc.dofs, dall, sizeof *dall * ndofs); } }
-    // vertex buffers
+    // vertex buffers (single vk_pool_of lookup per bound stream — avoids redundant lookup on every draw)
     for (uint32_t i = 0; i < k.nbind; i++) {
         uint32_t b = k.bind[i].binding; VkBuffer buf; VkDeviceSize off;
         if (b == 16) { buf = vk_default_attribute_buffer(); off = 0; }
-        else if (!vk_buf_at(S.vbuf[b].address, 1, &buf, &off)) { buf = vk_zero_buffer(); off = 0; VKRED_ONCE(51, "vertex buffer outside the memory pools"); }
-        else if (S.vbuf[b].size) { vkpool_t *vp = vk_pool_of(S.vbuf[b].address, 1); if (vp && S.vbuf[b].address + S.vbuf[b].size > vp->hi && vp->hi < vp->end) vk_cross(2, S.vbuf[b].address, S.vbuf[b].size, vp); }
+        else {
+            uint64_t va = S.vbuf[b].address;
+            vkpool_t *vp = va ? vk_pool_of(va, 1) : NULL;
+            if (!vp) { buf = vk_zero_buffer(); off = 0; VKRED_ONCE(51, "vertex buffer outside the memory pools"); }
+            else {
+                buf = vp->buf; off = va - vp->lo + vp->boff;
+                if (S.vbuf[b].size && va + S.vbuf[b].size > vp->hi && vp->hi < vp->end) vk_cross(2, va, S.vbuf[b].size, vp);
+            }
+        }
         if (g_var_now == 5) { buf = vk_zero_buffer(); off = 0; }
         if (!(dbg_draw() & 2) && b < 17) { int fresh = bc_fresh(); if (fresh || g_bc.vb[b] != buf || g_bc.vo[b] != off) { vkCmdBindVertexBuffers(cb, b, 1, &buf, &off); g_bc.vb[b] = buf; g_bc.vo[b] = off; } }
     }

@@ -65,7 +65,7 @@
     "file": "libdmhost.so",
     "abi": "arm64-v8a",
     "page_align": 16384,
-    "sha256": "afc14a374b28a6eb1e9ecbcc9180b5be146bc42d06ab7613d1496c2bc0599fd4"
+    "sha256": "5d6e96114386e160785c07965b1b76e76ac3464cdcf29c5f8d77336515bd03d5"
   },
-  "hybrid_release": "1.1.2-hybrid7"
+  "hybrid_release": "1.1.2-hybrid30"
 }

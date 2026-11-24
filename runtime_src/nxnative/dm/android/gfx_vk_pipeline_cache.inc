@@ -31,8 +31,8 @@ static pthread_mutex_t g_pcache_io=PTHREAD_MUTEX_INITIALIZER;
 // its own (vk_pipeline_cache_changed, which each pipeline built calls), so a force-kill soon after a scene's first load keeps them. The rule is droidplay-core c3c723280's.
 // Each save rewrites the whole file (vkGetPipelineCacheData, SHA-256, write and fsync), so the gap grows with the cache: 15 s for each whole PCACHE_GAP_MB of the
 // last loaded or saved cache, at least once and at most PCACHE_GAP_STEPS times (120 s), so the burst saves write about 2 MB/s at most. Caches seen on an Odin 3: 12 to 138 MB
-enum { PCACHE_BURST=64, PCACHE_GAP_MB=16, PCACHE_GAP_STEPS=8 };
-static int64_t g_pcache_gap_ns=15000000000ll;   // the gap's step (a variable: the unit test shortens it)
+enum { PCACHE_BURST=10, PCACHE_GAP_MB=16, PCACHE_GAP_STEPS=8 };
+static int64_t g_pcache_gap_ns=10000000000ll;   // 10 s step (saves >=10 new pipelines promptly in background)
 static _Atomic size_t g_pcache_size;           // the cache's size at the last load or save
 static int64_t pcache_gap(void) {
     int64_t steps=(int64_t)((atomic_load_explicit(&g_pcache_size,memory_order_relaxed)>>20)/PCACHE_GAP_MB);
@@ -43,6 +43,12 @@ static _Atomic int64_t g_pcache_kick_ns;        // and when (CLOCK_MONOTONIC; 0:
 static int64_t pcache_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (int64_t)t.tv_sec*1000000000ll+t.tv_nsec; }
 void vk_pipeline_cache_save(void);
 static void *pcache_save_main(void *unused) { (void)unused; vk_pipeline_cache_save(); return NULL; }
+void vk_pipeline_cache_save_async(void) {
+    if (!V.pcache || !g_pcache_path[0]) return;
+    pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
+    if (!pthread_create(&th,&a,pcache_save_main,NULL)) atomic_store_explicit(&g_pcache_kick_ns,pcache_now(),memory_order_relaxed);
+    pthread_attr_destroy(&a);
+}
 static void pcache_burst(uint64_t generation) {
     uint64_t base=atomic_load_explicit(&g_pcache_kick_gen,memory_order_relaxed);
     if (generation<base+PCACHE_BURST || !V.pcache || !g_pcache_path[0]) return;
@@ -61,7 +67,7 @@ static pcache_header pcache_identity(void) {
     memcpy(h.uuid,V.props.pipelineCacheUUID,sizeof h.uuid);
     memcpy(h.device_uuid,g_pcache_ids.deviceUUID,sizeof h.device_uuid);
     memcpy(h.driver_uuid,g_pcache_ids.driverUUID,sizeof h.driver_uuid);
-    snprintf(h.chain,sizeof h.chain,"nx2a-h7-m%d-a%d",vk_disable_msaa()?1:0,vk_no_a2c()?1:0);
+    snprintf(h.chain,sizeof h.chain,"h24-m%d-a%d-r%d",vk_disable_msaa()?1:0,vk_no_a2c()?1:0,V.robust_buf?1:0);
     return h;
 }
 static uint32_t pcache_u32(const uint8_t *p) {
@@ -75,27 +81,45 @@ static int pcache_driver_header(const void *data,size_t bytes) {
 static void pcache_path(void) {
     const char *root=getenv("DM_ROOT");g_pcache_path[0]=0;
     if (!root || !*root) return;
-    int n=snprintf(g_pcache_path,sizeof g_pcache_path,"%s/vk_pipeline_cache.bin",root);
+    // Separate VkPipelineCache files per MSAA mode (vk_pipe_cache_msaa1.bin vs vk_pipe_cache_msaa2.bin)
+    // so toggling MSAA ON/OFF NEVER invalidates or overwrites the other mode's compiled shader cache!
+    int msaa_tag = vk_disable_msaa() ? 1 : 2;
+    int n=snprintf(g_pcache_path,sizeof g_pcache_path,"%s/vk_pipe_cache_msaa%d.bin",root,msaa_tag);
     if (n<0 || (size_t)n>=sizeof g_pcache_path) g_pcache_path[0]=0;
 }
 static size_t pcache_load(void) {
     VkPhysicalDeviceProperties2 props={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,&g_pcache_ids};
     vkGetPhysicalDeviceProperties2(V.pd,&props);
     pcache_path();pcache_header identity=pcache_identity(),header;size_t bytes=0;void *data=NULL;
-    int legacy=0;uint8_t digest[32];
+    int legacy=0, from_legacy_path=0;uint8_t digest[32];
     g_pcache_digest_valid=0;g_pcache_migrate=0;
     FILE *file=g_pcache_path[0] && !getenv("DM_VK_NOPCACHE") ? fopen(g_pcache_path,"rb") : NULL;
+    if (!file && g_pcache_path[0] && !getenv("DM_VK_NOPCACHE")) {
+        const char *root=getenv("DM_ROOT");
+        if (root && *root) {
+            char lpath[1024];
+            if (snprintf(lpath,sizeof lpath,"%s/vk_pipeline_cache.bin",root)<(int)sizeof lpath) {
+                file=fopen(lpath,"rb");
+                if (file) from_legacy_path=1;
+            }
+        }
+    }
     if (file) {
         struct stat st;uint8_t prefix[32];size_t payload=0;
         int valid=!fstat(fileno(file),&st) && S_ISREG(st.st_mode) &&
             st.st_size>=32 && (uint64_t)st.st_size<=sizeof header+PCACHE_MAX_BYTES &&
             fread(prefix,1,sizeof prefix,file)==sizeof prefix;
+        const char *why = "corrupt or truncated";
         if (valid && !memcmp(prefix,identity.magic,sizeof identity.magic)) {
             rewind(file);
-            if (fread(&header,1,sizeof header,file)==sizeof header &&
-                !memcmp(&header,&identity,offsetof(pcache_header,bytes)) &&
-                header.bytes>=32 && header.bytes<=PCACHE_MAX_BYTES &&
-                (uint64_t)st.st_size==sizeof header+header.bytes) payload=header.bytes;
+            if (fread(&header,1,sizeof header,file)==sizeof header) {
+                if (memcmp(&header,&identity,offsetof(pcache_header,bytes))) {
+                    why = memcmp(header.chain, identity.chain, sizeof header.chain) ? "MSAA/A2C setting changed" : "driver/GPU identity changed";
+                } else if (header.bytes>=32 && header.bytes<=PCACHE_MAX_BYTES &&
+                    (uint64_t)st.st_size==sizeof header+header.bytes) {
+                    payload=header.bytes;
+                }
+            }
         } else if (valid && st.st_size<=PCACHE_MAX_BYTES && pcache_driver_header(prefix,sizeof prefix)) {
             // Pre-envelope files carry only Vulkan's device/UUID header. Preserve
             // that compatibility check, then upgrade on the next successful save.
@@ -106,10 +130,11 @@ static size_t pcache_load(void) {
             if (data && fread(data,1,payload,file)==payload && pcache_driver_header(data,payload)) {
                 CC_SHA256(data,(CC_LONG)payload,digest);
                 if (legacy || !memcmp(digest,header.digest,sizeof digest)) bytes=payload;
+                else why = "SHA-256 digest mismatch";
             }
         }
         fclose(file);
-        if (!bytes) { free(data);data=NULL;VKLOG("vk: ignored incompatible or corrupt pipeline cache"); }
+        if (!bytes) { free(data);data=NULL;VKLOG("vk: rebuilding pipeline cache (%s)", why); }
     }
     VkPipelineCacheCreateInfo info={VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,NULL,0,bytes,data};
     VkResult result=vkCreatePipelineCache(V.dev,&info,NULL,&V.pcache);
@@ -125,10 +150,10 @@ static size_t pcache_load(void) {
         bytes=0;
     }
     if (bytes) {
-        memcpy(g_pcache_digest,digest,sizeof digest);g_pcache_bytes=bytes;g_pcache_digest_valid=1;g_pcache_migrate=legacy;
+        memcpy(g_pcache_digest,digest,sizeof digest);g_pcache_bytes=bytes;g_pcache_digest_valid=1;g_pcache_migrate=legacy || from_legacy_path;
         atomic_store_explicit(&g_pcache_size,bytes,memory_order_relaxed);
     }
-    if (bytes) VKLOG("vk: loaded %zu pipeline-cache bytes for this device, driver and shader chain",bytes);
+    if (bytes) VKLOG("vk: loaded %zu pipeline-cache bytes (%s) for this device, driver and shader chain",bytes,vk_disable_msaa()?"msaa1":"msaa2");
     free(data);return bytes;
 }
 void vk_pipeline_cache_changed(void) { pcache_burst(atomic_fetch_add_explicit(&g_pcache_generation,1,memory_order_relaxed)+1); }

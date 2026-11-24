@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/launcher_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_launcher_clean">
+
+    <!-- Clean, resolution-independent centered layout (100% sharp on all phone screens & aspect ratios) -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:gravity="center_horizontal"
+        android:orientation="vertical"
+        android:paddingBottom="18dp">
+
+        <!-- Official Doraemon Story of Seasons: Friends of the Great Kingdom Logo -->
+        <ImageView
+            android:id="@+id/img_game_logo"
+            android:layout_width="340dp"
+            android:layout_height="132dp"
+            android:adjustViewBounds="true"
+            android:contentDescription="@string/cd_wallpaper"
+            android:scaleType="fitCenter"
+            android:src="@drawable/logo_doraemon_sos" />
+
+        <!-- 2-Row Compact Main Menu directly below the Game Logo -->
+        <LinearLayout
+            android:id="@+id/main_menu_column"
+            android:layout_width="316dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:orientation="vertical">
+
+            <!-- Row 1: PLAY (Primary Honey-Gold Wooden Button) -->
+            <LinearLayout
+                android:id="@+id/btn_main_play"
+                android:layout_width="match_parent"
+                android:layout_height="46dp"
+                android:background="@drawable/bg_btn_play"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:orientation="horizontal"
+                android:paddingStart="18dp"
+                android:paddingEnd="18dp">
+
+                <ImageView
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:contentDescription="@string/btn_play"
+                    android:src="@drawable/ic_play_leaf" />
+
+                <TextView
+                    android:id="@+id/txt_main_play"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="10dp"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:shadowColor="#88532A08"
+                    android:shadowDx="0"
+                    android:shadowDy="2"
+                    android:shadowRadius="2"
+                    android:text="@string/btn_play"
+                    android:textColor="#FFFDF5"
+                    android:textSize="16sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <!-- Row 2: SETTINGS + IMPORT GAME side-by-side -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <!-- 2. SETTINGS -->
+                <LinearLayout
+                    android:id="@+id/btn_main_settings"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/bg_btn_parchment"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:orientation="horizontal"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp">
+
+                    <ImageView
+                        android:layout_width="17dp"
+                        android:layout_height="17dp"
+                        android:contentDescription="@string/btn_settings"
+                        android:src="@drawable/ic_gear_wood" />
+
+                    <TextView
+                        android:id="@+id/txt_main_settings"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="7dp"
+                        android:ellipsize="end"
+                        android:maxLines="1"
+                        android:text="@string/btn_settings"
+                        android:textColor="#4A2E14"
+                        android:textSize="12.5sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <!-- 3. IMPORT GAME -->
+                <LinearLayout
+                    android:id="@+id/btn_main_import"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1.08"
+                    android:background="@drawable/bg_btn_parchment"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:orientation="horizontal"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp">
+
+                    <ImageView
+                        android:layout_width="17dp"
+                        android:layout_height="17dp"
+                        android:contentDescription="@string/btn_import_game"
+                        android:src="@drawable/ic_chest_import" />
+
+                    <TextView
+                        android:id="@+id/txt_main_import"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="7dp"
+                        android:ellipsize="end"
+                        android:maxLines="1"
+                        android:text="@string/btn_import_game"
+                        android:textColor="#4A2E14"
+                        android:textSize="12.5sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Minimalist Bottom-Left Status Pill + Compact hybrid27 Badge -->
+    <LinearLayout
+        android:id="@+id/status_pill"
+        android:layout_width="wrap_content"
+        android:layout_height="28dp"
+        android:layout_gravity="bottom|start"
+        android:layout_marginStart="16dp"
+        android:layout_marginBottom="12dp"
+        android:background="@drawable/bg_status_pill"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="10dp"
+        android:paddingEnd="8dp">
+
+        <View
+            android:id="@+id/status_dot"
+            android:layout_width="8dp"
+            android:layout_height="8dp"
+            android:background="#4E8C3B" />
+
+        <TextView
+            android:id="@+id/txt_status_short"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="7dp"
+            android:text="@string/status_checking"
+            android:textColor="#4A2E14"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/txt_version_badge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="7dp"
+            android:background="#EFE0C2"
+            android:paddingStart="5dp"
+            android:paddingTop="1dp"
+            android:paddingEnd="5dp"
+            android:paddingBottom="1dp"
+            android:text="FOTGK"
+            android:textColor="#7A481D"
+            android:textSize="9.5sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- Tiny subtle @AiosPort watermark pinned to very bottom-right corner -->
+    <TextView
+        android:id="@+id/txt_watermark_aiosport"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_marginEnd="16dp"
+        android:layout_marginBottom="12dp"
+        android:alpha="0.78"
+        android:letterSpacing="0.03"
+        android:text="@string/watermark_aiosport"
+        android:textColor="#7A5634"
+        android:textSize="10.5sp"
+        android:textStyle="bold" />
+
+    <!-- Overlay Scrim 1: SETTINGS Storybook Wooden Panel -->
+    <FrameLayout
+        android:id="@+id/overlay_settings"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#88201105"
+        android:clickable="true"
+        android:focusable="true"
+        android:paddingStart="28dp"
+        android:paddingTop="14dp"
+        android:paddingEnd="28dp"
+        android:paddingBottom="14dp"
+        android:visibility="gone">
+
+        <include layout="@layout/panel_settings" />
+    </FrameLayout>
+
+    <!-- Overlay Scrim 2: IMPORT GAME Storybook Wooden Panel -->
+    <FrameLayout
+        android:id="@+id/overlay_import"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#88201105"
+        android:clickable="true"
+        android:focusable="true"
+        android:paddingStart="28dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="28dp"
+        android:paddingBottom="16dp"
+        android:visibility="gone">
+
+        <include layout="@layout/panel_import" />
+    </FrameLayout>
+
+</FrameLayout>

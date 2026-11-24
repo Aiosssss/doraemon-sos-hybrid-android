@@ -53,14 +53,15 @@ static double present_time_get(uint64_t ticket) {
     pthread_mutex_unlock(&g_pres_mu);
     return t;
 }
-static VkSurfaceKHR g_surf; static VkSwapchainKHR g_swap; static VkImage g_simg[8]; static uint32_t g_nsimg; static VkExtent2D g_sext; static VkFormat g_sfmt;
+enum { SWAP_MAX = 16 };
+static VkSurfaceKHR g_surf; static VkSwapchainKHR g_swap; static VkImage g_simg[SWAP_MAX]; static uint32_t g_nsimg; static VkExtent2D g_sext; static VkFormat g_sfmt;
 // The swapchain's format follows the window texture's sRGB-ness: a blit from an sRGB image into a UNORM one decodes to linear and stores that unencoded, which darkened the whole
 // picture (Donkey Kong Country Returns HD presents RGBA8_SRGB, NVN format 0x38; issue #4). The Switch scans the window texture's bytes out as they are, and an SRGB -> SRGB blit
 // decodes and encodes them again. UNORM games keep the UNORM swapchain. The overlay drawn after the blit is encoded too in an sRGB swapchain, so it shows a little lighter there
 static VkFormat g_want = VK_FORMAT_R8G8B8A8_UNORM;
-static VkSemaphore g_acq[8], g_done_sem[8]; static VkFence g_pfence[8]; static VkCommandPool g_ppool; static VkCommandBuffer g_pcb[8]; static uint32_t g_pi;
+static VkSemaphore g_acq[SWAP_MAX], g_done_sem[SWAP_MAX]; static VkFence g_pfence[SWAP_MAX]; static VkCommandPool g_ppool; static VkCommandBuffer g_pcb[SWAP_MAX]; static uint32_t g_pi;
 static ANativeWindow *g_win;
-static VkImageView g_sview[8];
+static VkImageView g_sview[SWAP_MAX];
 // Where the game's picture lies in the window (fractions: x, y, width, height; aspect kept, black borders around it), for the front end's touch points, which hle_touch.c
 // takes relative to the picture: normalized by the whole window, a tap in Unpacking's 3040x1904 window (97 px borders) was off by up to 5% of the height
 static _Atomic uint32_t g_pic[4] = {0, 0, 1u << 20, 1u << 20};
@@ -142,7 +143,7 @@ static int rot_setup(void) {
         VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR}; VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
         VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &g_sfmt};
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, 0, 2, ss, &vi, &ia, NULL, &vs, &rs, &ms, NULL, &cbs, &dy, g_rot.layout, VK_NULL_HANDLE};
-        if (!r) r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &g_rot.pipe);
+        if (!r) { vk_pipe_compile_lock(); r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &g_rot.pipe); vk_pipe_compile_unlock(); }
         vk_pipeline_cache_changed();
         if (vm) vkDestroyShaderModule(V.dev, vm, NULL); if (fm) vkDestroyShaderModule(V.dev, fm, NULL);
         if (r) { g_rot.pipe = VK_NULL_HANDLE; VKRED_ONCE(111, "pre-rotation: pipeline for format %d: %d; the compositor turns the picture", g_sfmt, r); return 0; }
@@ -192,13 +193,25 @@ static int swap_make(void) {
         (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR : VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_PRESENT_MODE_FIFO_KHR, 1, VK_NULL_HANDLE};
     VkResult r = vkCreateSwapchainKHR(V.dev, &ci, NULL, &g_swap);
     if (r) { VKLOG("[RED] swapchain creation failed: %d", r); swap_destroy(); return 0; }
-    g_nsimg = 8; vkGetSwapchainImagesKHR(V.dev, g_swap, &g_nsimg, g_simg);
-    for (uint32_t i = 0; i < g_nsimg; i++) { VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, g_simg[i], VK_IMAGE_VIEW_TYPE_2D, g_sfmt, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-        VKCHK(vkCreateImageView(V.dev, &vi, NULL, &g_sview[i])); }
+    uint32_t real_n = 0;
+    r = vkGetSwapchainImagesKHR(V.dev, g_swap, &real_n, NULL);
+    if (r < 0 || !real_n) { VKLOG("[RED] vkGetSwapchainImagesKHR count failed: %d (n=%u)", r, real_n); swap_destroy(); return 0; }
+    if (real_n > SWAP_MAX) { VKLOG("[RED] swapchain returned %u images > SWAP_MAX %d; clamping", real_n, SWAP_MAX); real_n = SWAP_MAX; }
+    g_nsimg = real_n;
+    memset(g_simg, 0, sizeof g_simg);
+    memset(g_sview, 0, sizeof g_sview);
+    r = vkGetSwapchainImagesKHR(V.dev, g_swap, &g_nsimg, g_simg);
+    if (r < 0 || !g_nsimg) { VKLOG("[RED] vkGetSwapchainImagesKHR images failed: %d (n=%u)", r, g_nsimg); swap_destroy(); return 0; }
+    for (uint32_t i = 0; i < g_nsimg; i++) {
+        if (!g_simg[i]) { VKLOG("[RED] swapchain image %u is NULL", i); swap_destroy(); return 0; }
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, g_simg[i], VK_IMAGE_VIEW_TYPE_2D, g_sfmt, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkResult vr = vkCreateImageView(V.dev, &vi, NULL, &g_sview[i]);
+        if (vr || !g_sview[i]) { VKLOG("[RED] swapchain image view %u failed: %d", i, vr); swap_destroy(); return 0; }
+    }
     if (!g_ppool) {
         VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, V.qf}; VKCHK(vkCreateCommandPool(V.dev, &pci, NULL, &g_ppool));
-        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_ppool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 8}; VKCHK(vkAllocateCommandBuffers(V.dev, &ai, g_pcb));
-        for (int i = 0; i < 8; i++) {
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_ppool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, SWAP_MAX}; VKCHK(vkAllocateCommandBuffers(V.dev, &ai, g_pcb));
+        for (int i = 0; i < SWAP_MAX; i++) {
             VkSemaphoreCreateInfo s = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; VKCHK(vkCreateSemaphore(V.dev, &s, NULL, &g_acq[i])); VKCHK(vkCreateSemaphore(V.dev, &s, NULL, &g_done_sem[i]));
             VkFenceCreateInfo f = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT}; VKCHK(vkCreateFence(V.dev, &f, NULL, &g_pfence[i]));
         }
@@ -224,7 +237,7 @@ enum { SP_DISC = OV_N, SP_BLACK, SP_WHITE, SP_ACCENT, SP_N };   // (black, white
 #define OV_FPS_CHARS "0123456789 FPS-CBATO"   // (the temperature rows: "SOC 52C", "BAT 38C")
 static struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkSampler samp; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set;
                 VkPipeline pipe; VkFormat pfmt; uint32_t w, h, sh, pw, ph, gh, gs; VkBuffer up; VkDeviceMemory upm; uint8_t *px, *panel_cpu; size_t panel_cpu_sz; int up_k; int uploaded, panel, lay, cver; float sp[SP_N][4];
-                VkRenderPass rp; VkFramebuffer fb[8]; VkImageView fbview[8]; VkExtent2D fbext[8]; } g_ov = { .up_k = -1 };
+                VkRenderPass rp; VkFramebuffer fb[SWAP_MAX]; VkImageView fbview[SWAP_MAX]; VkExtent2D fbext[SWAP_MAX]; } g_ov = { .up_k = -1 };
 static struct { const ov_theme *t; VkImage img; VkDeviceMemory mem; VkImageView view; VkDescriptorSet set; VkBuffer up; VkDeviceMemory upm; uint32_t upk; int ready; } g_tt[2];   // per layout
 // Without dynamic rendering (a Vulkan 1.1 / 1.2 device, V.has_dynrender) the overlay draws in a render pass object over the swapchain image: one pass for the swapchain's
 // format (load and store, the image already in COLOR_ATTACHMENT_OPTIMAL), and a framebuffer per swapchain image, made again when its view or the extent changes
@@ -236,14 +249,28 @@ static VkRenderPass ov_rp(void) {
                                  VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference r = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sp = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &r, NULL, NULL, 0, NULL};
-    VkRenderPassCreateInfo ci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &a, 1, &sp, 0, NULL};
+    // Explicit EXTERNAL <-> subpass 0 dependencies prevent Mali-G57 Vulkan 1.1 (!has_dynrender) overlay pass
+    // from racing with the preceding swapchain vkCmdBlitImage or subsequent vkQueuePresentKHR (1-frame black flash).
+    VkSubpassDependency deps[2] = {
+        {VK_SUBPASS_EXTERNAL, 0,
+         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0},
+        {0, VK_SUBPASS_EXTERNAL,
+         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         VK_ACCESS_MEMORY_READ_BIT, 0}
+    };
+    VkRenderPassCreateInfo ci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &a, 1, &sp, 2, deps};
     if (vkCreateRenderPass(V.dev, &ci, NULL, &g_ov.rp)) { VKRED_ONCE(93, "overlay render pass failed"); g_ov.rp = VK_NULL_HANDLE; }
     return g_ov.rp;
 }
 // every overlay framebuffer goes with the views or the pass it was made for: a view handle made again later may have the same value (ov_fb would take it for its own)
-static void ov_fb_drop(void) { for (int i = 0; i < 8; i++) { if (g_ov.fb[i]) vkDestroyFramebuffer(V.dev, g_ov.fb[i], NULL); g_ov.fb[i] = VK_NULL_HANDLE; g_ov.fbview[i] = VK_NULL_HANDLE; g_ov.fbext[i] = (VkExtent2D){0, 0}; } }
+static void ov_fb_drop(void) { for (int i = 0; i < SWAP_MAX; i++) { if (g_ov.fb[i]) vkDestroyFramebuffer(V.dev, g_ov.fb[i], NULL); g_ov.fb[i] = VK_NULL_HANDLE; g_ov.fbview[i] = VK_NULL_HANDLE; g_ov.fbext[i] = (VkExtent2D){0, 0}; } }
 static VkFramebuffer ov_fb(uint32_t idx) {
-    if (idx >= 8 || !ov_rp()) return VK_NULL_HANDLE;
+    if (idx >= SWAP_MAX || idx >= g_nsimg || !g_sview[idx] || !ov_rp()) return VK_NULL_HANDLE;
     if (g_ov.fb[idx] && g_ov.fbview[idx] == g_sview[idx] && g_ov.fbext[idx].width == g_sext.width && g_ov.fbext[idx].height == g_sext.height) return g_ov.fb[idx];
     if (g_ov.fb[idx]) vkDestroyFramebuffer(V.dev, g_ov.fb[idx], NULL);   // (swap_destroy drops them all with the views; here only an extent change)
     VkFramebufferCreateInfo ci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, g_ov.rp, 1, &g_sview[idx], g_sext.width, g_sext.height, 1};
@@ -776,10 +803,12 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         VkRenderPass orp = V.has_dynrender ? VK_NULL_HANDLE : ov_rp();
         if (!V.has_dynrender && !orp) { vkDestroyShaderModule(V.dev, vm, NULL); vkDestroyShaderModule(V.dev, fm, NULL); return 0; }
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, orp ? NULL : &rci, 0, 2, ss, &vi, &ia, NULL, &vs, &rs, &ms, NULL, &cbs, &dy, g_ov.layout, orp};
+        vk_pipe_compile_lock();
         VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &g_ov.pipe);
+        vk_pipe_compile_unlock();
         vk_pipeline_cache_changed();
         vkDestroyShaderModule(V.dev, vm, NULL); vkDestroyShaderModule(V.dev, fm, NULL);
-        if (r) { VKRED_ONCE(92, "overlay pipeline failed: %d", r); return 0; }
+        if (r || !g_ov.pipe) { g_ov.pipe = VK_NULL_HANDLE; VKRED_ONCE(92, "overlay pipeline failed: %d", r); return 0; }
         g_ov.pfmt = g_sfmt;
     }
     ov_theme_upload(cb, k, lay);
@@ -810,8 +839,8 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         g_ov.uploaded = 0; g_ov.panel = -1;
     }
     uint32_t y0 = 0, rows = g_ov.h + g_ov.sh + g_ov.ph + g_ov.gh;   // the rows to upload
-    if (g_ov.uploaded && menu >= 0 && menu != g_ov.panel) {   // wait ONLY on the single fence that last copied from g_ov.up (not all 7 swapchain fences)
-        if (g_ov.up_k >= 0 && g_ov.up_k < 8 && g_ov.up_k != (int)k)
+    if (g_ov.uploaded && menu >= 0 && menu != g_ov.panel) {   // wait ONLY on the single fence that last copied from g_ov.up (not all swapchain fences)
+        if (g_ov.up_k >= 0 && g_ov.up_k < SWAP_MAX && g_ov.up_k != (int)k)
             vkWaitForFences(V.dev, 1, &g_pfence[g_ov.up_k], 1, 1000000000ull);
         y0 = g_ov.h + g_ov.sh; rows = g_ov.ph; g_ov.uploaded = 0;
     }
@@ -884,44 +913,85 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
     // earlier, the cadence restarts half a vsync further out than that, so the next frames have room for the jitter: restarting at the earliest itself made 31 long frames
     // in 4,200 (5 shown late), and going on until the target was under a vsync away made 54 in 3,600 go out late
     double vk_gpu_ms_recent(void); double g = vk_gpu_ms_recent();
-    uint64_t margin_ns = (period > 0 && period <= 0.018) ? 1500000ull : 3000000ull;   // tighter lead margin at 60 FPS for lower display latency
-    uint64_t gpu = (uint64_t)((g > 4 ? g : 4) * 1e6) + margin_ns;
+    // Smooth GPU estimate with an EMA (alpha=1/8) + 1/4-vsync resync hysteresis so single-frame 1-2 ms GPU jitter
+    // does not trigger unnecessary cadence resync cascades (drops display timing resyncs dramatically at 60 FPS).
+    static double g_gpu_ema;
+    if (g > 0.0) {
+        double gc = g < 3.0 ? 3.0 : (g > 22.0 ? 22.0 : g);
+        g_gpu_ema = g_gpu_ema > 0.0 ? (g_gpu_ema * 7.0 + gc) * 0.125 : gc;
+    }
+    double gest = g_gpu_ema > 3.0 ? g_gpu_ema : 4.0;
+    uint64_t margin_ns = (period > 0 && period <= 0.018) ? 750000ull : 2500000ull;
+    uint64_t gpu = (uint64_t)(gest * 1e6) + margin_ns;
     // The cadence advances unsnapped (g_pace_ideal) and only the frame's vsync is snapped: snapping each target and adding the period to it lost the fraction,
     // so a period that is not a whole number of vsyncs always rounded up (40 fps on a 60 Hz panel: 25 ms came out as 2 vsyncs every frame, 30 fps, on a Retroid Pocket 5)
     uint64_t now = mono_ns(), t = 0;
     if (g_pace_target) { g_pace_ideal += (uint64_t)(period * 1e9); t = pace_snap(g_pace_ideal - g_refresh_ns / 2); }
-    if (t < now + gpu + g_refresh_ns) { if (g_pace_target) { g_pace_resync++; if (plog) VKLOG("[perf] pace log: resync, predicted %.2f ms short (GPU estimate %.2f ms)", ((double)(now + gpu + g_refresh_ns) - (double)t) / 1e6, gpu / 1e6); } uint64_t extra = (g_refresh_ns <= 9000000ull && period <= 0.018) ? g_refresh_ns : (g_refresh_ns * 3 / 2); t = pace_snap(now + gpu + extra); g_pace_ideal = t; }
+    uint64_t hyst = g_pace_target ? (g_refresh_ns / 4) : 0;
+    if (t + hyst < now + gpu + g_refresh_ns) { if (g_pace_target) { g_pace_resync++; if (plog) VKLOG("[perf] pace log: resync, predicted %.2f ms short (GPU estimate %.2f ms)", ((double)(now + gpu + g_refresh_ns) - (double)t) / 1e6, gpu / 1e6); } uint64_t extra = (g_refresh_ns <= 9000000ull && period <= 0.018) ? g_refresh_ns : (g_refresh_ns * 3 / 2); t = pace_snap(now + gpu + extra); g_pace_ideal = t; }
     g_pace_target = t;
     return t - g_refresh_ns / 2;
 }
-static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t ticket) {   // period: the game's frame period (s); < 0 for a redraw (ticket 0)
-    uint32_t k = g_pi++ % 8;
+static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t ticket, uint64_t fence) {   // period: the game's frame period (s); < 0 for a redraw (ticket 0)
+    uint32_t k = g_pi++ % SWAP_MAX;
     vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
     VkFormat want = im->fmt == VK_FORMAT_R8G8B8A8_SRGB || im->fmt == VK_FORMAT_B8G8R8A8_SRGB || im->fmt == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     if (want != g_want) { g_want = want; swap_destroy(); if (!swap_make()) return; }   // once, at the first present of the other kind
-    uint32_t idx; VkResult r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx);
+    uint32_t idx = 0; VkResult r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_destroy(); if (!swap_make()) return; r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx); }
-    if (r < 0) { VKRED_ONCE(90, "vkAcquireNextImageKHR: %d", r); return; }
+    if (r < 0 || idx >= g_nsimg || !g_simg[idx] || !g_sview[idx]) { VKRED_ONCE(90, "vkAcquireNextImageKHR: %d (idx=%u/%u)", r, idx, g_nsimg); return; }
     vkResetFences(V.dev, 1, &g_pfence[k]);
-    int turned = g_pre != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;   // composed into g_rot.img, then copied turned into the swapchain image
+    int turned = g_pre != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR && g_rot.img && g_rot.view && g_rot.pipe;   // composed into g_rot.img, then copied turned into the swapchain image
     VkImage tgt = turned ? g_rot.img : g_simg[idx]; VkImageView tview = turned ? g_rot.view : g_sview[idx];
     VkCommandBuffer cb = g_pcb[k];
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; vkBeginCommandBuffer(cb, &bi);
     vk_img_barrier_all(cb);   // after everything submitted before on this queue
     barrier(cb, tgt, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cb, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
     int cx = crop ? crop[0] : 0, cy = crop ? crop[1] : 0, cw = crop && crop[2] ? crop[2] : (int)im->w, ch = crop && crop[3] ? crop[3] : (int)im->h;
+    if (crop && crop[2] && im->orig_w && im->orig_w != im->w) {
+        cx = (int)(((int64_t)cx * im->w) / im->orig_w);
+        cw = (int)(((int64_t)cw * im->w + im->orig_w / 2) / im->orig_w);
+    }
+    if (crop && crop[3] && im->orig_h && im->orig_h != im->h) {
+        cy = (int)(((int64_t)cy * im->h) / im->orig_h);
+        ch = (int)(((int64_t)ch * im->h + im->orig_h / 2) / im->orig_h);
+    }
+    if (cx < 0) cx = 0; if (cy < 0) cy = 0;
+    if (cw <= 0 || cx + cw > (int)im->w) cw = (int)im->w - cx;
+    if (ch <= 0 || cy + ch > (int)im->h) ch = (int)im->h - cy;
     double s = fmin((double)g_sext.width / cw, (double)g_sext.height / ch); int dw = (int)(cw * s), dh = (int)(ch * s), dx = ((int)g_sext.width - dw) / 2, dy = ((int)g_sext.height - dh) / 2;
     vk_pic_set((float)dx / g_sext.width, (float)dy / g_sext.height, (float)dw / g_sext.width, (float)dh / g_sext.height);
+    if (dx > 0 || dy > 0 || dw < (int)g_sext.width || dh < (int)g_sext.height) {
+        VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
+        // Order clear -> blit write-after-write on tgt (without this barrier Mali-G57 can land black clear after blit -> 1-frame black flash).
+        VkImageMemoryBarrier waw = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, tgt, rg};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &waw);
+    }
     VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
     if (vk_window_bottom_up()) { b.srcOffsets[0].y = cy + ch; b.srcOffsets[1].y = cy; }   // lower-left origin: the window image is stored bottom-up (gfx_vk_exec.c)
-    if (im->layout == VK_IMAGE_LAYOUT_UNDEFINED) { barrier(cb, im->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL); im->layout = VK_IMAGE_LAYOUT_GENERAL; }   // an imported frame buffer, first shown (gl_android.c)
-    vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    // Explicit per-image layout transition on im->img (GENERAL -> TRANSFER_SRC_OPTIMAL -> GENERAL) flushes AFBC/tile
+    // writes cleanly before linear-filtered blit on Mali-G57/G52 under pool_overlap=1 & render_scale < 1.0.
+    VkImageLayout src_prev = (im->layout == VK_IMAGE_LAYOUT_UNDEFINED) ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
+    VkImageMemoryBarrier src_pre = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT, src_prev, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im->img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &src_pre);
+    vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    VkImageMemoryBarrier src_post = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im->img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &src_post);
+    im->layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageLayout lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     int external = dm_external_active();
     int ovm = external ? 0 : dm_overlay_visible(), menu = external ? -1 : dm_menu_state(), fps = dm_overlay_fps();
-    if ((ovm || menu >= 0 || fps) && overlay_ready(cb, k, menu) && (V.has_dynrender || ov_fb(idx))) {   // without dynamic rendering, only with the image's framebuffer
+    if ((ovm || menu >= 0 || fps) && overlay_ready(cb, k, menu) && g_ov.pipe && (V.has_dynrender || (g_ov.rp && ov_fb(idx)))) {   // without dynamic rendering, only with valid render pass + classic framebuffer
         barrier(cb, tgt, lay, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); lay = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, tview, lay, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE};
         VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, g_sext}, 1, 0, 1, &ca, NULL, NULL};
@@ -956,12 +1026,19 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
         barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     } else barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vkEndCommandBuffer(cb);
-    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};
+    // Wait on g_timeline >= fence (in addition to swapchain acquire g_acq[k]) so async present_thread on Mali CSF
+    // never blits im->img before its producing submission completes, even when pipelined overlap is active.
+    VkSemaphore tl = fence ? vk_timeline_semaphore() : VK_NULL_HANDLE;
+    VkSemaphore wsems[2] = {g_acq[k], tl};
+    VkPipelineStageFlags ws[2] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT};
+    uint64_t wvals[2] = {0, fence};
+    uint64_t svals[1] = {0};
+    VkTimelineSemaphoreSubmitInfo tsi = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, 2u, wvals, 1u, svals};
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, tl ? &tsi : NULL, tl ? 2u : 1u, wsems, ws, 1, &cb, 1, &g_done_sem[k]};
     extern pthread_mutex_t g_vk_queue_mu;
     pthread_mutex_lock(&g_vk_queue_mu);
     r = vkQueueSubmit(V.q, 1, &si, g_pfence[k]);
-    if (r) { pthread_mutex_unlock(&g_vk_queue_mu); VKRED_ONCE(91, "present submit failed (%d)", r); return; }
+    if (r) { pthread_mutex_unlock(&g_vk_queue_mu); if (r == VK_ERROR_DEVICE_LOST) vk_record_device_lost("present_window", r); VKRED_ONCE(91, "present submit failed (%d)", r); return; }
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &g_done_sem[k], 1, &g_swap, &idx, NULL};
     uint32_t pid = ++g_pace_id;   // before pace_desired, which keys its call times by it (an initializer's order of evaluation is unspecified)
     VkPresentTimeGOOGLE ptm = {pid, period >= 0 ? pace_desired(period) : 0};
@@ -1013,7 +1090,7 @@ void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); swap_destroy(); g
 // its ticket (mtl_present_wait), and the blit's submission comes after the frame's own on the one queue. DM_VK_SYNC_PRESENT=1 presents on the game thread.
 // Low-latency present queue (2 frames max buffered instead of 4 to minimize input-to-screen lag).
 #define PQ_N 2
-static struct { vkimg_t *im; int crop[4], has_crop; uint64_t n; double period; } g_pq[PQ_N];
+static struct { vkimg_t *im; int crop[4], has_crop; uint64_t n, fence; double period; } g_pq[PQ_N];
 static uint64_t g_pq_head, g_pq_tail, g_pq_done;   // queued [tail, head), presents up to ticket g_pq_done are blitted
 static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
 // While the game is held (the pause menu) no frame comes: dm_overlay_redraw presents the last one again with what the overlay now shows.
@@ -1029,29 +1106,31 @@ static void *present_thread(void *arg) {
         atomic_store(&g_redraw, 0);
         if (g_pq_tail == g_pq_head) {   // a redraw, no new frame
             pthread_mutex_unlock(&g_pq_mu);
-            if (last.im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(last.im, last.has_crop ? last.crop : NULL, -1, 0); pthread_mutex_unlock(&g_present_mu); }
+            if (last.im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(last.im, last.has_crop ? last.crop : NULL, -1, 0, last.fence); pthread_mutex_unlock(&g_present_mu); }
             continue;
         }
         typeof(g_pq[0]) e = g_pq[g_pq_tail % PQ_N];
         pthread_mutex_unlock(&g_pq_mu);
-        if (e.im) { last = e; pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(e.im, e.has_crop ? e.crop : NULL, e.period, e.n); pthread_mutex_unlock(&g_present_mu); }
+        if (e.im) { last = e; pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(e.im, e.has_crop ? e.crop : NULL, e.period, e.n, e.fence); pthread_mutex_unlock(&g_present_mu); }
         pthread_mutex_lock(&g_pq_mu); g_pq_tail++; g_pq_done = e.n; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }
     return NULL;
 }
 static void present_thread_start(void) { pthread_t t; pthread_create(&t, NULL, present_thread, NULL); pthread_detach(t); }
 static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, double period) {   // im NULL: nothing to show, the ticket still completes in order
+    uint64_t mtl_last_fence(void);
+    uint64_t fence = mtl_last_fence();
     static int sync = -1; static pthread_once_t once = PTHREAD_ONCE_INIT;
     if (sync < 0) sync = getenv("DM_VK_SYNC_PRESENT") != NULL;
     if (sync || !dm_front_window()) {   // headless: nothing to show; or presenting on this thread
-        if (sync && im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(im, crop, period, n); pthread_mutex_unlock(&g_present_mu); }
+        if (sync && im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(im, crop, period, n, fence); pthread_mutex_unlock(&g_present_mu); }
         pthread_mutex_lock(&g_pq_mu); if (g_pq_tail == g_pq_head) g_pq_done = n; pthread_mutex_unlock(&g_pq_mu);   // done at once (after any queued ones)
         return n;
     }
     pthread_once(&once, present_thread_start);
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_head - g_pq_tail >= PQ_N) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // never more than PQ_N frames behind
-    typeof(g_pq[0]) *e = &g_pq[g_pq_head % PQ_N]; e->im = im; e->n = n; e->period = period; e->has_crop = crop != NULL; if (crop) memcpy(e->crop, crop, sizeof e->crop);
+    typeof(g_pq[0]) *e = &g_pq[g_pq_head % PQ_N]; e->im = im; e->n = n; e->fence = fence; e->period = period; e->has_crop = crop != NULL; if (crop) memcpy(e->crop, crop, sizeof e->crop);
     g_pq_head++; pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     return n;
@@ -1073,7 +1152,12 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     // title screen, and the game stayed at 30 fps for the run (the display at 30 Hz in each of four 30 fps runs, never in the runs that held 60)
     static int game_rate = -1; static uint64_t game_rate_at; double wperiod = period;
     if (game_rate < 0 || g_presents - game_rate_at >= 60) { game_rate = dm_pacing_window_game_rate(); game_rate_at = g_presents; }
-    if (game_rate) { int nvn_game_fps(void); int gf = nvn_game_fps(); if (gf > 0 && 1.0 / gf < wperiod) wperiod = 1.0 / gf; }
+    if (game_rate) {
+        int nvn_game_fps(void); int gf = nvn_game_fps();
+        int tgt = dm_pacing_target(NULL);
+        if (tgt > gf) gf = tgt;   // honor explicit DM_FPS_TARGET=60 for ANativeWindow_setFrameRate(60 Hz)
+        if (gf > 0 && 1.0 / gf < wperiod) wperiod = 1.0 / gf;
+    }
     static ANativeWindow *rate_win; static double rate_period, want_period; static uint64_t want_since;
     if (wperiod != want_period) { want_period = wperiod; want_since = g_presents; }
     if (g_win && (g_win != rate_win || (wperiod != rate_period && (wperiod < rate_period || g_presents - want_since >= 60)))) { rate_win = g_win; rate_period = wperiod; dm_perf_window(g_win, wperiod > 0 ? 1.0 / wperiod : 60); }
@@ -1086,12 +1170,12 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     static uint64_t no_img, undrawn, shown;
     if (n == 600) { void crash_handlers_check(const char *when); crash_handlers_check("after 600 presents"); }
     if (n % 300 == 0) {
-        extern struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatches, pipes_built, rt_kept, ns_exec, ns_desc, ns_pipe, max_pass_draws; } g_vkst; extern uint64_t g_vk_skip_pipe_async, g_vk_skip_pipe_fail; extern uint64_t g_ubd_landed, g_ubd_superseded, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_gpu_ns, g_pkg_n, g_pkg_bytes, g_pkg_ns, g_set_hits, g_set_new, g_set_key_bypass, g_ubd_racy, g_ns_set_build, g_ns_set_hash, g_ns_set_new, g_set_memo, g_set_memo_bad;
+        extern struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatches, pipes_built, rt_kept, ns_exec, ns_desc, ns_pipe, max_pass_draws; } g_vkst; extern uint64_t g_vk_skip_pipe_async, g_vk_skip_pipe_fail, g_tbdr_fs_load_opt, g_discard_store_opt, g_inline_resolve_opt, g_pp_skipped; extern uint64_t g_ubd_landed, g_ubd_superseded, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_gpu_ns, g_pkg_n, g_pkg_bytes, g_pkg_ns, g_set_hits, g_set_new, g_set_key_bypass, g_ubd_racy, g_ns_set_build, g_ns_set_hash, g_ns_set_new, g_set_memo, g_set_memo_bad;
         static uint64_t psb, psh, psn, pe, pd, pp, ps, pb, pdr, pg, pkn, pkb, pkt, psm;
-        VKLOG("replay up to present %llu: draws %llu, skipped (no program %llu, no target %llu, no pipeline %llu [async %llu, failed %llu]), passes %llu, clears folded %llu, dispatches %llu, pipelines %llu; presents shown %llu, no image %llu, never drawn %llu; uniform updates landed %llu (superseded %llu, shadows %llu, CPU reads racing a GPU write %llu), same targets kept %llu, most draws in one pass %llu",
+        VKLOG("replay up to present %llu: draws %llu, skipped (no program %llu, no target %llu, no pipeline %llu [async %llu, failed %llu]), passes %llu, pp_skipped %llu, clears folded %llu, dc_folded %llu, store_dc %llu, inline_res %llu, dispatches %llu, pipelines %llu; presents shown %llu, no image %llu, never drawn %llu; uniform updates landed %llu (superseded %llu, shadows %llu, CPU reads racing a GPU write %llu), same targets kept %llu, most draws in one pass %llu",
               (unsigned long long)n, (unsigned long long)g_vkst.draws, (unsigned long long)g_vkst.skip_prog, (unsigned long long)g_vkst.skip_rt, (unsigned long long)g_vkst.skip_pipe,
               (unsigned long long)g_vk_skip_pipe_async, (unsigned long long)g_vk_skip_pipe_fail,
-              (unsigned long long)g_vkst.passes, (unsigned long long)g_vkst.folded, (unsigned long long)g_vkst.dispatches, (unsigned long long)g_vkst.pipes_built,
+              (unsigned long long)g_vkst.passes, (unsigned long long)g_pp_skipped, (unsigned long long)g_vkst.folded, (unsigned long long)g_tbdr_fs_load_opt, (unsigned long long)g_discard_store_opt, (unsigned long long)g_inline_resolve_opt, (unsigned long long)g_vkst.dispatches, (unsigned long long)g_vkst.pipes_built,
               (unsigned long long)shown, (unsigned long long)no_img, (unsigned long long)undrawn, (unsigned long long)g_ubd_landed, (unsigned long long)g_ubd_superseded, (unsigned long long)g_ubd_shadows, (unsigned long long)g_ubd_racy, (unsigned long long)g_vkst.rt_kept, (unsigned long long)g_vkst.max_pass_draws);
         double nd = g_vkst.draws > pdr ? (double)(g_vkst.draws - pdr) / 300 : 0;
         VKLOG("replay per frame (last 300): %.0f draws, replay %.2f ms (descriptor sets %.2f, pipeline keys %.2f), queue submit %.2f ms, uniform shadows %.0f KB; GPU busy %.2f ms; texture uploads %.1f (%.2f MB, %.2f ms); descriptor sets reused %llu, new %llu, key arena bypasses %llu (collecting %.2f ms, hashing %.2f, new ones %.2f), kept per stage %.0f a frame (memo differences %llu)",
@@ -1119,7 +1203,8 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     int vcrop[4];
     if (im && !(crop && crop[2] > 0 && crop[3] > 0)) {
         void dm_vi_layer_crop(int c[4]); dm_vi_layer_crop(vcrop);
-        if (vcrop[2] > 0 && vcrop[3] > 0 && vcrop[0] + vcrop[2] <= (int)im->w && vcrop[1] + vcrop[3] <= (int)im->h) crop = vcrop;
+        int ow = (int)(im->orig_w ? im->orig_w : im->w), oh = (int)(im->orig_h ? im->orig_h : im->h);
+        if (vcrop[2] > 0 && vcrop[3] > 0 && vcrop[0] + vcrop[2] <= ow && vcrop[1] + vcrop[3] <= oh) crop = vcrop;
     }
     uint64_t r = present_enqueue(im, crop, n, period);
     vk_sub_timing_add(6, mono_ns() - pt0);
@@ -1177,7 +1262,7 @@ int mtl_fps_target(void) { return DM_GAME_FPS_TARGET > 0 ? DM_GAME_FPS_TARGET : 
 extern uint8_t *dm_fps_state;
 int dm_fps_ceiling(void) {
     static int c = -1;
-    if (c < 0) { c = dm_pacing_ceiling(); if (c != 30 || dm_fps_state) c = 0; }   // dm_pacing.c
+    if (c < 0) { c = dm_pacing_ceiling(); if ((c != 30 && c != 45) || dm_fps_state) c = 0; }   // dm_pacing.c (supports 30 & 45 FPS caps)
     return c;
 }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }

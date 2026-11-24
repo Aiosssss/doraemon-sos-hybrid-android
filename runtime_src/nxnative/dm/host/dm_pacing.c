@@ -9,26 +9,48 @@
 
 #define PLOG(...) do { fprintf(stderr, "[dm] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 
+__attribute__((weak)) int vk_gpu_ultra_low_end(void) { return 0; }
+// Auto FPS tier policy (v1.1.2-hybrid27): Ultra Low-End / HP Kentang (Tier 3: Mali-G52, Adreno 610/612, <=3.5 GB)
+// defaults to stable 30 FPS in Auto mode (user can still raise to 45/60 FPS in Settings); Flagship/Mid/Low-End (Tier 0-2) default to 60 FPS.
+static int auto_is_30(void) { return vk_gpu_ultra_low_end() != 0; }
+
 int dm_pacing_target(const char **src) {
-    const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
+    const char *e = getenv("DM_FPS_TARGET");
+    if (e && !strcmp(e, "auto")) {
+        if (src) *src = auto_is_30() ? "DM_FPS_TARGET=auto (ultra-low GPU -> 30)" : "DM_FPS_TARGET=auto (60)";
+        return auto_is_30() ? 30 : 60;
+    }
+    int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
     if (src) *src = e ? "DM_FPS_TARGET" : "game profile fps_target";
     if (t != 0 && t != 30 && t != 60) {
-        static int said; if (!said++) PLOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; the game's own frame limit is used", e ? e : "(profile)");
+        static int said; if (!said++) PLOG("[RED] DM_FPS_TARGET=%s: must be 0, 30, 60 or auto; the game's own frame limit is used", e ? e : "(profile)");
         t = 0;
     }
     return t;
 }
 
-int dm_pacing_ceiling(void) { const char *e = getenv("DM_FPS_CEILING"); return e ? atoi(e) : DM_GAME_FPS_CEILING; }
+int dm_pacing_ceiling(void) {
+    const char *e = getenv("DM_FPS_CEILING");
+    if (e && !strcmp(e, "auto")) return auto_is_30() ? 30 : 0;
+    return e ? atoi(e) : DM_GAME_FPS_CEILING;
+}
 
 int dm_pacing_hold(const char **src) {
     const char *e = getenv("DM_FPS_HOLD");
+    if (e && !strcmp(e, "auto")) {
+        if (src) *src = "DM_FPS_HOLD=auto";
+        return auto_is_30() ? 1 : 0;
+    }
     if (src) *src = e ? "DM_FPS_HOLD" : "game profile fps_hold";
     return e ? strcmp(e, "off") != 0 : DM_GAME_FPS_HOLD;
 }
 
 int dm_pacing_display(const char **src) {
     const char *m = getenv("DM_PRESENT_INTERVAL");
+    if (m && !strcmp(m, "auto")) {
+        if (src) *src = "DM_PRESENT_INTERVAL=auto";
+        return auto_is_30() ? 0 : 1;
+    }
     if (src) *src = m ? "DM_PRESENT_INTERVAL" : "game profile present_interval";
     return m ? !strcmp(m, "display") : DM_GAME_PRESENT_DISPLAY;
 }
@@ -43,7 +65,11 @@ int dm_pacing_pin(void) { const char *e = getenv("DM_FPS_PIN"); int v = e ? atoi
 
 int dm_pacing_up_pct(void) { const char *e = getenv("DM_ADAPT_UP_PCT"); return e && atoi(e) > 0 && atoi(e) < 100 ? atoi(e) : 90; }
 
-int dm_pacing_window_game_rate(void) { const char *e = getenv("DM_VK_WINDOW_GAME_RATE"); return e && atoi(e) != 0; }
+int dm_pacing_window_game_rate(void) {
+    const char *e = getenv("DM_VK_WINDOW_GAME_RATE");
+    if (e && !strcmp(e, "auto")) return auto_is_30() ? 0 : 1;
+    return e && atoi(e) != 0;
+}
 
 int dm_pacing_turbo(void) { const char *e = getenv("DM_GPU_TURBO"); return e && !strcmp(e, "auto") ? 2 : e && atoi(e) > 0; }
 

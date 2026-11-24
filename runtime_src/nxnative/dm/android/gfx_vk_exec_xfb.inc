@@ -178,6 +178,38 @@ static void vbuf_bound(VkCommandBuffer cb, uint32_t first, uint32_t nvert, uint3
                                     s, nvert, first, (unsigned long long)vsh->key, (unsigned long long)(n - sz), (unsigned long long)sz);
     }
 }
+// Validate per-instance vertex stream bounds on indexed draws (especially Mali Vulkan 1.1 without robustBufferAccess
+// or vertexAttributeInstanceRateDivisor, even when DM_VK_EMU_FIRST_INSTANCE=0). Pads/clamps into vk_scratch on OOB.
+static uint32_t vbuf_inst_bound(VkCommandBuffer cb, uint32_t binst, uint32_t inst, uint32_t skip_mask) {
+    vkshader_t *vsh = S.sh[0]; if (!g_vbound || !vsh || (dbg_draw() & 2) || g_var_now == 5) return 0;
+    uint32_t in_mask = vsh->local[0], int_mask = vsh->local[1] | vsh->local[2], sint_mask = vsh->local[1];
+    uint64_t need[16] = {0}; uint32_t fixed = 0;
+    uint32_t ninst = inst ? inst : 1u;
+    for (int loc = 0; loc < 16; loc++) {
+        if (!(in_mask >> loc & 1)) continue;
+        va_st a; memcpy(&a, &S.vattr[loc], 4); if (!a.fmt || !S.vbuf[a.stream].address) continue;
+        uint32_t s = a.stream, st = S.vstream[s].stride, dv = S.vstream[s].divisor;
+        if (!dv || !st || (skip_mask >> s & 1)) continue;
+        VkFormat f = vertex_format(a.fmt, int_mask >> loc & 1, sint_mask >> loc & 1); if (f == VK_FORMAT_UNDEFINED) continue;
+        uint64_t last = (!V.has_divisor && dv > 1) ? ((uint64_t)binst + ninst - 1) : ((uint64_t)(binst / dv) + (ninst - 1) / dv);
+        uint64_t e = last * st + a.offset + vfmt_bytes(f);
+        if (e > need[s]) need[s] = e;
+    }
+    for (uint32_t s = 0; s < 16; s++) {
+        uint64_t n = need[s]; if (!n) continue;
+        vkpool_t *vp = vk_pool_of(S.vbuf[s].address, 1);
+        uint64_t pool_rem = (vp && S.vbuf[s].address >= vp->lo && S.vbuf[s].address < vp->hi) ? (vp->hi - S.vbuf[s].address) : 0;
+        uint64_t sz = S.vbuf[s].size && S.vbuf[s].size < pool_rem ? S.vbuf[s].size : pool_rem;
+        if (n <= sz) continue;
+        if (n > (4u << 20)) continue;
+        VkBuffer b; VkDeviceSize o; uint8_t *p = vk_scratch(n, 16, &b, &o);
+        if (sz) vk_ubd_read(S.vbuf[s].address, sz, p);
+        memset(p + sz, 0, (size_t)(n - sz));
+        vkCmdBindVertexBuffers(cb, s, 1, &b, &o); g_bc.vb[s] = b; g_bc.vo[s] = o;
+        fixed |= 1u << s;
+    }
+    return fixed;
+}
 // Mali-G720 (VK_KHR_vertex_attribute_divisor with supportsNonZeroFirstInstance=VK_FALSE) forbids
 // non-zero firstInstance when any active vertex binding uses divisor > 1 (VUID-vkCmdDraw-firstInstance-09460).
 // Verified across all 5,613 Doraemon SoS shaders: all 453 shaders touching BuiltIn InstanceIndex/BaseInstance
@@ -185,8 +217,35 @@ static void vbuf_bound(VkCommandBuffer cb, uint32_t first, uint32_t nvert, uint3
 // independently via driver constant buffer c0+0x644 (g_draw_binst). Thus shifting every active per-instance
 // vertex stream (divisor >= 1) by (firstInstance / divisor) * stride and drawing with firstInstance=0 is exact.
 uint64_t g_fi_emu_n;
-static uint32_t emulate_first_instance(VkCommandBuffer cb, uint32_t *binst) {
-    if (!g_emu_first_instance || V.has_nonzero_first_inst || !*binst || !V.has_divisor || (dbg_draw() & 2) || g_var_now == 5) return 0;
+// Compute the bitmask of active vertex streams that emulate_first_instance() will expand to divisor=1
+// in vk_scratch when V.has_divisor && !V.has_nonzero_first_inst && dv > 1 && (fi % dv) != 0.
+// Called BEFORE prepare_draw() so the pipeline key uses divisor=1 for those streams, preventing
+// double division (dst[k/dv] = el((fi + k/dv)/dv)) on Mali-G720/Adreno GPUs with hardware divisor.
+static uint32_t fi_expand_mask_for(uint32_t fi, uint32_t inst) {
+    if (!V.has_divisor || V.has_nonzero_first_inst || !g_emu_first_instance || !fi || (dbg_draw() & 2) || g_var_now == 5) return 0;
+    vkshader_t *vsh = S.sh[0]; if (!vsh) return 0;
+    uint32_t in_mask = vsh->local[0], used = 0;
+    for (int loc = 0; loc < 16; loc++) {
+        if (!(in_mask >> loc & 1)) continue;
+        va_st a; memcpy(&a, &S.vattr[loc], 4);
+        if (!a.fmt || !S.vbuf[a.stream].address) continue;
+        used |= 1u << a.stream;
+    }
+    uint32_t ninst = inst ? inst : 1u, mask = 0;
+    for (uint32_t s = 0; s < 16; s++) {
+        if (!(used >> s & 1)) continue;
+        uint32_t dv = S.vstream[s].divisor, st = S.vstream[s].stride;
+        if (dv <= 1 || (fi % dv) == 0 || !st) continue;
+        vkpool_t *vp = vk_pool_of(S.vbuf[s].address, 1);
+        uint64_t pool_rem = (vp && S.vbuf[s].address >= vp->lo && S.vbuf[s].address < vp->hi) ? (vp->hi - S.vbuf[s].address) : 0;
+        uint64_t avail = S.vbuf[s].size && S.vbuf[s].size < pool_rem ? S.vbuf[s].size : pool_rem;
+        uint64_t out_bytes = (uint64_t)ninst * (uint64_t)st;
+        if (out_bytes > 0 && out_bytes <= (1u << 20) && avail >= st) mask |= 1u << s;
+    }
+    return mask;
+}
+static uint32_t emulate_first_instance(VkCommandBuffer cb, uint32_t *binst, uint32_t inst) {
+    if ((dbg_draw() & 2) || g_var_now == 5) return 0;
     vkshader_t *vsh = S.sh[0]; if (!vsh) return 0;
     uint32_t in_mask = vsh->local[0], used = 0; int has_div_gt1 = 0;
     for (int loc = 0; loc < 16; loc++) {
@@ -199,10 +258,90 @@ static uint32_t emulate_first_instance(VkCommandBuffer cb, uint32_t *binst) {
     if (!has_div_gt1) return 0;
     uint32_t fi = *binst, shifted = 0;
     VkBuffer zbuf = vk_zero_buffer(), dbuf = vk_default_attribute_buffer();
+    if (!V.has_divisor) {
+        // Device lacks vertexAttributeInstanceRateDivisor (e.g. Mali-G615 MC2, Mali-G57 MC2) and often lacks VK_EXT_robustness2.
+        // Without emulation, hardware steps divisor>1 streams at divisor=1 and reads (fi + inst - 1) * stride past the VkBuffer -> Mali MMU fault (-4).
+        // Expand each active per-instance stream (dv >= 1) into bounded vk_scratch(inst * stride) with exact (fi + k) / dv indexing and draw with firstInstance=0.
+        uint32_t ninst = inst ? inst : 1;
+        for (uint32_t s = 0; s < 16; s++) {
+            if (!(used >> s & 1)) continue;
+            uint32_t dv = S.vstream[s].divisor, st = S.vstream[s].stride;
+            if (!dv || !st || !g_bc.vb[s] || g_bc.vb[s] == zbuf || g_bc.vb[s] == dbuf) continue;
+            vkpool_t *vp = vk_pool_of(S.vbuf[s].address, 1);
+            uint64_t pool_rem = (vp && S.vbuf[s].address >= vp->lo && S.vbuf[s].address < vp->hi) ? (vp->hi - S.vbuf[s].address) : 0;
+            uint64_t avail = S.vbuf[s].size && S.vbuf[s].size < pool_rem ? S.vbuf[s].size : pool_rem;
+            uint64_t out_bytes = (uint64_t)ninst * (uint64_t)st;
+            if (out_bytes > 0 && out_bytes <= (1u << 20) && avail >= st) {
+                if (vk_gpu_pending(S.vbuf[s].address, avail)) vk_cpu_ready(S.vbuf[s].address, avail);
+                VkBuffer sb; VkDeviceSize so;
+                uint8_t *dst = vk_scratch(out_bytes, 16, &sb, &so);
+                uint32_t max_el = (uint32_t)(avail / st);
+                uint32_t last_idx = ~0u;
+                uint8_t el_tmp[256];
+                for (uint32_t k = 0; k < ninst; k++) {
+                    uint32_t idx = (fi + k) / dv;
+                    if (idx >= max_el) idx = max_el - 1;
+                    if (st <= sizeof el_tmp) {
+                        if (idx != last_idx) { vk_ubd_read(S.vbuf[s].address + (uint64_t)idx * st, st, el_tmp); last_idx = idx; }
+                        memcpy(dst + (uint64_t)k * st, el_tmp, st);
+                    } else {
+                        vk_ubd_read(S.vbuf[s].address + (uint64_t)idx * st, st, dst + (uint64_t)k * st);
+                    }
+                }
+                vkCmdBindVertexBuffers(cb, s, 1, &sb, &so);
+                g_bc.vb[s] = sb; g_bc.vo[s] = so;
+                shifted |= 1u << s;
+            } else if (avail < st) {
+                // OOB safety fallback on GPUs without robustness2: never let hardware read past VkBuffer.
+                VkDeviceSize zo = 0;
+                vkCmdBindVertexBuffers(cb, s, 1, &zbuf, &zo);
+                g_bc.vb[s] = zbuf; g_bc.vo[s] = 0;
+                shifted |= 1u << s;
+            }
+        }
+        if (shifted) {
+            static uint64_t g_nodiv_emu_n;
+            if (g_nodiv_emu_n++ < 8) VKLOG("emulated divisor>1 streams without hardware divisor ext (inst=%u fi=%u VS %016llx mask=%#x)", ninst, fi, (unsigned long long)vsh->key, shifted);
+            *binst = 0;
+        }
+        return shifted;
+    }
+    if (!g_emu_first_instance || V.has_nonzero_first_inst || !fi) return 0;
+    uint32_t ninst = inst ? inst : 1u;
     for (uint32_t s = 0; s < 16; s++) {
         if (!(used >> s & 1)) continue;
         uint32_t dv = S.vstream[s].divisor, st = S.vstream[s].stride;
         if (!dv || !st || !g_bc.vb[s] || g_bc.vb[s] == zbuf || g_bc.vb[s] == dbuf) continue;
+        // If fi is not an exact multiple of dv (>1), shifting by (fi / dv) drops the remainder (fi % dv)
+        // for subsequent instances (e.g. instanced trees/shadows); expand into vk_scratch with exact (fi + k) / dv
+        // (pipeline divisor for streams in g_fi_expand_mask was already forced to 1 in prepare_draw()).
+        if ((g_fi_expand_mask >> s) & 1u) {
+            vkpool_t *vp = vk_pool_of(S.vbuf[s].address, 1);
+            uint64_t pool_rem = (vp && S.vbuf[s].address >= vp->lo && S.vbuf[s].address < vp->hi) ? (vp->hi - S.vbuf[s].address) : 0;
+            uint64_t avail = S.vbuf[s].size && S.vbuf[s].size < pool_rem ? S.vbuf[s].size : pool_rem;
+            uint64_t out_bytes = (uint64_t)ninst * (uint64_t)st;
+            if (out_bytes > 0 && out_bytes <= (1u << 20) && avail >= st) {
+                if (vk_gpu_pending(S.vbuf[s].address, avail)) vk_cpu_ready(S.vbuf[s].address, avail);
+                VkBuffer sb; VkDeviceSize so;
+                uint8_t *dst = vk_scratch(out_bytes, 16, &sb, &so);
+                uint32_t max_el = (uint32_t)(avail / st), last_idx = ~0u;
+                uint8_t el_tmp[256];
+                for (uint32_t k = 0; k < ninst; k++) {
+                    uint32_t idx = (fi + k) / dv;
+                    if (idx >= max_el) idx = max_el - 1;
+                    if (st <= sizeof el_tmp) {
+                        if (idx != last_idx) { vk_ubd_read(S.vbuf[s].address + (uint64_t)idx * st, st, el_tmp); last_idx = idx; }
+                        memcpy(dst + (uint64_t)k * st, el_tmp, st);
+                    } else {
+                        vk_ubd_read(S.vbuf[s].address + (uint64_t)idx * st, st, dst + (uint64_t)k * st);
+                    }
+                }
+                vkCmdBindVertexBuffers(cb, s, 1, &sb, &so);
+                g_bc.vb[s] = sb; g_bc.vo[s] = so;
+                shifted |= 1u << s;
+                continue;
+            }
+        }
         uint64_t delta = (uint64_t)(fi / dv) * (uint64_t)st;
         if (!delta) continue;
         // Recompute from base S.vbuf[s].address when bound to the pool buffer (avoiding any accumulated shift in g_bc.vo[s]).
@@ -210,11 +349,16 @@ static uint32_t emulate_first_instance(VkCommandBuffer cb, uint32_t *binst) {
         VkBuffer pb; VkDeviceSize po;
         if (vk_buf_at(S.vbuf[s].address, 1, &pb, &po) && vb == pb) base_o = po;
         VkDeviceSize off = base_o + delta;
-        if (off < base_o) continue;
         vkpool_t *vp = vk_pool_of(S.vbuf[s].address, 1);
-        if (vp && vb == vp->buf && off >= (vp->hi - vp->lo) + vp->boff) continue;
+        VkDeviceSize buf_end = (vp && vb == vp->buf) ? ((vp->hi - vp->lo) + vp->boff) : 0;
+        uint64_t need = (uint64_t)((inst ? (inst - 1) / dv : 0) + 1) * (uint64_t)st;
+        if (off < base_o || (buf_end && (off >= buf_end || off + st > buf_end))) {
+            // Clamp or zero-fallback so GPUs without VK_EXT_robustness2 never fault on OOB per-instance offset.
+            if (buf_end >= base_o + st) off = (buf_end >= need && buf_end - need >= base_o) ? (buf_end - need) : (buf_end - st);
+            else { vb = zbuf; off = 0; }
+        }
         vkCmdBindVertexBuffers(cb, s, 1, &vb, &off);
-        g_bc.vo[s] = off;
+        g_bc.vb[s] = vb; g_bc.vo[s] = off;
         shifted |= 1u << s;
     }
     if (g_fi_emu_n++ < 8) VKLOG("emulated non-zero firstInstance=%u via per-instance VBO offsets (VS %016llx, mask=%#x, calls=%llu)", fi, (unsigned long long)vsh->key, shifted, (unsigned long long)g_fi_emu_n);
@@ -223,6 +367,7 @@ static uint32_t emulate_first_instance(VkCommandBuffer cb, uint32_t *binst) {
 }
 static inline void emulate_first_instance_finish(uint32_t shifted) {
     // Invalidate shifted VBO slots in bind cache so subsequent draws always rebind their true unshifted offset.
+    g_fi_expand_mask = 0;
     if (!shifted) return;
     for (uint32_t s = 0; s < 16; s++) if (shifted >> s & 1) { g_bc.vb[s] = VK_NULL_HANDLE; g_bc.vo[s] = 0; }
 }
@@ -318,7 +463,9 @@ static int qi_init(void) {
     if (vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_qi.dl) || vkCreateDescriptorPool(V.dev, &pi, NULL, &g_qi.dp) || vkCreateShaderModule(V.dev, &mi, NULL, &sm)) { VKLOG("[RED] indirect quad draws: the rewrite shader could not be made"); return 0; }
     VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_qi.dl, 1, &pr};
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL}};
+    vk_pipe_compile_lock();
     int bad = vkCreatePipelineLayout(V.dev, &pli, NULL, &g_qi.pl) || (ci.layout = g_qi.pl, vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_qi.p));
+    vk_pipe_compile_unlock();
     vkDestroyShaderModule(V.dev, sm, NULL);
     VkDescriptorSetAllocateInfo sa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_qi.dp, 1, &g_qi.dl};
     if (bad || vkAllocateDescriptorSets(V.dev, &sa, &g_qi.set)) { VKLOG("[RED] indirect quad draws: the rewrite pipeline could not be made"); return 0; }
@@ -364,7 +511,9 @@ static void draw(const p_draw *d) {
     if (d->ind && prim == 7 && !g_tf_on) quad_indirect(d->ind, mcb ? d->mdi_max : 1, mcb ? d->mdi_stride : 16, &qib, &qio);
     // before prepare_draw, whose driver segment carries it (c0 + 0x644): set after it, each draw's segment had the draw before's. An indirect draw's is in GPU memory: 0
     g_draw_binst = d->ind ? 0 : (uint32_t)d->base_instance;
-    if (!prepare_draw(prim == 7 ? 4 : prim, prim == 7)) return;
+    g_first_draw_cnt = (uint32_t)d->count; g_first_draw_inst = d->instances ? (uint32_t)d->instances : 1u; g_first_draw_ind = d->ind != 0;
+    g_fi_expand_mask = d->ind ? 0u : fi_expand_mask_for(g_draw_binst, g_first_draw_inst);
+    if (!prepare_draw(prim == 7 ? 4 : prim, prim == 7)) { g_fi_expand_mask = 0; return; }
     VkCommandBuffer cb = vk_cmd();
     int g_ok = draw_allowed(); if (g_ok == 2 || (g_tracing && g_x_tracepass >= 0)) trace_draw("draw", d->prim, (uint32_t)d->count, (uint32_t)d->instances, -1);
     if (g_tracing && g_x_tracepass >= 0 && !d->ind && S.vbuf[0].address) {   // the first vertices stream 0 gives the draw (with the deferred updates), every word as a float
@@ -394,7 +543,7 @@ static void draw(const p_draw *d) {
         uint32_t orig_fi = (uint32_t)d->base_instance, fi = orig_fi;
         d3d_log_draw("quad", (uint32_t)d->count, inst, orig_fi);
         vbuf_bound(cb, (uint32_t)d->first, nq * 4, fi, inst);
-        uint32_t shifted = emulate_first_instance(cb, &fi);
+        uint32_t shifted = emulate_first_instance(cb, &fi, inst);
         if (g_tf_on && S.sh[0] && S.sh[0]->xfb) VKRED_ONCE(85, "quads under transform feedback: not captured");
         VkBuffer qb = quad_index_buffer(&nq);
         bc_index(cb, qb, 0, VK_INDEX_TYPE_UINT32); if (!(dbg_draw() & 1) && g_ok) vkCmdDrawIndexed(cb, nq * 6, inst, 0, g_var_now == 4 ? 0 : d->first, fi);
@@ -403,7 +552,7 @@ static void draw(const p_draw *d) {
     uint32_t orig_fi = (uint32_t)d->base_instance, fi = orig_fi;
     d3d_log_draw("draw", (uint32_t)d->count, inst, orig_fi);
     vbuf_bound(cb, (uint32_t)d->first, (uint32_t)d->count, fi, inst);
-    uint32_t shifted = emulate_first_instance(cb, &fi);
+    uint32_t shifted = emulate_first_instance(cb, &fi, inst);
     if (g_bc_slot >= 0) {   // DrawTransformFeedback of a geometry shader's capture: its vertex count is the counter's bytes over the stream's stride
         vkshader_t *vsh = S.sh[0]; uint32_t st = 0;
         for (int loc = 0; vsh && loc < 16 && !st; loc++) if (vsh->local[0] >> loc & 1) { va_st a; memcpy(&a, &S.vattr[loc], 4); if (a.fmt) st = S.vstream[a.stream].stride; }
@@ -433,7 +582,9 @@ static void draw_idx(const p_draw_idx *d) {
     VkBuffer mcb = VK_NULL_HANDLE; VkDeviceSize mco = 0; if (mdi_group(d->mdi_cnt, d->ind, d->mdi_i, d->mdi_max, d->mdi_stride, 20, &mcb, &mco)) return;
     int prim = d->prim;
     g_draw_binst = d->ind ? 0 : (uint32_t)d->base_instance;   // before prepare_draw (see draw)
-    if (!prepare_draw(prim == 7 ? 4 : prim, 1)) return;
+    g_first_draw_cnt = (uint32_t)d->count; g_first_draw_inst = d->instances ? (uint32_t)d->instances : 1u; g_first_draw_ind = d->ind != 0;
+    g_fi_expand_mask = d->ind ? 0u : fi_expand_mask_for(g_draw_binst, g_first_draw_inst);
+    if (!prepare_draw(prim == 7 ? 4 : prim, 1)) { g_fi_expand_mask = 0; return; }
     VkCommandBuffer cb = vk_cmd();
     int g_ok = draw_allowed(); if (g_ok == 2 || (g_tracing && g_x_tracepass >= 0)) trace_draw("indexed draw", d->prim, (uint32_t)d->count, (uint32_t)d->instances, d->itype);
     if (d->ind && g_tracing && g_x_tracepass >= 0) { uint32_t w[5]; vk_ubd_read(d->ind, 20, (uint8_t *)w);   // the arguments as the CPU sees them now (a GPU writer's last merged copy)
@@ -475,13 +626,14 @@ static void draw_idx(const p_draw_idx *d) {
     if (prim == 7) { VkBuffer b; VkDeviceSize o; int n = quad_indices((uint32_t)d->count, (const uint8_t *)(uintptr_t)d->ibuf, d->itype, 0, &b, &o); if (!n) return;
         uint32_t orig_fi = (uint32_t)d->base_instance, fi = orig_fi;
         d3d_log_draw("qidx", (uint32_t)d->count, inst, orig_fi);
-        uint32_t shifted = emulate_first_instance(cb, &fi);
+        uint32_t shifted = emulate_first_instance(cb, &fi, inst);
         bc_index(cb, b, o, VK_INDEX_TYPE_UINT32); if (!(dbg_draw() & 1) && g_ok) vkCmdDrawIndexed(cb, (uint32_t)n, inst, 0, d->base_vertex, fi);
         emulate_first_instance_finish(shifted); return; }
     if (io % isz) { VKRED_ONCE(57, "index buffer offset not aligned to its index size"); return; }
     uint32_t orig_fi = (uint32_t)d->base_instance, fi = orig_fi;
     d3d_log_draw("idx", (uint32_t)d->count, inst, orig_fi);
-    uint32_t shifted = emulate_first_instance(cb, &fi);
+    uint32_t shifted = emulate_first_instance(cb, &fi, inst);
+    shifted |= vbuf_inst_bound(cb, fi, inst, shifted);
     bc_index(cb, ib, io, it);
     if (!(dbg_draw() & 1) && g_ok) { int xf = xfb_begin(cb); vkCmdDrawIndexed(cb, (uint32_t)d->count, inst, 0, d->base_vertex, fi); if (xf) xfb_end(cb, prim, (uint32_t)d->count, inst, xf); }
     emulate_first_instance_finish(shifted);
@@ -496,7 +648,10 @@ static VkPipeline compute_build(vkshader_t *cs, uint64_t um, uint64_t im) {   //
     static int alt = -1; if (alt < 0) { const char *e = getenv("DM_VK_SPV_ALT"); alt = e && atoi(e); }
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(VK_SHADER_STAGE_COMPUTE_BIT, cs->local), 0, VK_SHADER_STAGE_COMPUTE_BIT, vk_shader_module(cs, um, im, alt && !um && !im ? 1u << 31 : 0, 0, 0), "main", NULL}, vk_pipeline_layout(dsl, 1), VK_NULL_HANDLE, -1};   // (pNext: DM_VK_SUBGROUP_PIN)
     if (bs >= 0) g_build[bs].phase = 2;
-    VkResult r = vkCreateComputePipelines(V.dev, V.pcache, 1, &ci, NULL, &p); build_end(bs);
+    vk_pipe_compile_lock();
+    VkResult r = vkCreateComputePipelines(V.dev, V.pcache, 1, &ci, NULL, &p);
+    vk_pipe_compile_unlock();
+    build_end(bs);
     vk_pipeline_cache_changed();
     if (r) { LOG("[RED] [vk] compute pipeline failed: %016llx", (unsigned long long)cs->key); p = (VkPipeline)1; }
     return p;
@@ -509,20 +664,26 @@ static void *compute_warm(void *arg) {
     int vk_shader_keys(uint32_t stage, uint64_t *out, int max); static uint64_t keys[4096]; int n = vk_shader_keys(5, keys, 4096), made = 0; uint64_t t0 = tick();
     // A bundle with many compute shaders is left to the replay: Monster Hunter Rise's (4096 or more) held ~550 MB more from the title on, and a Retroid Pocket 5
     // (Adreno 650, 8 GB) ran out of GPU memory loading the first area (vkAllocateMemory -2 at a 4 MB pool). DM_VK_COMPUTE_WARM_MAX (start-up, default 256): the most made ahead
-    { const char *e = getenv("DM_VK_COMPUTE_WARM_MAX"); int cap = e ? atoi(e) : 256;
+    { const char *e = getenv("DM_VK_COMPUTE_WARM_MAX"); int def_cap = (vk_low_ram_tier() >= 1 || vk_mali_legacy_compiler()) ? 64 : 256; int cap = e ? atoi(e) : def_cap;
       if (n > cap) { VKLOG("compute pipelines made ahead: none, the bundle has %d%s compute shaders (more than %d, DM_VK_COMPUTE_WARM_MAX)", n, n == 4096 ? " or more" : "", cap); return NULL; } }
+    int paced = vk_mali_legacy_compiler();
     for (int i = 0; i < n; i++) {
         uint64_t ck[3] = {keys[i], 0, 0};
         pthread_mutex_lock(&g_cpipe_mu); int have = nvn_hm_get(&g_cpipes, ck) != NULL; pthread_mutex_unlock(&g_cpipe_mu);
         vkshader_t *cs = have ? NULL : vk_shader(keys[i], 5); if (!cs) continue;
         VkPipeline p = compute_build(cs, 0, 0); made++;
         pthread_mutex_lock(&g_cpipe_mu); if (!nvn_hm_get(&g_cpipes, ck)) nvn_hm_put(&g_cpipes, ck, p); else if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); pthread_mutex_unlock(&g_cpipe_mu);
+        if (paced) usleep(1500);
     }
-    VKLOG("compute pipelines made ahead: %d of %d compute shaders in %.0f ms", made, n, (tick() - t0) / 1e6);
+    if (made > 0) { void vk_pipeline_cache_save(void); vk_pipeline_cache_save(); }
+    VKLOG("compute pipelines made ahead: %d of %d compute shaders in %.0f ms%s", made, n, (tick() - t0) / 1e6, paced ? " (single-thread paced)" : "");
     return NULL;
 }
 static void compute_warm_start(void) {
-    if (getenv("DM_VK_NOPREWARM")) return;
+    if (getenv("DM_VK_NOPREWARM") || vk_low_ram_tier() >= 2) {
+        VKLOG("compute warm: off (%s)", getenv("DM_VK_NOPREWARM") ? "DM_VK_NOPREWARM" : "ultra low-RAM tier");
+        return;
+    }
     pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, compute_warm, NULL); pthread_attr_destroy(&a);
 }
 // Validate all three indirect argument words before recording any copy. A pool can have several VkBuffers (chunks), and a slab's

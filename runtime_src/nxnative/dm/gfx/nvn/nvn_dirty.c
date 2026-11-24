@@ -360,21 +360,106 @@ int nvn_dirty_tracked(const void *addr, size_t len) {
 }
 // The tracked range holding [addr, addr+len), as a handle a caller keeps (packaged textures: the scan over every range ran twice per texture lookup). NULL = untracked
 const void *nvn_dirty_span(const void *addr, size_t len) { return len ? find_span((uintptr_t)addr, len) : NULL; }
-// Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
-void nvn_dirty_protect(const void *addr, size_t len) {
-    range_t *r = len ? find_span((uintptr_t)addr, len) : NULL;
-    if (!r) return;
-    uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
-    // Consecutive pages are merged into one mprotect (per-page calls reach thousands per frame on the first upload of large textures; character select page startup frame 5: 4888 calls).
-    // Pages already PROT / BUSY break the consecutive run: do not protect again, and do not touch pages another thread is changing
-    uintptr_t run = 0; int open = 0;
-    for (uintptr_t i = p; i <= q + 1; i++) {
-        uint8_t st = PG_NONE;
-        int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
-        if (took && !open) { run = i; open = 1; }
-        if (!took && open) { atomic_fetch_add(&r->nmp, 1); mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) { atomic_store(&r->span[k], (uint32_t)p + 1); atomic_store(&r->state[k], PG_PROT); } open = 0; }
+// Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file).
+// When span_blk > 0 (e.g. 16 KB / 64 KB for copied pools), consecutive PG_NONE pages AND small already-PROT gaps
+// (up to BRIDGE_MAX_PGS) are coalesced into one mprotect(PROT_READ) syscall (merging fragmented VMAs and cutting TLB shootdowns).
+// Hardened (v1.1.2-hybrid27):
+//   - Checks mp() return value: if mprotect(PROT_READ) ever fails, pages revert to PG_NONE + stamped (never falsely PG_PROT!).
+//   - Bridged already-PROT pages KEEP their original r->span[k] (never shatters packaged texture spans like font atlases!).
+//   - Pages currently PG_BUSY (concurrent fault/prep_write) are waited on after flushing any open run so NO page escapes PROT_READ.
+static void finish_prot_run(range_t *r, uintptr_t run, uintptr_t end, uintptr_t p, uintptr_t blk_pgs, const uint8_t *was_prot) {
+    atomic_fetch_add(&r->nmp, 1);
+    int rc = mp(r->base + (run << g_shift), (end - run) << g_shift, PROT_READ);
+    if (rc) {
+        for (uintptr_t k = run; k < end; k++) {
+            if (was_prot && was_prot[k - run]) {
+                atomic_store(&r->state[k], PG_PROT);
+            } else {
+                stamp_page(r, k);
+                atomic_store(&r->state[k], PG_NONE);
+            }
+        }
+        return;
+    }
+    for (uintptr_t k = run; k < end; k++) {
+        if (!was_prot || !was_prot[k - run] || !blk_pgs) {
+            uint32_t sp = blk_pgs ? (uint32_t)((k / blk_pgs) * blk_pgs + 1) : ((uint32_t)p + 1);
+            atomic_store(&r->span[k], sp);
+        }
+        atomic_store(&r->state[k], PG_PROT);
     }
 }
+void nvn_dirty_protect_span_blk(const void *span, const void *addr, size_t len, size_t span_blk) {
+    if (!len) return;
+    uintptr_t a = (uintptr_t)addr;
+    range_t *r = (range_t *)span;
+    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a + len > r->end) r = find_span(a, len);
+    if (!r) return;
+    uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    uintptr_t blk_pgs = (span_blk >= g_pg) ? (span_blk >> g_shift) : 0;
+    enum { BRIDGE_MAX_PGS = 16, RUN_MAX_PGS = 4096 };
+    uint8_t was_prot[RUN_MAX_PGS];
+    uintptr_t run = 0; int open = 0;
+    for (uintptr_t i = p; i <= q; ) {
+        if (open && (i - run) >= RUN_MAX_PGS) {
+            finish_prot_run(r, run, i, p, blk_pgs, was_prot);
+            open = 0;
+        }
+        uint8_t st = atomic_load_explicit(&r->state[i], memory_order_acquire);
+        if (st == PG_NONE) {
+            if (atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY)) {
+                if (!open) { run = i; open = 1; }
+                was_prot[i - run] = 0;
+                i++;
+                continue;
+            }
+            // CAS failed: re-examine page i with updated st below
+        }
+        if (st == PG_BUSY) {
+            // Flush open run FIRST (so we hold 0 PG_BUSY pages while waiting -> deadlock-free), then wait & retry page i.
+            if (open) {
+                finish_prot_run(r, run, i, p, blk_pgs, was_prot);
+                open = 0;
+            }
+            if (!busy_wait(r, i)) i++;
+            continue;
+        }
+        // st == PG_PROT: if we have an open run and another PG_NONE page lies within BRIDGE_MAX_PGS,
+        // CAS-lock this PG_PROT page to PG_BUSY to bridge into a single coalesced mprotect() syscall,
+        // preserving its original r->span[] via was_prot[].
+        if (open && blk_pgs && (i - run) < RUN_MAX_PGS) {
+            int has_more_none = 0;
+            uintptr_t lim = i + BRIDGE_MAX_PGS <= q ? i + BRIDGE_MAX_PGS : q;
+            for (uintptr_t j = i + 1; j <= lim; j++) {
+                uint8_t jst = atomic_load_explicit(&r->state[j], memory_order_relaxed);
+                if (jst == PG_NONE) { has_more_none = 1; break; }
+                if (jst == PG_BUSY) break;
+            }
+            if (has_more_none) {
+                uint8_t exp = PG_PROT;
+                if (atomic_compare_exchange_strong(&r->state[i], &exp, PG_BUSY)) {
+                    was_prot[i - run] = 1;
+                    i++;
+                    continue;
+                }
+                // Another thread faulted on page i -> close run below and re-handle page i on next iteration!
+                finish_prot_run(r, run, i, p, blk_pgs, was_prot);
+                open = 0;
+                continue;
+            }
+        }
+        if (open) {
+            finish_prot_run(r, run, i, p, blk_pgs, was_prot);
+            open = 0;
+        }
+        i++;
+    }
+    if (open) {
+        finish_prot_run(r, run, q + 1, p, blk_pgs, was_prot);
+    }
+}
+void nvn_dirty_protect_blk(const void *addr, size_t len, size_t span_blk) { nvn_dirty_protect_span_blk(NULL, addr, len, span_blk); }
+void nvn_dirty_protect(const void *addr, size_t len) { nvn_dirty_protect_blk(addr, len, 0); }
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;

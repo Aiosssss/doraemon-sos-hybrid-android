@@ -35,7 +35,7 @@ typedef struct {
     uint32_t dt, dw, df, st, sf[2], sfail[2], szfail[2], szpass[2];
     uint32_t nattr; struct { uint32_t loc, binding, fmt, off; } attr[16];
     uint32_t nbind; struct { uint32_t binding, stride, rate, divisor; } bind[17];
-    uint32_t ncol, cfmt[8], dfmt, samples, a2c, blend_en, logic_en, logic_op, wmask[8];
+    uint32_t ncol, cfmt[8], dfmt, samples, res_mask, a2c, blend_en, logic_en, logic_op, wmask[8];
     struct { uint32_t src, dst, srca, dsta, eq, eqa; } bl[8];
     uint32_t clip_neg1, alt, fdz, dual, gs_split;   // fdz: fragment depth; dual: dual-source blending; gs_split: separated geometry effects/rasterization
     uint64_t um[3], im[3];   // each stage's sampled bindings given integer views (vk_shader_module)
@@ -43,8 +43,14 @@ typedef struct {
 static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and the prewarm threads
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]);
 static void pipe_record(const pkey *k);
-// The last key and its pipeline (the replay thread's only; pipelines are never dropped): runs of draws with one pipeline skip the 992-byte hash and the lock
-static pkey g_last_k; static VkPipeline g_last_p;
+// 16-entry lock-free replay-thread pipeline hot-cache (pipelines are never destroyed):
+// skips g_pipe_mu lock and 992-byte hash when alternating between materials/UI shaders within a pass.
+enum { PIPE_HOT = 16 };
+static struct { pkey k; VkPipeline p; } g_pipe_hot[PIPE_HOT];
+static inline unsigned pipe_hot_slot(const pkey *k) {
+    uint64_t h = k->key[0] ^ (k->key[1] * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)k->blend_en << 17) ^ ((uint64_t)k->dfmt << 5) ^ k->cfmt[0];
+    return (unsigned)((h ^ (h >> 32)) & (PIPE_HOT - 1u));
+}
 // Pipelines built in the background. A pipeline met for the first time costs the driver's compile on the replay thread, 20-35 ms each on Adreno 830 (no pipeline
 // libraries there): in Super Mario Odyssey the first cap throw at a breakable object, the first swim, made 2-7 new pipelines a frame (175 ms frames, seen as 40, 30
 // fps or lower for a moment), then never again in that run; the prewarm (below) covers what an earlier run met. A draw whose pipeline does not exist yet is queued for
@@ -94,10 +100,14 @@ static int async_pipe(const pkey *k) {   // 1: queued (the draw is left out); un
 }
 static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     g_last_pipe_skip = 0;
-    if (g_last_p && !memcmp(k, &g_last_k, sizeof *k)) { if (g_last_p == (void *)1) { g_last_pipe_skip = 2; return VK_NULL_HANDLE; } return g_last_p; }
+    unsigned hs = pipe_hot_slot(k);
+    if (g_pipe_hot[hs].p && !memcmp(k, &g_pipe_hot[hs].k, sizeof *k)) {
+        if (g_pipe_hot[hs].p == (void *)1) { g_last_pipe_skip = 2; return VK_NULL_HANDLE; }
+        return g_pipe_hot[hs].p;
+    }
     pthread_mutex_lock(&g_pipe_mu); VkPipeline p = nvn_hm_get(&g_pipes, k); pthread_mutex_unlock(&g_pipe_mu);
     if (p == PIPE_PENDING) { g_last_pipe_skip = 1; return VK_NULL_HANDLE; }
-    if (p) { g_last_k = *k; g_last_p = p; if (p == (void *)1) { g_last_pipe_skip = 2; return VK_NULL_HANDLE; } return p; }
+    if (p) { g_pipe_hot[hs].k = *k; g_pipe_hot[hs].p = p; if (p == (void *)1) { g_last_pipe_skip = 2; return VK_NULL_HANDLE; } return p; }
     if (async_pipe(k)) { g_last_pipe_skip = 1; return VK_NULL_HANDLE; }
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
     uint64_t tb = g_prof_on ? tick() : 0; p = build_pipeline(k, layout, stg); if (g_prof_on) g_prof_ns[0] += tick() - tb; g_vkst.pipes_built++;
@@ -106,13 +116,14 @@ static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
     else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1) pipe_record(k); }
     pthread_mutex_unlock(&g_pipe_mu);
+    g_pipe_hot[hs].k = *k; g_pipe_hot[hs].p = p;
     if (p == (void *)1) { g_last_pipe_skip = 2; return VK_NULL_HANDLE; }
     return p;
 }
 // ---- pipeline prewarm: every pipeline the game needed is recorded (DM_ROOT/vk_pipelines.bin) and made again at the next boot on background
 // threads, before the game reaches it, so a scene seen once never stalls a frame on a pipeline compile again (the driver's compile, not the
 // pipeline cache's lookup, is the cost: tens of milliseconds per pipeline on Adreno). DM_VK_NOPREWARM=1 turns it off.
-#define PIPE_MAGIC_BASE 0x38455050u   // "PPE8" (hybrid7: bit0=disable_msaa, bit1=no_a2c; invalidates older PPE7/hybrid6 caches)
+#define PIPE_MAGIC_BASE 0x39455050u   // "PPE9" (hybrid24: includes res_mask for inline TBDR MSAA resolve + robustBufferAccess)
 // debug_mode shifted the key's fields without changing its padded size; PPE1 prewarm records otherwise decoded as 76 colour targets and crashed Adreno at startup.
 static FILE *g_prec;
 // The records are written by a thread of their own: a flush to the app's files folder (FUSE) took tens of milliseconds, and made under g_pipe_mu it held up the replay's
@@ -137,7 +148,8 @@ static void pipe_record(const pkey *k) {   // (under g_pipe_mu: only queued here
 }
 static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done;
 static void *prewarm_thread(void *arg) {
-    (void)arg; pthread_setname_np(pthread_self(), "vk prewarm");
+    int paced = (int)(intptr_t)arg;
+    pthread_setname_np(pthread_self(), "vk prewarm");
     setpriority(PRIO_PROCESS, 0, 10);   // below the game's threads: prewarm uses idle cores
     for (;;) {
         size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_n) break;
@@ -154,26 +166,41 @@ static void *prewarm_thread(void *arg) {
         if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, p); else if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL);
         pthread_mutex_unlock(&g_pipe_mu);
         size_t d = __atomic_add_fetch(&g_pw_done, 1, __ATOMIC_RELAXED);
-        if (d == g_pw_n || d % 500 == 0) VKLOG("prewarm: %zu of %zu pipelines", d, g_pw_n);
+        if (d == g_pw_n || d % 250 == 0) VKLOG("prewarm: %zu of %zu pipelines%s", d, g_pw_n, paced ? " (single-thread paced)" : "");
+        if (d == g_pw_n) { void vk_pipeline_cache_save(void); vk_pipeline_cache_save(); }
+        if (paced) usleep(1500);
     }
     return NULL;
 }
 static void prewarm_start(void) {
     const char *root = getenv("DM_ROOT"); if (!root) return;
-    char path[1024]; snprintf(path, sizeof path, "%s/vk_pipelines.bin", root);
+    // Separate recorded pipeline files per MSAA mode (vk_pipes_msaa1.bin vs vk_pipes_msaa2.bin) so toggling
+    // MSAA ON/OFF NEVER wipes the other mode's prewarm list or triggers 640 ms pipeline compile freezes!
+    int msaa_tag = vk_disable_msaa() ? 1 : 2;
+    char path[1024]; snprintf(path, sizeof path, "%s/vk_pipes_msaa%d.bin", root, msaa_tag);
     uint32_t hdr[2] = {PIPE_MAGIC_BASE + (uint32_t)((vk_disable_msaa() ? 1u : 0u) | (vk_no_a2c() ? 2u : 0u)), (uint32_t)sizeof(pkey)}, fh[2] = {0};
     FILE *f = fopen(path, "rb");
+    if (!f) {
+        // Seamless one-time migration from legacy single vk_pipelines.bin if header matches active MSAA mode.
+        char legacy_path[1024]; snprintf(legacy_path, sizeof legacy_path, "%s/vk_pipelines.bin", root);
+        f = fopen(legacy_path, "rb");
+    }
     if (f && fread(fh, sizeof fh, 1, f) == 1 && fh[0] == hdr[0] && fh[1] == hdr[1]) {
         fseek(f, 0, SEEK_END); long n = (ftell(f) - (long)sizeof fh) / (long)sizeof(pkey); fseek(f, sizeof fh, SEEK_SET);
         if (n > 0) { g_pw = malloc((size_t)n * sizeof(pkey)); g_pw_n = fread(g_pw, sizeof(pkey), (size_t)n, f); }
     }
     if (f) fclose(f);
-    // rewrite the file with the records read (dropping a torn last record), then append to it
+    // rewrite the per-MSAA file with the records read (dropping a torn last record), then append to it
     g_prec = fopen(path, "wb"); if (g_prec) { fwrite(hdr, sizeof hdr, 1, g_prec); if (g_pw_n) fwrite(g_pw, sizeof(pkey), g_pw_n, g_prec); fflush(g_prec); }
-    if (!g_pw_n || getenv("DM_VK_NOPREWARM")) { VKLOG("prewarm: %zu pipelines recorded%s", g_pw_n, g_pw_n ? ", off (DM_VK_NOPREWARM)" : ""); return; }
-    long nc = sysconf(_SC_NPROCESSORS_ONLN); int nt = nc >= 8 ? 3 : nc >= 4 ? 2 : 1;
-    VKLOG("prewarm: %zu recorded pipelines on %d threads", g_pw_n, nt);
-    for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, NULL); pthread_attr_destroy(&a); }
+    if (!g_pw_n || getenv("DM_VK_NOPREWARM") || vk_low_ram_tier() >= 2) {
+        VKLOG("prewarm: %zu pipelines recorded (msaa%d), off (%s)", g_pw_n, msaa_tag,
+              !g_pw_n ? "none" : getenv("DM_VK_NOPREWARM") ? "DM_VK_NOPREWARM" : "ultra low-RAM tier");
+        return;
+    }
+    int paced = vk_mali_legacy_compiler();
+    long nc = sysconf(_SC_NPROCESSORS_ONLN); int nt = paced ? 1 : (nc >= 8 ? 3 : nc >= 4 ? 2 : 1);
+    VKLOG("prewarm: %zu recorded pipelines (msaa%d) on %d thread%s%s", g_pw_n, msaa_tag, nt, nt == 1 ? "" : "s", paced ? " (legacy Mali single-thread paced, serialized via compile lock)" : "");
+    for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, (void *)(intptr_t)paced); pthread_attr_destroy(&a); }
 }
 // ---- what each thread is building, for the crash dump. Issue #64: Super Mario Bros. Wonder crashed in the Adreno 750's shader compiler (libllvm-qgl.so, driver 512.762)
 // at its title scene, with no log line to say which pipeline or which thread; and a pipeline that crashes is never recorded for the prewarm, so every run met it again.
@@ -272,7 +299,7 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     VkFormat df = (VkFormat)k->dfmt;
     int has_stencil = df == VK_FORMAT_D24_UNORM_S8_UINT || df == VK_FORMAT_D32_SFLOAT_S8_UINT || df == VK_FORMAT_S8_UINT;
     VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k->ncol, cf, df == VK_FORMAT_S8_UINT ? VK_FORMAT_UNDEFINED : df, has_stencil ? df : VK_FORMAT_UNDEFINED};
-    VkRenderPass prp = rp_on() ? rp_compat(k->ncol, k->cfmt, k->dfmt, k->samples) : VK_NULL_HANDLE;   // with render passes, pipelines are made against a compatible one
+    VkRenderPass prp = rp_on() ? rp_compat(k->ncol, k->cfmt, k->dfmt, k->samples, k->res_mask) : VK_NULL_HANDLE;   // with render passes, pipelines are made against a compatible one
     if (!prp && !V.has_dynrender) {
         build_end(bs);
         LOG("[RED] [vk] graphics pipeline failed (no compatible render pass and no dynamic rendering): shaders %016llx %016llx %016llx samples %u ncol %u cfmt0 %u dfmt %u",
@@ -281,7 +308,9 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     }
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, prp ? NULL : &rci, 0, ns, ss, &vi, &ia, NULL, &vs, &rs, &ms, &ds, &cb, &dy, layout, prp, 0, VK_NULL_HANDLE, -1};
     if (bs >= 0) g_build[bs].phase = 2;
+    vk_pipe_compile_lock();
     VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p);
+    vk_pipe_compile_unlock();
     vk_pipeline_cache_changed();
     build_end(bs);
     static uint64_t n; uint64_t c = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);

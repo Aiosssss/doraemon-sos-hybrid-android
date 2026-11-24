@@ -1,4 +1,5 @@
 // ---------------- copies and clears ----------------
+static VkImage transfer_image(VkCommandBuffer cb, VkFormat fmt, uint32_t w, uint32_t h);
 static VkImageSubresourceLayers sub_of(vkimg_t *im, const view_t *v, int has_v, int z) {
     uint32_t lv = has_v && v->set_levels ? v->base_level : 0, ly = has_v && v->set_layers ? v->min_layer : 0;
     int layered = im->layers > 1;
@@ -8,9 +9,10 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
     vk_end_pass_land();
     vkimg_t *im = vk_tex(c->tex); const vkfmt_t *f = vk_fmt(c->tex->d.format);
     if (!im || !f) return;
+    if (!to_texture) im->ever_sampled = 1;
     VkBuffer b; VkDeviceSize o;
     if (!vk_buf_at(c->src, 1, &b, &o)) { VKRED_ONCE(70, "buffer of a buffer ↔ texture copy outside the memory pools"); return; }
-    VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb);
+    VkCommandBuffer cb = vk_cmd();
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1;
     uint32_t rowlen = S.row_stride > 0 && f->bpb ? (uint32_t)(S.row_stride / f->bpb) * bw : 0;
     uint32_t imgh = S.image_stride > 0 && S.row_stride > 0 ? (uint32_t)(S.image_stride / S.row_stride) * bh : 0;
@@ -18,6 +20,88 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
     VkBufferImageCopy r = {o, rowlen, imgh, sub_of(im, &c->view, c->has_view, c->r.zoffset), {c->r.xoffset, c->r.yoffset, layered ? 0 : c->r.zoffset},
                            {(uint32_t)c->r.width, (uint32_t)(c->r.height ? c->r.height : 1), layered ? 1 : (uint32_t)depth}};
     if (layered) r.imageSubresource.layerCount = (uint32_t)depth;
+    // Preserve render-scaled 3D targets (e.g. 858x482 / 640x360) across CopyBufferToTexture / CopyTextureToBuffer
+    // by routing 1:1 buffer transfers through a temporary 1:1 VkImage + vkCmdBlitImage instead of permanently
+    // unscaling im back to 1280x720! (Never-GPU-written >=1024x1024 square uploads still unscale 1:1 to protect font atlases.)
+    if (!im->ds_shift && im->orig_w && im->orig_h && (im->orig_w != im->w || im->orig_h != im->h)) {
+        int maybe_font_atlas = to_texture && !im->gpu_w && im->orig_w == im->orig_h && im->orig_w >= 1024u;
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(V.pd, im->fmt, &fp);
+        int can_blit = !maybe_font_atlas && (im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && !f->compressed && !f->dec &&
+                       im->samples == 1 && im->d <= 1 && r.imageSubresource.mipLevel == 0 &&
+                       r.imageSubresource.layerCount == 1 && r.imageExtent.depth == 1 &&
+                       r.imageExtent.width > 0 && r.imageExtent.height > 0 &&
+                       r.imageOffset.x >= 0 && r.imageOffset.y >= 0 &&
+                       (uint32_t)r.imageOffset.x + r.imageExtent.width <= im->orig_w &&
+                       (uint32_t)r.imageOffset.y + r.imageExtent.height <= im->orig_h &&
+                       (fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) ==
+                           (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT);
+        if (can_blit) {
+            uint64_t need = 0; int bad_buf = 0;
+            if (f->bpb) {
+                uint64_t bx = (r.imageExtent.width + bw - 1) / bw, by = (r.imageExtent.height + bh - 1) / bh;
+                uint64_t row = (uint64_t)((rowlen ? rowlen : r.imageExtent.width) + bw - 1) / bw * f->bpb;
+                need = (by ? by - 1 : 0) * row + bx * f->bpb;
+                VkBuffer b2; VkDeviceSize o2; bad_buf = need && !vk_buf_at(c->src, need, &b2, &o2);
+            }
+            if (!bad_buf) {
+                vk_tex_prepare(cb, im); vk_img_barrier_all(cb);
+                VkImage tmp = transfer_image(cb, im->fmt, r.imageExtent.width, r.imageExtent.height);
+                if (tmp) {
+                    int32_t sx0 = (int32_t)(((int64_t)r.imageOffset.x * im->w) / im->orig_w);
+                    int32_t sy0 = (int32_t)(((int64_t)r.imageOffset.y * im->h) / im->orig_h);
+                    int32_t sx1 = (int32_t)(((int64_t)(r.imageOffset.x + (int32_t)r.imageExtent.width) * im->w + (int64_t)im->orig_w / 2) / im->orig_w);
+                    int32_t sy1 = (int32_t)(((int64_t)(r.imageOffset.y + (int32_t)r.imageExtent.height) * im->h + (int64_t)im->orig_h / 2) / im->orig_h);
+                    if (sx0 < 0) sx0 = 0; if (sy0 < 0) sy0 = 0;
+                    if (sx1 <= sx0) sx1 = sx0 + 1; if (sy1 <= sy0) sy1 = sy0 + 1;
+                    if (sx1 > (int32_t)im->w) { sx1 = (int32_t)im->w; if (sx0 >= sx1) sx0 = sx1 - 1; }
+                    if (sy1 > (int32_t)im->h) { sy1 = (int32_t)im->h; if (sy0 >= sy1) sy0 = sy1 - 1; }
+                    VkFilter flt = (!f->is_int && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+                                   ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+                    VkBufferImageCopy tr = r;
+                    tr.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    tr.imageOffset = (VkOffset3D){0, 0, 0};
+                    tr.imageExtent.depth = 1;
+                    VkImageMemoryBarrier tb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                        tmp, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                    if (to_texture) {
+                        vkCmdCopyBufferToImage(cb, b, tmp, VK_IMAGE_LAYOUT_GENERAL, 1, &tr);
+                        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &tb);
+                        VkImageBlit bl = {
+                            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)r.imageExtent.width, (int32_t)r.imageExtent.height, 1}},
+                            r.imageSubresource, {{sx0, sy0, 0}, {sx1, sy1, 1}}
+                        };
+                        vkCmdBlitImage(cb, tmp, VK_IMAGE_LAYOUT_GENERAL, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, flt);
+                        vk_tex_mark_written(im);
+                    } else {
+                        VkImageBlit bl = {
+                            r.imageSubresource, {{sx0, sy0, 0}, {sx1, sy1, 1}},
+                            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)r.imageExtent.width, (int32_t)r.imageExtent.height, 1}}
+                        };
+                        vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, tmp, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, flt);
+                        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &tb);
+                        vkCmdCopyImageToBuffer(cb, tmp, VK_IMAGE_LAYOUT_GENERAL, b, 1, &tr);
+                        void vk_gpu_wrote(uint64_t a, uint64_t n); vkpool_t *p = vk_pool_of(c->src, 1);
+                        if (need && p && c->src + need <= p->hi) vk_gpu_wrote(c->src, need);
+                        else { vk_gpu_wrote(c->src, p ? p->hi - c->src : 1); vk_readback_unknown(); }
+                    }
+                    static uint64_t sb2t_cnt;
+                    if (++sb2t_cnt <= 8) VKLOG("[low-end] scaled Copy%s preserved %ux%u via 1:1 temp blit (%ux%u fmt %#x)",
+                                               to_texture ? "B2T" : "T2B", im->w, im->h, r.imageExtent.width, r.imageExtent.height, im->nvn_format);
+                    vk_img_barrier_all(cb);
+                    return;
+                }
+            }
+        }
+        vk_tex_unscale_cb(cb, im, c->tex);
+    }
+    vk_tex_prepare(cb, im); vk_img_barrier_all(cb);
+    if (im->ds_shift) {
+        if (r.imageSubresource.mipLevel < im->ds_shift) { vk_img_barrier_all(cb); return; }
+        r.imageSubresource.mipLevel -= im->ds_shift;
+    }
     if (f->dec) {   // a BC format the device lacks (gfx_vk_tex.c bc_decode): the blocks decoded on the CPU from the buffer's memory as the replay reaches the copy
         if (!to_texture) { VKRED_ONCE(71, "copy of a BC texture decoded on the CPU into a buffer: skipped"); return; }
         uint32_t w = (uint32_t)c->r.width, h = (uint32_t)(c->r.height ? c->r.height : 1), nz = (uint32_t)depth;
@@ -40,13 +124,31 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
             VkBuffer b2; VkDeviceSize o2; bad_buf = need && !vk_buf_at(c->src, need, &b2, &o2);
         }
         if (bad_img || bad_buf) {
-            static unsigned nbad; if (nbad++ < 16) VKLOG("[RED] buffer %s texture copy runs %s (logged, still made: no game seen doing it yet); region %d,%d,%d %ux%ux%u level %u layers %u+%u, image %ux%ux%u layers %u levels %u (nvn format %#x), buffer %#llx +%llu bytes",
+            static unsigned nbad; if (nbad++ < 16) VKLOG("[RED] buffer %s texture copy runs %s (SKIPPED to prevent GPU VRAM OOB / green screen); region %d,%d,%d %ux%ux%u level %u layers %u+%u, image %ux%ux%u layers %u levels %u (nvn format %#x), buffer %#llx +%llu bytes",
                 to_texture ? "→" : "←", bad_img ? "past the image" : "past the memory pool", r.imageOffset.x, r.imageOffset.y, r.imageOffset.z, r.imageExtent.width, r.imageExtent.height, r.imageExtent.depth, lv,
                 r.imageSubresource.baseArrayLayer, r.imageSubresource.layerCount, im->w, im->h, im->d, im->layers, im->levels, (unsigned)c->tex->d.format, (unsigned long long)c->src, (unsigned long long)need);
+            vk_img_barrier_all(cb);
+            return;
         }
     }
     if (g_watch_off >= 0) { char w[96]; snprintf(w, sizeof w, "buffer copy %s (buffer %#llx, %dx%d)", to_texture ? "destination" : "source", (unsigned long long)c->src, c->r.width, c->r.height); vk_watch(im, w); }
-    if (to_texture) { vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r); im->gpu_w = 1; }
+    if (to_texture) {
+        vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        vk_tex_mark_written(im);
+        VkImageMemoryBarrier pb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+            ((im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                                                      : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)),
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            im->img, {im->aspect, 0, im->levels, 0, im->layers}};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             ((im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                                                       : (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)),
+                             0, 0, NULL, 0, NULL, 1, &pb);
+    }
     else { vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
         void vk_gpu_wrote(uint64_t a, uint64_t n); vkpool_t *p = vk_pool_of(c->src, 1);
         uint64_t copy_bytes = 0;
@@ -76,7 +178,10 @@ static int dsc_init(void) {
     if (vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_dsc.dl) || vkCreateDescriptorPool(V.dev, &pi, NULL, &g_dsc.dp) || vkCreateShaderModule(V.dev, &mi, NULL, &sm)) { g_dsc.bad = 1; return 0; }
     VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_dsc.dl, 1, &pr};
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL}};
-    if (vkCreatePipelineLayout(V.dev, &pli, NULL, &g_dsc.pl) || (ci.layout = g_dsc.pl, vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_dsc.p))) g_dsc.bad = 1;
+    vk_pipe_compile_lock();
+    int dsc_err = vkCreatePipelineLayout(V.dev, &pli, NULL, &g_dsc.pl) || (ci.layout = g_dsc.pl, vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_dsc.p));
+    vk_pipe_compile_unlock();
+    if (dsc_err) g_dsc.bad = 1;
     vkDestroyShaderModule(V.dev, sm, NULL);
     if (g_dsc.bad) VKLOG("[RED] the scaled depth copy's compute pipeline could not be made");
     return !g_dsc.bad;
@@ -147,18 +252,53 @@ static VkImage transfer_image(VkCommandBuffer cb, VkFormat fmt, uint32_t w, uint
 }
 static void copy_t2t(const p_copy_t2t *c) {
     vk_end_pass();
+    if (g_inline_resolved_op && g_inline_resolved_op == g_cur_op_p) {
+        g_inline_resolved_op = NULL;
+        return;
+    }
     vkimg_t *s = vk_tex(c->src), *d = vk_tex(c->dst);
     if (!s || !d) return;
+    s->ever_sampled = 1;
     const vkfmt_t *sf = vk_fmt(c->src->d.format), *df = vk_fmt(c->dst->d.format);
     if (!sf || !df) return;
     vk_watch(s, "copy source"); vk_watch(d, "copy destination");
-    VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, s); vk_tex_prepare(cb, d); vk_img_barrier_all(cb);
+    VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, s); vk_tex_prepare(cb, d);
+    int fast_1x_copy = !g_strict_barriers && !((c->flags & DM_COPY_RESOLVE) && s->samples > 1) &&
+                       s->samples == 1 && d->samples == 1 && !(c->flags & (CF_MIRROR_X | CF_MIRROR_Y)) &&
+                       sf->vk == df->vk && s->orig_w == s->w && s->orig_h == s->h && d->orig_w == d->w && d->orig_h == d->h &&
+                       c->sr.width == c->dr.width && c->sr.height == c->dr.height;
+    if (!fast_1x_copy) vk_img_barrier_all(cb);
     VkImageSubresourceLayers ss = sub_of(s, &c->sv, c->has_sv, c->sr.zoffset), ds = sub_of(d, &c->dv, c->has_dv, c->dr.zoffset);
     // Vulkan refuses (vkEndCommandBuffer fails for the whole submission) a region outside either image or a blit the format cannot do: regions are clipped
     // to both images' levels, a copy with nothing left is skipped
     int32_t sw = (int32_t)(s->w >> ss.mipLevel ? s->w >> ss.mipLevel : 1), sh = (int32_t)(s->h >> ss.mipLevel ? s->h >> ss.mipLevel : 1);
     int32_t dw = (int32_t)(d->w >> ds.mipLevel ? d->w >> ds.mipLevel : 1), dh = (int32_t)(d->h >> ds.mipLevel ? d->h >> ds.mipLevel : 1);
-    p_copy_t2t k = *c; c = &k; d->gpu_w = 1;
+    p_copy_t2t k = *c; c = &k; vk_tex_mark_written(d);
+    // Scale guest pixel copy rects proportionally when DM_VK_RENDER_SCALE < 1.0 scaled s or d.
+    if (s->orig_w && s->orig_w != s->w) {
+        uint32_t sow = s->orig_w >> ss.mipLevel ? s->orig_w >> ss.mipLevel : 1u;
+        k.sr.xoffset = (int32_t)(((int64_t)k.sr.xoffset * sw) / sow);
+        k.sr.width = (int32_t)(((int64_t)k.sr.width * sw + sow / 2) / sow);
+        if (k.sr.width < 1) k.sr.width = 1;
+    }
+    if (s->orig_h && s->orig_h != s->h) {
+        uint32_t soh = s->orig_h >> ss.mipLevel ? s->orig_h >> ss.mipLevel : 1u;
+        k.sr.yoffset = (int32_t)(((int64_t)k.sr.yoffset * sh) / soh);
+        k.sr.height = (int32_t)(((int64_t)k.sr.height * sh + soh / 2) / soh);
+        if (k.sr.height < 1) k.sr.height = 1;
+    }
+    if (d->orig_w && d->orig_w != d->w) {
+        uint32_t dow = d->orig_w >> ds.mipLevel ? d->orig_w >> ds.mipLevel : 1u;
+        k.dr.xoffset = (int32_t)(((int64_t)k.dr.xoffset * dw) / dow);
+        k.dr.width = (int32_t)(((int64_t)k.dr.width * dw + dow / 2) / dow);
+        if (k.dr.width < 1) k.dr.width = 1;
+    }
+    if (d->orig_h && d->orig_h != d->h) {
+        uint32_t doh = d->orig_h >> ds.mipLevel ? d->orig_h >> ds.mipLevel : 1u;
+        k.dr.yoffset = (int32_t)(((int64_t)k.dr.yoffset * dh) / doh);
+        k.dr.height = (int32_t)(((int64_t)k.dr.height * dh + doh / 2) / doh);
+        if (k.dr.height < 1) k.dr.height = 1;
+    }
     // NVNcopyFlags: LINEAR_FILTER 1, ENGINE_2D 2 (nothing to do here), MIRROR_X 4, MIRROR_Y 8, MIRROR_Z 0x10: a mirrored copy is a blit with the destination's offsets
     // swapped. Pokémon Sword 1.3.2 captures its picture for a door's fade with MIRROR_Y (its lower-left origin image turned over) and draws it back; copied
     // unmirrored, the fade showed the room upside down for 7 frames (Odin 2, 2026-11-13)
@@ -187,7 +327,37 @@ static void copy_t2t(const p_copy_t2t *c) {
         // Explicit GENERAL <-> TRANSFER_SRC/DST_OPTIMAL layout transitions around 2x MSAA resolve
         // (CommandBufferDownsample) guarantee Mali Valhall TBDR/AFBC tile writeback + hardware resolve flush
         // and prevent cross-MRT channel corruption before post-processing reads RT0/RT1/RT2.
-        VkImageResolve r = {ss, {c->sr.xoffset, c->sr.yoffset, 0}, ds, {c->dr.xoffset, c->dr.yoffset, 0}, {(uint32_t)c->sr.width, (uint32_t)c->sr.height, 1}};
+        // If src and dst have mismatched dimensions (e.g. scaled MSAA source -> 1:1 unscaled target),
+        // resolve into a temporary 1x image matching src extent and blit linearly to dst (0 OOB).
+        if (k.sr.width != k.dr.width || k.sr.height != k.dr.height) {
+            VkImage tmp = transfer_image(cb, s->fmt, (uint32_t)k.sr.width, (uint32_t)k.sr.height);
+            if (tmp) {
+                VkImageResolve r0 = {ss, {k.sr.xoffset, k.sr.yoffset, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {(uint32_t)k.sr.width, (uint32_t)k.sr.height, 1}};
+                VkImageMemoryBarrier pb[2] = {
+                    {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, s->img, {ss.aspectMask, ss.mipLevel, 1, ss.baseArrayLayer, ss.layerCount}},
+                    {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, tmp, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}}
+                };
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pb);
+                vkCmdResolveImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r0);
+                VkImageMemoryBarrier mb[2] = {
+                    {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, s->img, {ss.aspectMask, ss.mipLevel, 1, ss.baseArrayLayer, ss.layerCount}},
+                    {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, tmp, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}}
+                };
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 2, mb);
+                VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {k.sr.width, k.sr.height, 1}},
+                                  ds, {{k.dr.xoffset, k.dr.yoffset, 0}, {k.dr.xoffset + k.dr.width, k.dr.yoffset + k.dr.height, 1}}};
+                vkCmdBlitImage(cb, tmp, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+            }
+            vk_img_barrier_all(cb); return;
+        }
+        uint32_t rw = (uint32_t)k.sr.width, rh = (uint32_t)k.sr.height;
+        if (k.dr.xoffset + (int32_t)rw > dw) rw = (uint32_t)(dw - k.dr.xoffset);
+        if (k.dr.yoffset + (int32_t)rh > dh) rh = (uint32_t)(dh - k.dr.yoffset);
+        VkImageResolve r = {ss, {k.sr.xoffset, k.sr.yoffset, 0}, ds, {k.dr.xoffset, k.dr.yoffset, 0}, {rw, rh, 1}};
         if (s->fmt == d->fmt) {
             VkImageMemoryBarrier pre_b[2] = {
                 {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
@@ -266,8 +436,39 @@ static void copy_t2t(const p_copy_t2t *c) {
     } else if (!mir && c->sr.width == c->dr.width && c->sr.height == c->dr.height && sf->vk == df->vk) {
         VkImageCopy r = {ss, {c->sr.xoffset, c->sr.yoffset, s->layers > 1 ? 0 : c->sr.zoffset}, ds, {c->dr.xoffset, c->dr.yoffset, d->layers > 1 ? 0 : c->dr.zoffset},
                          {(uint32_t)c->sr.width, (uint32_t)(c->sr.height ? c->sr.height : 1), s->layers > 1 ? 1 : (uint32_t)(c->sr.depth ? c->sr.depth : 1)}};
+        if (fast_1x_copy) {
+            // Targeted 2-image TBDR barrier for 1x-to-1x copies (including bypassed MSAA Downsample when disable_msaa=1):
+            // avoids 2x global ALL_COMMANDS GPU pipeline drains while preserving 100% AFBC/L2 coherency!
+            VkImageMemoryBarrier pre[2] = {
+                {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                 VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                 VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                 s->img, {ss.aspectMask, ss.mipLevel, 1, ss.baseArrayLayer, ss.layerCount}},
+                {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                 VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                 VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                 d->img, {ds.aspectMask, ds.mipLevel, 1, ds.baseArrayLayer, ds.layerCount}}
+            };
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
+            vkCmdCopyImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+            VkImageMemoryBarrier post = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                ((d->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                                                         : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)),
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                d->img, {ds.aspectMask, ds.mipLevel, 1, ds.baseArrayLayer, ds.layerCount}};
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                ((d->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                                         : (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)),
+                0, 0, NULL, 0, NULL, 1, &post);
+            return;
+        }
         vkCmdCopyImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     } else {
+        if (fast_1x_copy) vk_img_barrier_all(cb);
         VkImageBlit r = {ss, {{c->sr.xoffset, c->sr.yoffset, 0}, {c->sr.xoffset + c->sr.width, c->sr.yoffset + (c->sr.height ? c->sr.height : 1), 1}},
                          ds, {{c->dr.xoffset, c->dr.yoffset, 0}, {c->dr.xoffset + c->dr.width, c->dr.yoffset + (c->dr.height ? c->dr.height : 1), 1}}};
         VkImage si = s->img, di = d->img;
@@ -292,7 +493,7 @@ static void copy_t2t(const p_copy_t2t *c) {
 static void clear_tex(const p_clear_tex *c) {
     vk_end_pass();
     vkimg_t *im = vk_tex(c->tex); if (!im) return;
-    VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb); im->gpu_w = 1;
+    VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb); vk_tex_mark_written(im);
     VkImageSubresourceLayers l = sub_of(im, &c->view, c->has_view, c->r.zoffset);
     VkImageSubresourceRange rg = {l.aspectMask, l.mipLevel, 1, l.baseArrayLayer, im->layers > 1 ? (uint32_t)(c->r.depth ? c->r.depth : 1) : 1};
     if (c->r.xoffset || c->r.yoffset || (uint32_t)c->r.width < (im->w >> l.mipLevel) || (uint32_t)c->r.height < (im->h >> l.mipLevel)) VKRED_ONCE(71, "partial texture clear: the whole level is cleared");

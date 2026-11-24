@@ -54,13 +54,98 @@ static int mkdir_p(const char *path) {
     return 0;
 }
 
-/* ---------------- NSP (PFS0) ---------------- */
+/* ---------------- NSP (PFS0) & XCI (HEAD -> HFS0/secure) ---------------- */
+static int open_hfs0_at(int fd, uint64_t base_off, nx_nsp *nsp, char *err, size_t errcap) {
+    uint8_t hdr[16];
+    if (pread_all(fd, hdr, 16, base_off) != 0 || memcmp(hdr, "HFS0", 4) != 0) {
+        snprintf(err, errcap, "invalid HFS0 partition header at 0x%llx", (unsigned long long)base_off);
+        return -2;
+    }
+    uint32_t nfiles = rd32(hdr + 4);
+    uint32_t strtab_sz = rd32(hdr + 8);
+    if (nfiles == 0 || nfiles > 4096 || strtab_sz > (4u << 20)) {
+        snprintf(err, errcap, "unreasonable HFS0 table (files=%u, strtab=%u)", nfiles, strtab_sz);
+        return -3;
+    }
+    size_t tab_sz = (size_t)nfiles * 64; /* HFS0 entry size is 0x40 bytes */
+    uint8_t *raw = malloc(tab_sz + strtab_sz);
+    if (!raw) { snprintf(err, errcap, "OOM reading HFS0 table"); return -4; }
+    if (pread_all(fd, raw, tab_sz + strtab_sz, base_off + 16) != 0) {
+        free(raw); snprintf(err, errcap, "truncated HFS0 header table"); return -5;
+    }
+    nx_pfs0_entry *ents = calloc(nfiles, sizeof *ents);
+    if (!ents) { free(raw); snprintf(err, errcap, "OOM HFS0 entries"); return -6; }
+
+    uint64_t data_base = base_off + 16ull + tab_sz + strtab_sz;
+    const char *st = (const char *)(raw + tab_sz);
+    for (uint32_t i = 0; i < nfiles; i++) {
+        const uint8_t *e = raw + i * 64;
+        uint64_t off = rd64(e);
+        uint64_t sz = rd64(e + 8);
+        uint32_t noff = rd32(e + 16);
+        if (noff >= strtab_sz) { free(ents); free(raw); snprintf(err, errcap, "HFS0 strtab OOB"); return -7; }
+        size_t maxn = strtab_sz - noff;
+        size_t nl = strnlen(st + noff, maxn);
+        if (nl >= sizeof(ents[i].name)) nl = sizeof(ents[i].name) - 1;
+        memcpy(ents[i].name, st + noff, nl);
+        ents[i].name[nl] = '\0';
+        ents[i].offset = data_base + off;
+        ents[i].size = sz;
+    }
+    free(raw);
+    nsp->fd = fd;
+    nsp->count = nfiles;
+    nsp->entries = ents;
+    return 0;
+}
+
 int nx_nsp_open(int fd, nx_nsp *nsp, char *err, size_t errcap) {
     memset(nsp, 0, sizeof *nsp);
-    if (fd < 0) { snprintf(err, errcap, "invalid NSP file descriptor"); return -1; }
+    if (fd < 0) { snprintf(err, errcap, "invalid NSP/XCI file descriptor"); return -1; }
     uint8_t hdr[16];
-    if (pread_all(fd, hdr, 16, 0) != 0 || memcmp(hdr, "PFS0", 4) != 0) {
-        snprintf(err, errcap, "invalid NSP/PFS0 header");
+    if (pread_all(fd, hdr, 16, 0) != 0) {
+        snprintf(err, errcap, "cannot read NSP/XCI header");
+        return -2;
+    }
+    /* Check for XCI cartridge image ("HEAD" at +0x100 -> Root HFS0 -> "secure" HFS0) */
+    if (memcmp(hdr, "PFS0", 4) != 0) {
+        uint8_t xci_hdr[0x40];
+        if (pread_all(fd, xci_hdr, sizeof xci_hdr, 0x100) == 0 && memcmp(xci_hdr, "HEAD", 4) == 0) {
+            uint64_t root_hfs_off = rd64(xci_hdr + 0x30);
+            nx_nsp root_hfs;
+            memset(&root_hfs, 0, sizeof root_hfs);
+            if (open_hfs0_at(fd, root_hfs_off, &root_hfs, err, errcap) != 0) return -2;
+            uint64_t secure_off = 0;
+            int found_secure = 0;
+            for (uint32_t i = 0; i < root_hfs.count; i++) {
+                if (strcmp(root_hfs.entries[i].name, "secure") == 0) {
+                    secure_off = root_hfs.entries[i].offset;
+                    found_secure = 1;
+                    break;
+                }
+            }
+            nx_nsp_close(&root_hfs);
+            if (!found_secure) {
+                snprintf(err, errcap, "XCI image missing 'secure' HFS0 partition");
+                return -2;
+            }
+            return open_hfs0_at(fd, secure_off, nsp, err, errcap);
+        }
+        if (memcmp(hdr, "HFS0", 4) == 0) {
+            nx_nsp root_hfs;
+            memset(&root_hfs, 0, sizeof root_hfs);
+            if (open_hfs0_at(fd, 0, &root_hfs, err, errcap) != 0) return -2;
+            for (uint32_t i = 0; i < root_hfs.count; i++) {
+                if (strcmp(root_hfs.entries[i].name, "secure") == 0) {
+                    uint64_t secure_off = root_hfs.entries[i].offset;
+                    nx_nsp_close(&root_hfs);
+                    return open_hfs0_at(fd, secure_off, nsp, err, errcap);
+                }
+            }
+            *nsp = root_hfs;
+            return 0;
+        }
+        snprintf(err, errcap, "invalid NSP/XCI header (expected PFS0 or XCI HEAD)");
         return -2;
     }
     uint32_t nfiles = rd32(hdr + 4);
@@ -294,24 +379,48 @@ int nx_nsp_open_nca_by_type(const nx_nsp *nsp, const nx_keyset *ks, uint8_t cont
     return -1;
 }
 
+static int hex_prefix_eq_ci(const char *name, const char hex32[33]) {
+    for (int i = 0; i < 32; i++) {
+        char a = name[i], b = hex32[i];
+        if (!a || !b) return 0;
+        if (a >= 'A' && a <= 'F') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'F') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+int nx_nsp_open_nca_by_id(const nx_nsp *nsp, const nx_keyset *ks, const char nca_id_hex[33],
+                          nx_nca *nca, char *err, size_t errcap) {
+    if (!nca_id_hex || !nca_id_hex[0]) { snprintf(err, errcap, "empty NCA ID"); return -1; }
+    for (uint32_t i = 0; i < nsp->count; i++) {
+        const char *nm = nsp->entries[i].name;
+        size_t nl = strlen(nm);
+        if (nl < 36 || strcmp(nm + nl - 4, ".nca") != 0) continue;
+        if (hex_prefix_eq_ci(nm, nca_id_hex)) {
+            return nx_nca_open(nsp, &nsp->entries[i], ks, nca, err, errcap);
+        }
+    }
+    snprintf(err, errcap, "NCA %s.nca not found in container", nca_id_hex);
+    return -2;
+}
+
 /* ---------------- CNMT Reader ---------------- */
-int nx_nsp_read_cnmt(const nx_nsp *nsp, const nx_keyset *ks, nx_cnmt_info *info, char *err, size_t errcap) {
+static int parse_cnmt_from_meta_nca(const nx_nca *meta, nx_cnmt_info *info, char *err, size_t errcap) {
     memset(info, 0, sizeof *info);
-    nx_nca meta;
-    if (nx_nsp_open_nca_by_type(nsp, ks, 1 /* Meta */, 0, &meta, err, errcap) != 0) return -1;
-    if (!meta.sec[0].exists || meta.sec[0].fs_type != 1) {
+    if (!meta->sec[0].exists || meta->sec[0].fs_type != 1) {
         snprintf(err, errcap, "Meta NCA missing PFS0 section 0");
         return -2;
     }
-    uint64_t pfs_off = meta.sec[0].data_offset;
-    uint64_t pfs_sz = meta.sec[0].data_size;
+    uint64_t pfs_off = meta->sec[0].data_offset;
+    uint64_t pfs_sz = meta->sec[0].data_size;
     if (pfs_sz < 16 || pfs_sz > (2u << 20)) {
         snprintf(err, errcap, "unexpected Meta PFS0 size %llu", (unsigned long long)pfs_sz);
         return -3;
     }
     uint8_t *buf = malloc((size_t)pfs_sz);
     if (!buf) { snprintf(err, errcap, "OOM Meta PFS0"); return -4; }
-    if (nca_read_section_plain_ctr(&meta, 0, pfs_off, buf, (size_t)pfs_sz) != 0 || memcmp(buf, "PFS0", 4) != 0) {
+    if (nca_read_section_plain_ctr(meta, 0, pfs_off, buf, (size_t)pfs_sz) != 0 || memcmp(buf, "PFS0", 4) != 0) {
         free(buf); snprintf(err, errcap, "failed to decrypt Meta PFS0"); return -5;
     }
     uint32_t nf = rd32(buf + 4), stsz = rd32(buf + 8);
@@ -331,10 +440,29 @@ int nx_nsp_read_cnmt(const nx_nsp *nsp, const nx_keyset *ks, nx_cnmt_info *info,
             info->version = rd32(c + 0x08);
             info->meta_type = c[0x0C];
             uint16_t ext_hdr_sz = rd16(c + 0x0E);
+            uint16_t content_cnt = rd16(c + 0x10);
             info->app_id = info->title_id;
             if ((info->meta_type == 0x81 || info->meta_type == 0x82) && ext_hdr_sz >= 8 && sz >= 0x28) {
                 /* PatchMetaExtendedHeader & AddOnContentMetaExtendedHeader: ApplicationId is at +0x20 */
                 info->app_id = rd64(c + 0x20);
+            }
+            /* Extract primary Program (type 1 for 0x80/0x81) or Data (type 2 for 0x82) NCA ID from content records */
+            uint8_t want_ct = (info->meta_type == 0x82) ? 2 : 1;
+            size_t rec_base = 0x20u + (size_t)ext_hdr_sz;
+            static const char H[] = "0123456789abcdef";
+            for (uint16_t r = 0; r < content_cnt; r++) {
+                size_t roff = rec_base + (size_t)r * 0x38u;
+                if (roff + 0x38u > sz) break;
+                uint8_t ct = c[roff + 0x36];
+                if (ct == want_ct) {
+                    for (int k = 0; k < 16; k++) {
+                        uint8_t b = c[roff + 0x20 + k];
+                        info->content_nca_id[k * 2]     = H[b >> 4];
+                        info->content_nca_id[k * 2 + 1] = H[b & 0xF];
+                    }
+                    info->content_nca_id[32] = '\0';
+                    break;
+                }
             }
             found = 1;
             break;
@@ -343,6 +471,41 @@ int nx_nsp_read_cnmt(const nx_nsp *nsp, const nx_keyset *ks, nx_cnmt_info *info,
     free(buf);
     if (!found) { snprintf(err, errcap, "no .cnmt file found in Meta NCA"); return -6; }
     return 0;
+}
+
+int nx_nsp_read_cnmt(const nx_nsp *nsp, const nx_keyset *ks, nx_cnmt_info *info, char *err, size_t errcap) {
+    memset(info, 0, sizeof *info);
+    nx_nca meta;
+    if (nx_nsp_open_nca_by_type(nsp, ks, 1 /* Meta */, 0, &meta, err, errcap) != 0) return -1;
+    return parse_cnmt_from_meta_nca(&meta, info, err, errcap);
+}
+
+int nx_nsp_scan_cnmts(const nx_nsp *nsp, const nx_keyset *ks, nx_cnmt_info *out, int max_out, char *err, size_t errcap) {
+    int count = 0;
+    char last_err[256] = "no Meta NCA (.cnmt.nca) found in container";
+    for (uint32_t i = 0; i < nsp->count && count < max_out; i++) {
+        const char *nm = nsp->entries[i].name;
+        size_t nl = strlen(nm);
+        if (nl < 4 || strcmp(nm + nl - 4, ".nca") != 0) continue;
+        nx_nca tmp;
+        char e[256] = "";
+        if (nx_nca_open(nsp, &nsp->entries[i], ks, &tmp, e, sizeof e) != 0) {
+            snprintf(last_err, sizeof last_err, "%s", e);
+            continue;
+        }
+        if (tmp.content_type != 1 /* Meta */) continue;
+        nx_cnmt_info info;
+        if (parse_cnmt_from_meta_nca(&tmp, &info, e, sizeof e) == 0) {
+            out[count++] = info;
+        } else {
+            snprintf(last_err, sizeof last_err, "%s", e);
+        }
+    }
+    if (count == 0) {
+        snprintf(err, errcap, "%s", last_err);
+        return -1;
+    }
+    return count;
 }
 
 /* ---------------- PFS0 Section Extraction (ExeFS) ---------------- */

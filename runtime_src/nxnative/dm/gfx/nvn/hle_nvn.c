@@ -1293,7 +1293,26 @@ static nvn_job *g_jobs; static int g_njob, g_capjob;
 static uint64_t g_replaying;   // the job being replayed (nvn_replaying_job)
 static uint64_t g_job_enq, g_job_done, g_job_fence[JOB_RING];   // jobs queued and replayed so far; the commit fence each left (by job number)
 static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_job_cv = PTHREAD_COND_INITIALIZER, g_jobdone_cv = PTHREAD_COND_INITIALIZER;
-static int nvn_async(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_ASYNC"); on = e && atoi(e); } return on; }
+static int nvn_async(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DM_NVN_ASYNC");
+        int want = e && atoi(e);
+        // Disable asynchronous replay whenever copied-pool safe_sync is active (default DM_VK_POOL_SAFE_SYNC=2)
+        // unless DM_NVN_ASYNC=2 explicitly forces it: under copied pools, letting QueueSubmitCommands return
+        // early allows the guest render thread to overwrite p->lo for frame N+1 while the replay thread is
+        // still waiting on frame N-1's fence before copying p->lo -> p->shadow, causing low-end flicker.
+        const char *ss = getenv("DM_VK_POOL_SAFE_SYNC");
+        int safe_sync = (ss && *ss) ? atoi(ss) : 2;
+        if (want == 1 && safe_sync >= 1) {
+            LOG("[nvn] asynchronous replay disabled (DM_VK_POOL_SAFE_SYNC=%d copied-pool safety; set DM_NVN_ASYNC=2 to force)", safe_sync);
+            on = 0;
+        } else {
+            on = want != 0;
+        }
+    }
+    return on;
+}
 static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h);
 static void *replay_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "nvn replay"); dm_perf_replay_thread();
@@ -2647,9 +2666,9 @@ NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) { (void)c; 
 NVN(nvnCommandBufferSetConservativeRasterEnable, void, NVNcommandBuffer *c, uint32_t en) { (void)c; if (en & 0xff) ONCE_LOG("SetConservativeRasterEnable on: ignored by the host for now"); }
 NVN(nvnCommandBufferSetTiledCacheAction, void, NVNcommandBuffer *c, NVNtiledCacheAction a) { (void)c; (void)a; }        // Tegra tiled cache hint, no Metal equivalent
 // A bound target's contents may be discarded: they are undefined afterwards, so keeping them is correct (The Great Ace Attorney Chronicles discards colour target 0)
-uint64_t g_nvn_discards[2];   // calls of DiscardColor / DiscardDepthStencil (counted for the Android backend's log; the replay ignores them)
-NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) { (void)c; (void)i; g_nvn_discards[0]++; }
-NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { (void)c; g_nvn_discards[1]++; }
+uint64_t g_nvn_discards[2];   // calls of DiscardColor / DiscardDepthStencil
+NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) { g_nvn_discards[0]++; *REC(c, OP_DISCARD_COLOR, p_discard) = (p_discard){i, 0}; }
+NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { g_nvn_discards[1]++; *REC(c, OP_DISCARD_DS, p_discard) = (p_discard){0, 0}; }
 NVN(nvnCommandBufferSetTiledCacheTileSize, void, NVNcommandBuffer *c, int w, int h) { (void)c; (void)w; (void)h; }
 NVN_NOPROTO(nvnCommandBufferSetColorReductionEnable, void, NVNcommandBuffer *c, uint32_t en) { (void)c; (void)en; }   // color compression hints
 NVN_NOPROTO(nvnCommandBufferSetColorReductionThresholds, void, NVNcommandBuffer *c, int cls, const int *t) { (void)c; (void)cls; (void)t; }

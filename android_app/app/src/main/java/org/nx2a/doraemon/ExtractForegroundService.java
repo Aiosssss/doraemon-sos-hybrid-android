@@ -58,10 +58,18 @@ public final class ExtractForegroundService extends Service {
         public final long bytesTotal;
         public final int percent;
         public final String message;
+        public final String errorDetail;
+        public final long eventId;
 
         public Snapshot(boolean running, boolean success, boolean cancelled, String stage,
                         long filesDone, long filesTotal, long bytesDone, long bytesTotal,
                         int percent, String message) {
+            this(running, success, cancelled, stage, filesDone, filesTotal, bytesDone, bytesTotal, percent, message, "", 0L);
+        }
+
+        public Snapshot(boolean running, boolean success, boolean cancelled, String stage,
+                        long filesDone, long filesTotal, long bytesDone, long bytesTotal,
+                        int percent, String message, String errorDetail, long eventId) {
             this.running = running;
             this.success = success;
             this.cancelled = cancelled;
@@ -72,11 +80,14 @@ public final class ExtractForegroundService extends Service {
             this.bytesTotal = bytesTotal;
             this.percent = percent;
             this.message = message;
+            this.errorDetail = errorDetail != null ? errorDetail : "";
+            this.eventId = eventId;
         }
     }
 
     private static final AtomicBoolean sRunning = new AtomicBoolean(false);
     private static volatile Snapshot sSnapshot = new Snapshot(false, false, false, "idle", 0, 0, 0, 0, 0, "");
+    private static long sEventSeq = 0L;
 
     private NotificationManager mNotifMgr;
     private long mLastNotifUpdateMs = 0L;
@@ -160,9 +171,17 @@ public final class ExtractForegroundService extends Service {
             if (!NativeBridge.isLoaded()) {
                 throw new IOException("Native extractor library unavailable: " + NativeBridge.getLoadError());
             }
-            if (keysStr == null || baseStr == null || updStr == null) {
-                throw new IOException("Missing required SAF URI (prod.keys, Base NSP, or Update 1.1.2 NSP)");
+            if (keysStr == null || keysStr.isEmpty() || baseStr == null || baseStr.isEmpty()) {
+                throw new IOException("Missing required SAF URI (prod.keys or Base Game .nsp/.xci)");
             }
+
+            boolean hasSeparateUpdate = (updStr != null && !updStr.isEmpty());
+            int dlcCount = (dlcStrs != null) ? Math.min(dlcStrs.size(), 32) : 0;
+            SaveAndLogManager.appendLauncherLog(this, "extract",
+                    String.format(Locale.US, "START: base=selected update=%s dlcs=%d free=%.2f GiB",
+                            hasSeparateUpdate ? "separate" : "optional(auto-check merged)",
+                            dlcCount,
+                            NativeBridge.nativeQueryFreeSpace(getFilesDir().getAbsolutePath()) / 1073741824.0));
 
             // Capture existing user config & custom in-game layout lines before atomic swap
             RuntimeConfigManager.Config savedCfg = RuntimeConfigManager.load(this);
@@ -176,9 +195,8 @@ public final class ExtractForegroundService extends Service {
             // Open all SAF URIs with fdsan-safe detachFd() tracking
             int keysFd = openDetachedReadFd(Uri.parse(keysStr), ownedFds);
             int baseFd = openDetachedReadFd(Uri.parse(baseStr), ownedFds);
-            int updFd = openDetachedReadFd(Uri.parse(updStr), ownedFds);
+            int updFd = hasSeparateUpdate ? openDetachedReadFd(Uri.parse(updStr), ownedFds) : -1;
 
-            int dlcCount = (dlcStrs != null) ? Math.min(dlcStrs.size(), 32) : 0;
             int[] dlcFds = new int[dlcCount];
             for (int i = 0; i < dlcCount; i++) {
                 dlcFds[i] = openDetachedReadFd(Uri.parse(dlcStrs.get(i)), ownedFds);
@@ -186,12 +204,19 @@ public final class ExtractForegroundService extends Service {
 
             // Invoke native streaming extractor (writes filesDir/extract_tmp -> atomic swap to filesDir/game_data)
             String destRoot = getFilesDir().getAbsolutePath();
+            final String[] lastLoggedStage = {""};
             String err = NativeBridge.nativeExtractGame(
                     keysFd, baseFd, updFd, dlcFds,
                     patchesDir.getAbsolutePath(),
                     destRoot,
                     MIN_FREE_BYTES,
                     (stage, fDone, fTotal, bDone, bTotal) -> {
+                        if (stage != null && !stage.equals(lastLoggedStage[0])) {
+                            lastLoggedStage[0] = stage;
+                            SaveAndLogManager.appendLauncherLog(this, "extract",
+                                    String.format(Locale.US, "stage=%s files=%d/%d bytes=%d/%d",
+                                            stage, fDone, fTotal, bDone, bTotal));
+                        }
                         int pct = computePercent(stage, fDone, fTotal, bDone, bTotal);
                         String msg = formatStageMessage(stage, fDone, fTotal, bDone, bTotal);
                         publishState(new Snapshot(true, false, false, stage,
@@ -201,11 +226,23 @@ public final class ExtractForegroundService extends Service {
 
             if (err != null && !err.isEmpty()) {
                 boolean wasCancelled = err.toLowerCase(Locale.US).contains("cancel");
+                SaveAndLogManager.appendLauncherLog(this, "extract",
+                        (wasCancelled ? "CANCELLED: " : "FAILED: ") + err);
+                String displayErr = err.startsWith("UPDATE_112_MISSING:")
+                        ? "Update v1.1.2 tidak ditemukan (cek detail dialog)"
+                        : ("Extraction failed: " + err);
                 publishState(new Snapshot(false, false, wasCancelled, wasCancelled ? "cancelled" : "error",
                         0, 0, 0, 0, 0,
-                        wasCancelled ? "Extraction cancelled safely. Previous valid data preserved."
-                                : ("Extraction failed: " + err)), true);
+                        wasCancelled ? "Extraction cancelled safely. Previous valid data preserved." : displayErr,
+                        err, ++sEventSeq), true);
                 return;
+            }
+
+            // Guarantee game_data/aoc/ exists even when 0 DLCs were selected (100% optional)
+            File aocDir = new File(CoreAssetSync.getGameDataDir(this), "aoc");
+            if (!aocDir.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                aocDir.mkdirs();
             }
 
             // Atomically sync bundled shaders.dmsv + .core_assets.json and restore user settings
@@ -214,12 +251,15 @@ public final class ExtractForegroundService extends Service {
             CoreAssetSync.syncCoreAssets(this, true);
             RuntimeConfigManager.applyToGameData(this, savedCfg, preservedLayoutLines);
 
+            SaveAndLogManager.appendLauncherLog(this, "extract", "SUCCESS: extraction & shader verification complete");
             publishState(new Snapshot(false, true, false, "done", 1, 1, 1, 1, 100,
-                    "Extraction & verification complete! Ready to Play."), true);
+                    "Extraction & verification complete! Ready to Play.", "", ++sEventSeq), true);
         } catch (Throwable t) {
             Log.e(TAG, "Extraction failed", t);
+            String detail = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+            SaveAndLogManager.appendLauncherLog(this, "extract", "EXCEPTION: " + detail);
             publishState(new Snapshot(false, false, false, "error", 0, 0, 0, 0, 0,
-                    "Extraction error: " + (t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName())),
+                    "Extraction error: " + detail, detail, ++sEventSeq),
                     true);
         } finally {
             // fdsan-safe guaranteed single-close of every detached POSIX fd across ALL exit paths

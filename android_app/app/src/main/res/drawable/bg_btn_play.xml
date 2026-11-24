@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_pressed="true">
+        <layer-list>
+            <item>
+                <shape android:shape="rectangle">
+                    <gradient android:angle="270" android:startColor="#E48F18" android:endColor="#BF630B" />
+                    <stroke android:width="3dp" android:color="#6B3C14" />
+                    <corners android:radius="16dp" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+    <item>
+        <layer-list>
+            <!-- Drop shadow edge -->
+            <item android:top="3dp">
+                <shape android:shape="rectangle">
+                    <solid android:color="#553C220A" />
+                    <corners android:radius="16dp" />
+                </shape>
+            </item>
+            <!-- Main honey-gold wood body -->
+            <item android:bottom="3dp">
+                <shape android:shape="rectangle">
+                    <gradient android:angle="270" android:startColor="#FCD35A" android:centerColor="#F5A623" android:endColor="#DF7E15" />
+                    <stroke android:width="3dp" android:color="#7A481D" />
+                    <corners android:radius="16dp" />
+                </shape>
+            </item>
+            <!-- Soft cream top inner highlight -->
+            <item android:left="5dp" android:right="5dp" android:top="3dp" android:bottom="28dp">
+                <shape android:shape="rectangle">
+                    <gradient android:angle="270" android:startColor="#66FFF9E6" android:endColor="#00FFF9E6" />
+                    <corners android:radius="12dp" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+</selector>

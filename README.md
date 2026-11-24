@@ -4,7 +4,7 @@ Standalone Android ARM64 (16 KB page-aligned, minSdk 29 / targetSdk 35) native h
 
 > **Legal Notice:** This repository contains **zero** copyrighted Nintendo Switch game binaries, RomFS assets, DLC data, or cryptographic keys (`prod.keys`). Users must legally dump and supply their own `prod.keys`, Base NSP, Update `1.1.2` NSP, and optional DLC NSPs directly on-device via the Android Launcher (SAF).
 
-## Checkpoint Highlights (`v1.1.2-hybrid8`, `versionCode = 8`)
+## Checkpoint Highlights (`v1.1.2-hybrid11`, `versionCode = 11`)
 - **Unified ARM Mali + Qualcomm Adreno Vulkan Runtime (`runtime_src/`):**
   - Integrated `nx2android` + `nx2android-mali` GPU quirks (`VQ_NO_ZEROCOPY`, `VQ_NO_UBWC`, `VQ_NO_CB_SPLIT`, `VQ_NO_A2C`, `DM_VK_BC_CACHE=1`).
   - Mali copied-pool CPU-GPU overlap (`DM_VK_POOL_OVERLAP=1`) via staged `vkCmdCopyBuffer` on `s->up`, eliminating the synchronous `fence_wait` stall for 60 FPS unlock on Handheld 720p.

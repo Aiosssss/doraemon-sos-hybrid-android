@@ -1,7 +1,198 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Doraemon SoS Hybrid</string>
-    <string name="app_subtitle">Friends of the Great Kingdom • Native ARM64 Hybrid Port</string>
+    <!-- App Identity -->
+    <string name="app_name">SOS FOTGK</string>
+    <string name="app_subtitle">Friends of the Great Kingdom • Native ARM64 Port</string>
     <string name="notif_channel_extract">Game Asset Extraction</string>
     <string name="notif_channel_extract_desc">Progress notifications while extracting Nintendo Switch game files</string>
+    <string name="watermark_aiosport">@AiosPort</string>
+
+    <!-- Main Launcher Screen -->
+    <string name="cd_wallpaper">Doraemon Story of Seasons Key Art</string>
+    <string name="btn_play">PLAY</string>
+    <string name="btn_play_waiting_import">PLAY  (Importing…)</string>
+    <string name="btn_play_import_first">PLAY  (Import First)</string>
+    <string name="btn_settings">SETTINGS</string>
+    <string name="btn_import_game">IMPORT GAME</string>
+    <string name="cd_close">Close</string>
+    <string name="cd_check">Selected</string>
+    <string name="status_checking">Checking game data…</string>
+    <string name="status_importing">Importing game data…</string>
+    <string name="status_ready_fmt">Ready to Play • v%1$s</string>
+    <string name="status_not_imported">Game Not Imported</string>
+
+    <!-- Settings Panel Header & Tabs -->
+    <string name="settings_title">Game Settings</string>
+    <string name="tab_basic">General</string>
+    <string name="tab_advanced">Advanced &amp; Log</string>
+
+    <!-- Quick Presets -->
+    <string name="preset_label">Quick Preset:</string>
+    <string name="preset_auto">Auto (Recommended)</string>
+    <string name="preset_low">Low-End / Budget</string>
+    <string name="preset_balanced">Performance 60 FPS</string>
+    <string name="preset_high">High Quality</string>
+    <string name="toast_preset_auto">Auto preset applied</string>
+    <string name="toast_preset_low">Low-End / Budget preset applied</string>
+    <string name="toast_preset_balanced">Performance 60 FPS preset applied</string>
+    <string name="toast_preset_high">High Quality preset applied</string>
+
+    <!-- Basic Tab: Left Column (Graphics & Performance) -->
+    <string name="sec_graphics">Graphics &amp; Performance</string>
+    <string name="lbl_render_scale">Graphics Quality (Render Scale)</string>
+    <string name="lbl_shadow_scale">Shadow Resolution</string>
+    <string name="lbl_target_fps">Target FPS</string>
+    <string name="lbl_msaa">Anti-Aliasing (MSAA 2x)</string>
+    <string name="sub_msaa">Turn OFF on low-end GPUs for higher FPS (separate cache, zero freeze).</string>
+    <string name="lbl_docked">Docked Mode (1080p)</string>
+    <string name="sub_docked">OFF = Handheld 720p (lighter) • ON = Docked 1080p</string>
+
+    <!-- Basic Tab: Right Column (Protection, Audio, Controls & Mod) -->
+    <string name="sec_protection_controls">Visual Protection, Audio &amp; Controls</string>
+    <string name="lbl_safe_sync_card_title">Anti-Flicker Protection (Mode 2 Default)</string>
+    <string name="lbl_safe_sync_card_active">Active: Serial Safe Sync (Mode 2) + Robust Access</string>
+    <string name="lbl_safe_sync_card_exp">Experimental: Pipelined Mode 1 active (may flicker)</string>
+    <string name="lbl_safe_sync_card_sub">Locked ON by default for 0% flicker across all GPUs. Change in Advanced tab.</string>
+    <string name="lbl_audio_vol_fmt">Audio Volume: %1$d%%</string>
+    <string name="lbl_virtual_gamepad">On-Screen Virtual Gamepad</string>
+    <string name="lbl_rumble_fps">Vibration &amp; FPS Counter</string>
+    <string name="mod_status_original">Language / RomFS Mod: Original RomFS</string>
+    <string name="mod_status_active_fmt">Active Mod: %1$s (%2$d files)</string>
+    <string name="btn_install_mod">Install Mod (.zip)</string>
+    <string name="btn_restore_mod">Restore Original</string>
+
+    <!-- Advanced & Diagnostics Tab -->
+    <string name="sec_diag">Reports, Save Data &amp; Device Info</string>
+    <string name="btn_export_log">Export Log Report (.txt)</string>
+    <string name="btn_backup_save">Backup Save</string>
+    <string name="btn_restore_save">Restore Save</string>
+    <string name="btn_reset_defaults">Reset Default Settings</string>
+    <string name="gpu_detecting">Detecting Vulkan GPU &amp; RAM…</string>
+    <string name="gpu_not_available">GPU : Vulkan not available</string>
+    <string name="gpu_probe_error">GPU : Probe error</string>
+    <string name="ram_summary_fmt">RAM : %1$.1f GB Total (%2$.1f GB Free)</string>
+
+    <string name="sec_vulkan_adv">Advanced Vulkan &amp; Memory Options</string>
+    <string name="lbl_safe_sync_adv">Pool Safe Sync Mode</string>
+    <string name="sub_safe_sync_adv">Mode 2 is recommended (0% flicker). Mode 1 is experimental and may cause red/shadow flicker.</string>
+    <string name="lbl_robust_access">Robust Buffer Access (Anti-Red Flicker)</string>
+    <string name="lbl_inline_resolve">Inline TBDR MSAA Resolve (Saves GPU)</string>
+    <string name="lbl_strict_barriers">Strict Vulkan Barriers (Diagnostic)</string>
+    <string name="lbl_bc_cache">BC Texture Disk Cache (Mali)</string>
+    <string name="lbl_low_ram">Memory / Anti-LMK Profile</string>
+    <string name="lbl_low_cost_pp">Low-Cost Post-Process (Low-End GPU)</string>
+
+    <!-- Spinner Items -->
+    <string name="sp_scale_auto">Auto (Match GPU &amp; RAM Tier)</string>
+    <string name="sp_scale_050">Ultra FPS (0.50x — 640×360 Low-End)</string>
+    <string name="sp_scale_055">Low (0.55x — 704×396)</string>
+    <string name="sp_scale_067">Light (0.67x — 854×480)</string>
+    <string name="sp_scale_075">Balanced (0.75x — 960×540)</string>
+    <string name="sp_scale_100">Sharp (1.00x — Native 720p)</string>
+
+    <string name="sp_shadow_auto">Auto (1.0x Flagship / 0.75x Mid / 0.5x Low-End)</string>
+    <string name="sp_shadow_050">Low (0.50x — Saves 75% Shadow GPU)</string>
+    <string name="sp_shadow_075">Medium (0.75x — Balanced Mid-Range)</string>
+    <string name="sp_shadow_100">Native (1.00x — Full Shadow Detail)</string>
+
+    <string name="sp_fps_auto">Auto (60 FPS • 30 FPS Ultra Low-End)</string>
+    <string name="sp_fps_30">30 FPS (Cool &amp; Stable)</string>
+    <string name="sp_fps_45">45 FPS (Smooth Mid-Range)</string>
+    <string name="sp_fps_60">60 FPS (Full Smoothness)</string>
+
+    <string name="sp_msaa_auto">Auto (2x Flagship / OFF Mid &amp; Low-End)</string>
+    <string name="sp_msaa_off">OFF — 1x (Higher FPS &amp; Cooler)</string>
+    <string name="sp_msaa_on">ON — Native 2x MSAA (Smooth Edges)</string>
+
+    <string name="sp_safe_sync_mode2">Mode 2 — Ultra Safe Serial (Recommended, 0% Flicker)</string>
+    <string name="sp_safe_sync_mode1">Mode 1 — Pipelined (Experimental — May Flicker)</string>
+
+    <string name="sp_low_ram_auto">Auto (Detect Device RAM)</string>
+    <string name="sp_low_ram_std">Standard (&gt;= 6 GB RAM)</string>
+    <string name="sp_low_ram_4gb">4 GB RAM Saver (Anti-LMK)</string>
+    <string name="sp_low_ram_3gb">3 GB Ultra Saver (Anti-LMK)</string>
+
+    <string name="sp_low_cost_pp_auto">Auto (ON on Low-End GPUs)</string>
+    <string name="sp_low_cost_pp_on">ON — Lighter Micro-Bloom</string>
+    <string name="sp_low_cost_pp_off">OFF — Full Post-Process</string>
+
+    <!-- Import Game Panel -->
+    <string name="import_title">Import Nintendo Switch Game</string>
+    <string name="import_step1_title">1. prod.keys  (Required)</string>
+    <string name="import_step1_hint">Not selected — your Switch decryption keys</string>
+    <string name="import_step2_title">2. Base Game (.nsp / .xci)  (Required)</string>
+    <string name="import_step2_hint">Supports Base NSP/XCI or Merged/Super NSP</string>
+    <string name="import_step3_title">3. Update v1.1.2 (.nsp)  (Required unless Merged)</string>
+    <string name="import_step3_hint">Leave empty if Base is already Merged v1.1.2</string>
+    <string name="import_step4_title">4. DLC (.nsp)  (Optional)</string>
+    <string name="import_step4_hint">Optional (supports 0–3 DLC files)</string>
+    <string name="btn_pick">Browse</string>
+    <string name="sec_import_status">Installation &amp; Storage Status</string>
+    <string name="import_status_none">No game data installed yet.\nSelect prod.keys &amp; Base Game (.nsp/.xci) on the left.</string>
+    <string name="import_status_ready_fmt">Installed &amp; Ready to Play\nUpdate v%1$s • %2$d RomFS files\nDLC: %3$s</string>
+    <string name="import_status_syncing">Game data detected, syncing core runtime assets…</string>
+    <string name="import_storage_checking">Free storage: checking…</string>
+    <string name="import_storage_fmt">Free storage: %.2f GB (at least 3.20 GB required)</string>
+    <string name="btn_start_extract">Start Import &amp; Extract</string>
+    <string name="btn_reimport_add_dlc">Re-Import / Add DLC</string>
+    <string name="btn_cancel_extract">Cancel Extraction</string>
+    <string name="btn_clean_data">Delete Game Data (Clean Re-Import)</string>
+
+    <!-- Dialogs & Toasts -->
+    <string name="toast_import_first">Please import your game files first.</string>
+    <string name="toast_game_not_verified">Game data is not verified yet.</string>
+    <string name="toast_config_save_warn">Config save warning: %1$s</string>
+    <string name="toast_config_save_fail">Failed to save settings: %1$s</string>
+    <string name="toast_core_sync_fail">Core asset sync failed: %1$s</string>
+    <string name="toast_extract_done">Import &amp; verification complete! Ready to play.</string>
+    <string name="toast_pick_required">Please select prod.keys (Required) and Base Game (.nsp/.xci) (Required) first.</string>
+    <string name="msg_extract_starting">Starting extraction…</string>
+    <string name="picked_fmt">Selected: %1$s</string>
+    <string name="picked_dlc_none">Optional (0 DLC files)</string>
+    <string name="picked_dlc_count_fmt">%1$d DLC file(s) selected</string>
+
+    <string name="dlg_reset_title">Reset Default Settings?</string>
+    <string name="dlg_reset_msg">All graphics, FPS, and Vulkan settings will be restored to optimal defaults (Mode 2 Safe Sync ON).</string>
+    <string name="btn_reset">Reset</string>
+    <string name="btn_cancel">Cancel</string>
+    <string name="btn_ok">OK</string>
+    <string name="btn_understood">Got It</string>
+    <string name="toast_reset_done">Settings restored to default.</string>
+
+    <string name="dlg_upd_missing_title">Update v1.1.2 Not Found</string>
+    <string name="dlg_upd_missing_msg">This port requires Update v1.1.2 (01008EE0177A8800 v262144); DLC is optional.\n\n• Select Base Game (.nsp/.xci) + Update v1.1.2 (.nsp), OR\n• Select a single Merged/Super NSP/XCI that already includes Update v1.1.2.\n\nDetail: %1$s</string>
+    <string name="dlg_import_fail_title">Import Failed</string>
+    <string name="dlg_import_fail_msg">An error occurred while extracting game files:\n\n%1$s\n\nYou can export logs in Settings → Advanced &amp; Log → Export Log Report.</string>
+
+    <string name="dlg_clean_title">Delete Game Data (Saves Stay Safe)?</string>
+    <string name="dlg_clean_msg">Deletes extracted RomFS/ExeFS files so you can cleanly re-import. Your save data remains intact.</string>
+    <string name="btn_clean_confirm">Delete &amp; Re-Import</string>
+    <string name="toast_clean_done">Extracted data cleared. Please re-import.</string>
+
+    <string name="dlg_gpu_lost_title">GPU Recovery Mode (-4)</string>
+    <string name="dlg_gpu_lost_msg">The previous session encountered VK_ERROR_DEVICE_LOST (-4).\n\n%1$sEnable 1-Click GPU Safe Mode? (Pool Safe Sync Mode 2 + Robust Access + MSAA OFF)</string>
+    <string name="btn_enable_safe_mode">Enable Safe Mode</string>
+    <string name="btn_ignore">Ignore</string>
+    <string name="toast_safe_mode_on">GPU Safe Mode enabled.</string>
+
+    <string name="toast_log_exported">Log exported (%1$d KiB)</string>
+    <string name="toast_log_export_fail">Failed to export log: %1$s</string>
+    <string name="toast_save_backup_ok">Save backup complete (%1$d files)</string>
+    <string name="toast_save_backup_fail">Save backup failed: %1$s</string>
+    <string name="dlg_restore_save_title">Restore Save Data?</string>
+    <string name="dlg_restore_save_msg">Replaces current game save data with the selected ZIP archive.</string>
+    <string name="btn_restore">Restore</string>
+    <string name="toast_save_restore_ok">Save restored (%1$d files)</string>
+    <string name="toast_save_restore_fail">Save restore failed: %1$s</string>
+
+    <string name="dlg_install_mod_title">Install RomFS Mod (.zip)?</string>
+    <string name="dlg_install_mod_msg">Apply \"%1$s\" to game_data/RomFS/?\n\nOverwritten original files are automatically backed up so you can restore in 1 second.</string>
+    <string name="btn_install_mod_confirm">Install Mod</string>
+    <string name="toast_mod_installed">Mod installed: %1$s (%2$d files)</string>
+    <string name="toast_mod_install_fail">Failed to install mod: %1$s</string>
+
+    <string name="dlg_restore_romfs_title">Restore Original RomFS?</string>
+    <string name="dlg_restore_romfs_msg">Disables the mod and restores all original RomFS files in ~1 second without re-importing NSP.</string>
+    <string name="toast_romfs_restored">Original RomFS restored (%1$d files)</string>
+    <string name="toast_romfs_restore_fail">Failed to restore: %1$s</string>
 </resources>

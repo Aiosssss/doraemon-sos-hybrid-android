@@ -122,11 +122,12 @@ static void exec_ops(const uint8_t *p) {
         uint64_t skip = g_skip_ops_live;   // DM_VK_SKIP_OPS (debugging, live): record ops not replayed
         if (h.op < 64 && h.op > 3 && (skip >> h.op & 1)) { p += h.size; continue; }
         const uint8_t *a = p + 8;
+        g_cur_op_p = p;
         switch (h.op) {
-        case OP_END: return;
+        case OP_END: g_cur_op_p = NULL; return;
         case OP_BEGIN: break;
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
-        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); exec_ops((const uint8_t *)(uintptr_t)t); break; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); const uint8_t *saved_p = g_cur_op_p; exec_ops((const uint8_t *)(uintptr_t)t); g_cur_op_p = saved_p; break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); if (g_x_tracepass == -2) VKLOG("--- report counter type %#llx to %#llx", (unsigned long long)t, (unsigned long long)ad); mtl_sub_counter(ad, (uint32_t)t); break; }
         case OP_RESET_COUNTER: break;
@@ -161,7 +162,7 @@ static void exec_ops(const uint8_t *p) {
         case OP_BIND_VSTREAM: { const p_bind_vstream *v = (const p_bind_vstream *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) S.vstream[v->first + i] = v->st[i]; break; }
         case OP_BIND_VBUF: { const p_bind_vbuf *v = (const p_bind_vbuf *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) S.vbuf[v->first + i] = v->r[i]; break; }
         case OP_BIND_UBO: { const p_bind_buf *b = (const p_bind_buf *)a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16 && memcmp(&S.ubo[b->stage][b->index], b, sizeof *b)) { S.ubo[b->stage][b->index] = *b; g_ubo_gen[b->stage]++; } break; }
-        case OP_BIND_SSBO: { const p_bind_buf *b = (const p_bind_buf *)a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16 && memcmp(&S.ssbo[b->stage][b->index], b, sizeof *b)) { S.ssbo[b->stage][b->index] = *b; g_bind_gen[b->stage]++; } break; }
+        case OP_BIND_SSBO: { const p_bind_buf *b = (const p_bind_buf *)a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16 && memcmp(&S.ssbo[b->stage][b->index], b, sizeof *b)) { S.ssbo[b->stage][b->index] = *b; if (b->addr || b->size) S.ssbo_mask[b->stage] |= (uint16_t)(1u << b->index); else S.ssbo_mask[b->stage] &= (uint16_t)~(1u << b->index); g_bind_gen[b->stage]++; } break; }
         case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_BIND_TEX1: bind_handles_rec(h.op, a); break;
         case OP_STENCIL: { const p_stencil *s = (const p_stencil *)a;
             for (int f = 0; f < 2; f++) if (s->face & (1 << f)) { if (s->which == 0) S.smask[f] = s->value_mask; else if (s->which == 1) S.swmask[f] = s->mask; else S.sref[f] = s->ref; }
@@ -176,10 +177,17 @@ static void exec_ops(const uint8_t *p) {
         case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; const p_draw_idx *d = draw_idx_rec(a, h.size, &t); uint64_t before = g_vkst.draws; draw_idx(d);
             pixel_history_record(4, g_draw_i - 1, g_vkst.draws != before, d->count, d->instances, d->ibuf, d->base_vertex); break; }
         case OP_DISPATCH: dispatch((const p_dispatch *)a); break;
-        case OP_BARRIER: {   // the pass ends at every barrier: kept across XC3's fragment- and primitive-order barriers (0x1 0x2 0x4) its characters drew torn in some frames
+        case OP_BARRIER: {   // Defer order/cache-invalidate barriers (0xF7: everything except ORDER_INDIRECT_DATA 0x8)
+            // inside an open render pass (S.pass_open == 1): no copy/dispatch/ubd_land can run while a pass is open,
+            // and prepare_draw() verifies g_pass_wmem / shader_wmem / order_feedback(3) before keeping it — safely
+            // merging Unity's 10x 4-MRT PASS #29-#38 & 3x MSAA PASS #5-#7 splits (41.3 -> ~21 passes/frame)!
             int32_t bits = *(const int32_t *)a;
-            if (g_x_listpasses) VKLOG("    barrier %#x%s", bits, g_order_keep && S.pass_open == 1 && !(bits & ~0x7) ? " (order only: decided at the next draw)" : "");
-            if (g_order_keep && S.pass_open == 1 && !(bits & ~0x7)) { g_order_pending = 1; break; }   // (g_order_keep)
+            if (g_x_listpasses) VKLOG("    barrier %#x%s", bits, g_order_keep && S.pass_open && !(bits & ~0xF7) ? " (deferred inside pass: checked at next draw)" : "");
+            if (g_order_keep && !(bits & ~0xF7)) {
+                if (S.pass_open == 1) { g_order_pending = 1; break; }
+                if (S.pass_open == 2) { vk_img_barrier_all(vk_cmd()); break; }   // keep folded LOAD_OP_CLEAR intact before draw #1!
+            }
+            if (S.pass_open == 2) { vk_img_barrier_all(vk_cmd()); g_order_pending = 0; break; }   // pass not committed yet: emit full barrier while keeping folded LOAD_OP_CLEAR!
             vk_end_pass(); vk_img_barrier_all(vk_cmd()); g_order_pending = 0; break; }
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: {   // bound handles were rebased when recorded (hle_nvn.c bind_handles); handles read from memory are rebased by these (mem_handle)
             const p_set_pool *sp = (const p_set_pool *)a; int base = sp->pool ? nvn_dpool_base(sp->pool, h.op == OP_SET_TEX_POOL) : 0;
@@ -195,6 +203,26 @@ static void exec_ops(const uint8_t *p) {
         case OP_TF_BIND: { const p_tf_bind *b = (const p_tf_bind *)a; if (b->index >= 0 && b->index < 4) g_tf[b->index] = *b; break; }
         case OP_TF_STATE: if (!V.has_xfb) VKRED_ONCE(80, "transform feedback: the device has none, its draws write nothing"); tf_state((const p_tf_state *)a); break;
         case OP_VP_SWIZZLE: { const p_vp_swizzle *b = (const p_vp_swizzle *)a; memcpy(S.vp_sw[b->first], b->sw, 4 * (size_t)b->n); break; }
+        case OP_DISCARD_COLOR: {
+            if (!g_strict_barriers && S.pass_open == 2) {
+                int idx = ((const p_discard *)a)->index;
+                if (idx >= 0 && idx < S.ncol && P_ca[idx].imageView && P_ca[idx].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                    P_ca[idx].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                    if (++g_discard_load_opt == 1) VKLOG("TBDR DiscardColor(%d) -> LOAD_OP_DONT_CARE active", idx);
+                }
+            }
+            break;
+        }
+        case OP_DISCARD_DS: {
+            if (!g_strict_barriers && S.pass_open == 2) {
+                if (P_da.imageView && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                    P_da.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                    if (P_sa.imageView && P_sa.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) P_sa.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                    if (++g_discard_load_opt == 1) VKLOG("TBDR DiscardDepthStencil -> LOAD_OP_DONT_CARE active");
+                }
+            }
+            break;
+        }
         default: VKRED_ONCE(82, "unknown record op %u", h.op); break;
         }
         p += h.size;

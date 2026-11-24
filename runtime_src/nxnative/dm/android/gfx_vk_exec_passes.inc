@@ -8,18 +8,40 @@ static VkRenderingAttachmentInfo P_ca[8], P_da, P_sa; static VkRenderingInfo P_r
 // (MK8's full-resolution normals in slots 3/4), which can lose the writer's contents.
 // Keep writable aliases and route inactive duplicates to the first writer, or
 // the first slot when none writes. Distinct views/layers are never combined.
-static VkImageView P_alias_views[8]; static uint8_t P_alias[8];
-static void color_alias_map(uint32_t n, const VkImageView views[8], uint32_t mask, uint8_t map[8]) {
+static VkImageView P_alias_views[8]; static vkimg_t *P_alias_imgs[8]; static uint32_t P_alias_lv[8], P_alias_ly[8]; static uint8_t P_alias[8];
+static int alias_same_slot(uint32_t i, uint32_t j, const VkImageView views[8]) {
+    if (views[i] && views[j] && views[i] == views[j]) return 1;
+    if (vk_img_valid(P_alias_imgs[i]) && P_alias_imgs[i] == P_alias_imgs[j] && P_alias_lv[i] == P_alias_lv[j] && P_alias_ly[i] == P_alias_ly[j]) return 1;
+    return 0;
+}
+static void color_alias_map(uint32_t n, const VkImageView views[8], uint32_t mask, const uint8_t *cur, uint8_t map[8]) {
     for (uint32_t i=0;i<8;i++) map[i]=(uint8_t)i;
     for (uint32_t i=0;i<n && i<8;i++) if (views[i] && map[i]==i) {
         uint32_t keep=i;
-        for (uint32_t j=0;j<n && j<8;j++) if (views[j]==views[i] && ((mask>>(4*j))&15u)) {keep=j;break;}
-        for (uint32_t j=0;j<n && j<8;j++) if (j!=keep && views[j]==views[i] && !((mask>>(4*j))&15u)) map[j]=(uint8_t)keep;
+        // When a render pass is already open (cur != NULL), preserve its active kept slot if that slot is still
+        // writable OR if no aliased slot of this image is writable (e.g. depth/stencil-only draw with mask=0),
+        // preventing needless 4-MRT render pass splits on Doraemon SoS c0/c2 aliased passes.
+        if (cur && cur[i] < n && alias_same_slot(i, cur[i], views)) {
+            uint32_t ck = cur[i];
+            int ck_w = ((mask >> (4 * ck)) & 15u) != 0;
+            int any_w = 0;
+            for (uint32_t j = 0; j < n && j < 8; j++) if (alias_same_slot(i, j, views) && ((mask >> (4 * j)) & 15u)) { any_w = 1; break; }
+            if (ck_w || !any_w) {
+                keep = ck;
+            } else {
+                for (uint32_t j = 0; j < n && j < 8; j++) if (alias_same_slot(i, j, views) && ((mask >> (4 * j)) & 15u)) { keep = j; break; }
+            }
+        } else {
+            for (uint32_t j=0;j<n && j<8;j++) if (alias_same_slot(i,j,views) && ((mask>>(4*j))&15u)) {keep=j;break;}
+        }
+        // Vulkan forbids binding the same image subresource to two active colour attachments in one VkRenderPass
+        // (Mali TBDR tile load/store race, e.g. PASS #27-#36 c0/c2 aliasing): always collapse duplicate slots to keep.
+        for (uint32_t j=0;j<n && j<8;j++) if (j!=keep && alias_same_slot(i,j,views)) map[j]=(uint8_t)keep;
     }
 }
 static void bind_chmask(uint32_t mask) {
     if (S.pass_open && mask!=S.chmask.mask) {
-        uint8_t map[8];color_alias_map((uint32_t)S.ncol,P_alias_views,mask,map);
+        uint8_t map[8];color_alias_map((uint32_t)S.ncol,P_alias_views,mask,P_alias,map);
         if (memcmp(map,P_alias,sizeof map)) vk_end_pass();
     }
     S.chmask.mask=mask;
@@ -29,9 +51,11 @@ static void bind_chmask(uint32_t mask) {
 // frame); a VkRenderPass is made once per set of formats and load operations, and an imageless framebuffer once per set of attachment descriptions, and passes
 // then begin with vkCmdBeginRenderPass (the battle's replay went from about 20 to 17.5 ms a frame). Pipelines are made against a compatible render pass (the same
 // formats, every load operation LOAD). DM_VK_RP=0 (start-up): dynamic rendering
-typedef struct { uint32_t ncol, cfmt[8], cload[8], dfmt, dload, sload, dstore, samples, cstore[8]; } rpkey;   // cstore: 0 (memset) STORE; DONT_CARE for slot 0's scratch (DM_VK_SLOT0_FILL)
-typedef struct { VkRenderPass rp; uint32_t w, h, layers, n; struct { uint32_t usage, flags, w, h, layers, fmt, fmt2, fmt3, fmt4; } a[9]; } fbkey;   // fmt2..fmt4: a format-listed image's other formats (an imageless framebuffer names the image's whole list)
+typedef struct { uint32_t ncol, cfmt[8], cload[8], dfmt, dload, sload, dstore, samples, cstore[8], res_mask; } rpkey;   // cstore: 0 (memset) STORE; res_mask: bit i = inline TBDR MSAA resolve for colour slot i
+typedef struct { VkRenderPass rp; uint32_t w, h, layers, n; struct { uint32_t usage, flags, w, h, layers, fmt, fmt2, fmt3, fmt4; } a[17]; } fbkey;   // up to 8 colour + 1 depth + 8 resolve attachments
 static nvn_hmap g_rps = {.klen = sizeof(rpkey)}, g_fbs = {.klen = sizeof(fbkey)}; static pthread_mutex_t g_rp_mu = PTHREAD_MUTEX_INITIALIZER;
+// Inline TBDR MSAA resolve & low-cost post-process skip counters:
+uint64_t g_inline_resolve_opt, g_pp_skipped;
 // Without dynamic rendering (a Vulkan 1.1 / 1.2 device, V.has_dynrender) passes must be render pass objects, whatever DM_VK_RP says (vk_init refuses a device with neither)
 static int rp_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_RP"); on = V.has_imageless && (!V.has_dynrender || !(e && !atoi(e))); VKLOG("passes: %s", on ? "render pass objects with imageless framebuffers" : "dynamic rendering"); } return on; }
 static int fmt_has_depth(uint32_t f) { return f && f != VK_FORMAT_S8_UINT; }
@@ -39,7 +63,7 @@ static int fmt_has_stencil(uint32_t f) { return f == VK_FORMAT_D24_UNORM_S8_UINT
 static VkRenderPass rp_get(const rpkey *k) {
     pthread_mutex_lock(&g_rp_mu); VkRenderPass rp = nvn_hm_get(&g_rps, k);
     if (!rp) {
-        VkAttachmentDescription2 ad[9]; VkAttachmentReference2 cr[8], dr; uint32_t na = 0;
+        VkAttachmentDescription2 ad[17]; VkAttachmentReference2 cr[8], rr[8], dr; uint32_t na = 0;
         for (uint32_t i = 0; i < k->ncol; i++) {
             if (!k->cfmt[i]) { cr[i] = (VkAttachmentReference2){VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, NULL, VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT}; continue; }
             ad[na] = (VkAttachmentDescription2){VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2, NULL, 0, (VkFormat)k->cfmt[i], (VkSampleCountFlagBits)k->samples, (VkAttachmentLoadOp)k->cload[i], (VkAttachmentStoreOp)k->cstore[i],
@@ -53,8 +77,20 @@ static VkRenderPass rp_get(const rpkey *k) {
                 hs ? (VkAttachmentLoadOp)k->sload : VK_ATTACHMENT_LOAD_OP_DONT_CARE, hs ? (VkAttachmentStoreOp)k->dstore : VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL};
             dr = (VkAttachmentReference2){VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, NULL, na++, VK_IMAGE_LAYOUT_GENERAL, (hd ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (hs ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)};
         }
-        VkSubpassDescription2 sd = {VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2, NULL, 0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, 0, NULL, k->ncol, cr, NULL, k->dfmt ? &dr : NULL, 0, NULL};
-        // Explicit EXTERNAL <-> subpass 0 dependencies protect TBDR tile load/store ordering on ARM Mali GPUs.
+        if (k->res_mask) {
+            for (uint32_t i = 0; i < k->ncol; i++) {
+                if ((k->res_mask & (1u << i)) && k->cfmt[i]) {
+                    ad[na] = (VkAttachmentDescription2){VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2, NULL, 0, (VkFormat)k->cfmt[i], VK_SAMPLE_COUNT_1_BIT,
+                        VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE,
+                        VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL};
+                    rr[i] = (VkAttachmentReference2){VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, NULL, na++, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT};
+                } else {
+                    rr[i] = (VkAttachmentReference2){VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, NULL, VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT};
+                }
+            }
+        }
+        VkSubpassDescription2 sd = {VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2, NULL, 0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, 0, NULL, k->ncol, cr, k->res_mask ? rr : NULL, k->dfmt ? &dr : NULL, 0, NULL};
+        // Explicit EXTERNAL <-> subpass 0 dependencies protect TBDR tile load/store ordering on ARM Mali GPUs (hybrid8 verbatim).
         VkSubpassDependency2 deps[2] = {
             {VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2, NULL, VK_SUBPASS_EXTERNAL, 0,
              VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -75,14 +111,14 @@ static VkRenderPass rp_get(const rpkey *k) {
     }
     pthread_mutex_unlock(&g_rp_mu); return rp;
 }
-static VkRenderPass rp_compat(uint32_t ncol, const uint32_t *cfmt, uint32_t dfmt, uint32_t samples) {   // for pipelines: every load operation LOAD
+static VkRenderPass rp_compat(uint32_t ncol, const uint32_t *cfmt, uint32_t dfmt, uint32_t samples, uint32_t res_mask) {   // for pipelines: every load operation LOAD
     rpkey k; memset(&k, 0, sizeof k); k.ncol = ncol; for (uint32_t i = 0; i < ncol && i < 8; i++) { k.cfmt[i] = cfmt[i]; k.cload[i] = VK_ATTACHMENT_LOAD_OP_LOAD; }
-    k.dfmt = dfmt; k.dload = k.sload = VK_ATTACHMENT_LOAD_OP_LOAD; k.dstore = VK_ATTACHMENT_STORE_OP_STORE; k.samples = samples ? samples : 1; return rp_get(&k);
+    k.dfmt = dfmt; k.dload = k.sload = VK_ATTACHMENT_LOAD_OP_LOAD; k.dstore = VK_ATTACHMENT_STORE_OP_STORE; k.samples = samples ? samples : 1; k.res_mask = res_mask; return rp_get(&k);
 }
 static VkFramebuffer fb_get(const fbkey *k) {
     pthread_mutex_lock(&g_rp_mu); VkFramebuffer fb = nvn_hm_get(&g_fbs, k);
     if (!fb) {
-        VkFramebufferAttachmentImageInfo ai[9]; VkFormat vf[9][4];
+        VkFramebufferAttachmentImageInfo ai[17]; VkFormat vf[17][4];
         for (uint32_t i = 0; i < k->n; i++) { uint32_t c[4] = {k->a[i].fmt, k->a[i].fmt2, k->a[i].fmt3, k->a[i].fmt4}, nf = 0;   // the image's list, without the unset entries (its own format first)
             for (int j = 0; j < 4; j++) if (c[j] || (j == 0 && !nf)) vf[i][nf++] = (VkFormat)c[j];
             ai[i] = (VkFramebufferAttachmentImageInfo){VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENT_IMAGE_INFO, NULL, k->a[i].flags, k->a[i].usage, k->a[i].w, k->a[i].h, k->a[i].layers, nf, vf[i]}; }
@@ -123,17 +159,412 @@ static void lrz_touch(vkimg_t *im, int write) {
 // GPU +1 ms), as did writing back only the one a pass switches away from (0 genuine drops in about 140 frames, GPU +0.6-0.8 ms of 13-18)
 static vkimg_t *g_lrz_prev;
 void vk_lrz_forget(vkimg_t *im) { if (g_lrz_prev == im) g_lrz_prev = NULL; }   // an image dropped (gfx_vk_tex.c img_drop)
+static int rt_same(const p_set_rt *r);
+static VkRect2D scissor_rect(void);
+static int pass_whole(VkRect2D r);
+static uint64_t g_discard_load_opt;
+uint64_t g_discard_store_opt;
+uint64_t g_tbdr_fs_load_opt;
+static uint32_t g_first_draw_cnt, g_first_draw_inst; static int g_first_draw_ind;
+// Auto VK_ATTACHMENT_LOAD_OP_DONT_CARE for full-screen opaque post-process / blit passes (TBDR RAM readback skip):
+// Triggers ONLY when the pass's first draw is a non-indirect single-instance fullscreen quad/triangle (cnt 3, 4, or 6)
+// with no blending, full RGBA write mask, no fragment discard (OpKill/Demote), no active depth/stencil test, full viewport &
+// scissor, shader outputting to the slot, and no self-feedback sampling of that slot.
+static void pass_apply_fullscreen_load_opt(void) {
+    if (g_strict_barriers || P_cleared || S.rast_discard || !S.sh[1] || S.sh[1]->has_discard) return;
+    // NVN polygon mode: 0 = POINT, 1 = LINE, 2 = FILL (fix hybrid20 bug where != 0 rejected all FILL passes and zeroed dc_folded!).
+    if (S.poly.mode != 2 || (S.ms.enable && S.ms.a2c && S.samples > 1u)) return;
+    if ((P_ri.pDepthAttachment && S.ds.dt) || (P_ri.pStencilAttachment && S.ds.st) || P_ri.colorAttachmentCount != 1u || S.sh[1]->nbind < 1) return;
+    if (g_first_draw_ind || g_first_draw_inst > 1u || !(g_first_draw_cnt == 3u || g_first_draw_cnt == 4u || g_first_draw_cnt == 6u)) return;
+    // Square targets (e.g. 512x512 wind/shadow/projection maps) can run single-quad passes with generic
+    // 1-texture shaders (e.g. fs=f66cab3d319d7101) that may not cover the full target or rely on retained contents;
+    // restrict cnt=4/6 folding to non-square (16:9 bloom/post-process) passes while keeping cnt=3 fullscreen triangles eligible.
+    if (S.pass_w == S.pass_h && g_first_draw_cnt != 3u) return;
+    if (!pass_whole(scissor_rect())) return;
+    // Also verify unscaled guest scissor covers 100% of orig_w x orig_h so render_scale < 1.0 rounding
+    // never falsely passes pass_whole() on a slightly cropped transition/wipe scissor.
+    if (S.sc_set) {
+        uint32_t ow = S.pass_orig_w ? S.pass_orig_w : S.pass_w;
+        uint32_t oh = S.pass_orig_h ? S.pass_orig_h : S.pass_h;
+        if (S.sc.x > 0 || S.sc.y > 0 || (int64_t)S.sc.x + S.sc.w < (int64_t)ow || (int64_t)S.sc.y + S.sc.h < (int64_t)oh) return;
+    }
+    // Confirm this render pass contains ONLY this single fullscreen draw (never touch multi-draw UI/3D passes).
+    if (!g_cur_op_p) return;
+    {
+        op_hdr h0; memcpy(&h0, g_cur_op_p, sizeof h0);
+        if (h0.size < 8 || (h0.size & 7) || h0.op >= OP_COUNT_) return;
+        const uint8_t *q = g_cur_op_p + h0.size;
+        int ended_clean = 0;
+        for (int step = 0; step < 256; step++) {
+            op_hdr h; memcpy(&h, q, sizeof h);
+            if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) break;
+            const uint8_t *a = q + 8;
+            if (h.op == OP_DRAW || h.op == OP_DRAW_IDX || h.op == OP_DRAW_TF) return;
+            if (h.op == OP_END || h.op == OP_CALL || h.op == OP_JUMP ||
+                h.op == OP_BARRIER || h.op == OP_COPY_T2T || h.op == OP_COPY_T2B ||
+                h.op == OP_COPY_B2T || h.op == OP_DISPATCH || h.op == OP_CLEAR_TEX ||
+                (h.op == OP_SET_RT && !rt_same((const p_set_rt *)a))) {
+                ended_clean = 1; break;
+            }
+            q += h.size;
+        }
+        if (!ended_clean) return;
+    }
+    float vx = S.vp[0][0], vy = S.vp[0][1], vw = S.vp[0][2], vh = S.vp[0][3];
+    if (vw != 0.f || vh != 0.f) {
+        if (S.pass_orig_w && S.pass_orig_w != S.pass_w) { float sx = (float)S.pass_w / (float)S.pass_orig_w; vx *= sx; vw *= sx; }
+        if (S.pass_orig_h && S.pass_orig_h != S.pass_h) { float sy = (float)S.pass_h / (float)S.pass_orig_h; vy *= sy; vh *= sy; }
+        float x0 = vx < vx + vw ? vx : vx + vw, x1 = vx > vx + vw ? vx : vx + vw;
+        float y0 = vy < vy + vh ? vy : vy + vh, y1 = vy > vy + vh ? vy : vy + vh;
+        if (x0 > 0.5f || y0 > 0.5f || x1 + 0.5f < (float)S.pass_w || y1 + 0.5f < (float)S.pass_h) return;
+    }
+    vkshader_t *fs = S.sh[1];
+    for (uint32_t i = 0; i < P_ri.colorAttachmentCount && i < 8; i++) {
+        if (!P_ca[i].imageView || P_ca[i].loadOp != VK_ATTACHMENT_LOAD_OP_LOAD || !vk_img_valid(P_att[i].im)) continue;
+        if ((S.color.blend_en >> i) & 1u) continue;
+        if (((S.chmask.mask >> (4 * i)) & 0xfu) != 0xfu) continue;
+        if (!(fs->out_locs & (1u << i))) continue;
+        // Skip if fragment shader samples the same pool+offset or uses indirect/bindless texture/image handles
+        // (self-feedback or opaque transition passes keep LOAD_OP_LOAD).
+        int self_samp = 0;
+        for (int b = 0; b < fs->nbind && !self_samp; b++) {
+            const dmsv_bind *db = &fs->b[b];
+            if (db->kind == RK_TEX_UBO || db->kind == RK_TEXD || db->kind == RK_IMG || db->kind == RK_IMG_UBO) { self_samp = 1; break; }
+            if (db->kind != RK_TEX || db->reg < 0 || db->reg >= 256) continue;
+            uint64_t h = S.tex[1][db->reg]; if (!h) continue;
+            int tid = (int)(h & 0xfffffu); const view_t *tv = NULL; const tex_t *tx = NULL;
+            if (tid && vk_tex_by_id(tid, &tv, &tx) && tx && (uint64_t)(uintptr_t)tx->pool == P_att[i].im->pool &&
+                tx->off < P_att[i].im->off + P_att[i].im->size && P_att[i].im->off < tx->off + (int64_t)tx->L.size) self_samp = 1;
+        }
+        if (self_samp) continue;
+        P_ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        if (++g_tbdr_fs_load_opt == 1 || g_tbdr_fs_load_opt == 300 || g_tbdr_fs_load_opt % 3000 == 0)
+            VKLOG("[tbdr] auto fullscreen opaque LOAD_OP_DONT_CARE active (folded=%llu, pass %ux%u fs=%016llx)",
+                  (unsigned long long)g_tbdr_fs_load_opt, S.pass_w, S.pass_h, (unsigned long long)fs->key);
+    }
+}
+// Lookahead for explicit NVN DiscardColor / DiscardDepthStencil, next-pass full depth clear, or end-of-submission
+// dead depth writeback on unsampled MSAA/transient depth buffers. Follows OP_JUMP chunks and tracks full-rect OP_SCISSOR
+// so Mali TBDR reliably skips dead depth tile writeback (STORE_OP_DONT_CARE) while never discarding sampled/shadow depth.
+static inline int tex_same_storage(const tex_t *a, const tex_t *b) {
+    return a && b && a->magic == MAGIC('T', 'E', 'X', 0) && b->magic == MAGIC('T', 'E', 'X', 0) &&
+           a->pool == b->pool && a->off == b->off && a->d.width == b->d.width && a->d.height == b->d.height;
+}
+static void pass_apply_discard_lookahead(void) {
+    S.pass_res_mask = 0; P_res_im = NULL; P_res_view = VK_NULL_HANDLE; P_res_op = NULL;
+    if (g_strict_barriers || !g_cur_op_p) return;
+    int has_ds = (P_ri.pDepthAttachment != NULL || P_ri.pStencilAttachment != NULL);
+    int ds_msaa = has_ds && vk_img_valid(P_att[8].im) && P_att[8].im->samples > 1u;
+    int ds_unsampled = has_ds && vk_img_valid(P_att[8].im) && !P_att[8].im->ever_sampled;
+    int ds_msaa_unsampled = ds_msaa && ds_unsampled;
+    int ds_display_end = has_ds && ds_unsampled && S.rt_has_col[0] && (S.rt_col[0].d.flags & NVN_TEXTURE_FLAGS_DISPLAY);
+    // Proven 1x 3D depth buffer: always starts every submission with a full LOAD_OP_CLEAR (>=2 frames) and is never sampled or loaded across submissions.
+    int ds_proven_1x_3d_end = has_ds && ds_unsampled && !P_att[8].im->depth_ever_loaded_across_sub && P_att[8].im->depth_clear_frames >= 2u;
+    uint32_t col_msaa_mask = 0;
+    for (uint32_t i = 0; i < P_ri.colorAttachmentCount && i < 8; i++) {
+        if (P_ca[i].imageView && S.rt_has_col[i] && vk_img_valid(P_att[i].im) &&
+            P_att[i].im->samples > 1u && !P_att[i].im->ever_sampled) {
+            col_msaa_mask |= 1u << i;
+        }
+    }
+    // Inline TBDR MSAA resolve candidate (1-colour MSAA pass followed directly by CommandBufferDownsample):
+    int can_inline_res = vk_inline_resolve() && g_psplit <= 0 && !g_x_cutfs && g_x_cbdraws <= 0 &&
+                         S.samples > 1u && P_ri.colorAttachmentCount == 1 && S.rt_has_col[0] &&
+                         P_ca[0].imageView && vk_img_valid(P_att[0].im) && P_att[0].im->samples > 1u &&
+                         !P_att[0].im->bc_of && P_ri.layerCount == 1 && !S.rast_discard &&
+                         !P_att[0].im->ever_sampled;
+    const uint8_t *res_cand_op = NULL;
+    const tex_t *res_cand_dst = NULL;
+    int res_cand_dead = 0;
+    int ubd_seen = 0;
+    const uint8_t *q = g_cur_op_p;
+    uint32_t col_disc = 0; int ds_disc = 0;
+    int left_pass = 0, same_dep_next = 0, sc_full = 1, dep_reused = 0, reached_end = 0;
+    uint32_t same_col_next = 0;
+    uint32_t dw_chk = S.pass_orig_w ? S.pass_orig_w : S.pass_w;
+    uint32_t dh_chk = S.pass_orig_h ? S.pass_orig_h : S.pass_h;
+    // Bounded lookahead: up to 8192 ops for MSAA passes, up to 4096 ops for 1x unsampled depth passes
+    // (proves deterministic forward OP_CLEAR_DS or end-of-frame display depth STORE_OP_DONT_CARE when disable_msaa=1!),
+    // 96 ops for non-depth 1x passes (zero replay bloat).
+    int max_steps = (ds_msaa || col_msaa_mask || can_inline_res) ? 8192 : (ds_unsampled ? 4096 : 96);
+    for (int step = 0; step < max_steps; step++) {
+        op_hdr h; memcpy(&h, q, sizeof h);
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) break;
+        const uint8_t *a = q + 8;
+        if (h.op == OP_END) { reached_end = 1; break; }
+        if (h.op == OP_CALL) { dep_reused = 1; col_msaa_mask = 0; can_inline_res = 0; res_cand_op = NULL; break; }
+        if (h.op == OP_JUMP) {
+            const uint8_t *t = NULL; memcpy(&t, a, 8);
+            if (!t) break;
+            q = t;
+            continue;
+        }
+        if (!left_pass) {
+            if (h.op == OP_SET_RT) {
+                const p_set_rt *sr = (const p_set_rt *)a;
+                if (!rt_same(sr)) {
+                    can_inline_res = 0;
+                    if (!has_ds && !col_msaa_mask) break;
+                    left_pass = 1;
+                    sc_full = 1;
+                    same_dep_next = S.rt_has_dep && tex_same_storage(sr->depth, &S.rt_dep);
+                    same_col_next = 0;
+                    for (uint32_t m = col_msaa_mask; m; m &= m - 1) {
+                        uint32_t ci = (uint32_t)__builtin_ctz(m);
+                        for (int j = 0; j < sr->n && j < 8; j++)
+                            if (tex_same_storage(sr->color[j], &S.rt_col[ci])) { same_col_next |= 1u << ci; break; }
+                    }
+                }
+            } else if (h.op == OP_BARRIER) {
+                can_inline_res = 0;   // any barrier might trigger a mid-pass flush if a later draw reads a shader write
+                int32_t bits = *(const int32_t *)a;
+                if (!g_order_keep || (bits & ~0xF7)) {
+                    if (!has_ds && !col_msaa_mask) break;
+                    left_pass = 1; same_dep_next = S.rt_has_dep; same_col_next = col_msaa_mask; sc_full = 1;
+                }
+            } else if (h.op == OP_COPY_T2T) {
+                // CommandBufferDownsample (OP_COPY_T2T DM_COPY_RESOLVE) resolves MSAA COLOR immediately after
+                // the 3D MSAA pass: check if it qualifies for TBDR inline resolve (pResolveAttachments + STORE_OP_DONT_CARE)!
+                const p_copy_t2t *cp = (const p_copy_t2t *)a;
+                if (can_inline_res && (cp->flags & DM_COPY_RESOLVE) && !(cp->flags & (4u | 8u | 0x10u)) &&
+                    tex_same_storage(cp->src, &S.rt_col[0]) && cp->dst && !cp->has_sv && !cp->has_dv &&
+                    cp->sr.xoffset == 0 && cp->sr.yoffset == 0 && cp->sr.zoffset == 0 &&
+                    cp->dr.xoffset == 0 && cp->dr.yoffset == 0 && cp->dr.zoffset == 0 &&
+                    cp->sr.width == cp->dr.width && cp->sr.height == cp->dr.height &&
+                    cp->sr.width == (int32_t)dw_chk && cp->sr.height == (int32_t)dh_chk) {
+                    res_cand_op = q;
+                    res_cand_dst = cp->dst;
+                    res_cand_dead = 1;   // stays 1 unless a LATER op reads S.rt_col[0]
+                }
+                if (S.rt_has_dep && tex_same_storage(cp->src, &S.rt_dep)) dep_reused = 1;
+                for (uint32_t m = col_msaa_mask; m; m &= m - 1) {
+                    uint32_t ci = (uint32_t)__builtin_ctz(m);
+                    if (tex_same_storage(cp->src, &S.rt_col[ci])) col_msaa_mask &= ~(1u << ci);
+                }
+                if ((!has_ds || dep_reused) && !col_msaa_mask && !res_cand_op) break;
+                left_pass = 1; same_dep_next = 0; same_col_next = 0; sc_full = 1;
+            } else if (h.op == OP_COPY_T2B) {
+                can_inline_res = 0;
+                const p_copy_b2t *cp = (const p_copy_b2t *)a;
+                if (S.rt_has_dep && tex_same_storage(cp->tex, &S.rt_dep)) dep_reused = 1;
+                for (uint32_t m = col_msaa_mask; m; m &= m - 1) {
+                    uint32_t ci = (uint32_t)__builtin_ctz(m);
+                    if (tex_same_storage(cp->tex, &S.rt_col[ci])) col_msaa_mask &= ~(1u << ci);
+                }
+                if ((!has_ds || dep_reused) && !col_msaa_mask) break;
+                left_pass = 1; same_dep_next = 0; same_col_next = 0; sc_full = 1;
+            } else if (h.op == OP_COPY_B2T || h.op == OP_CLEAR_TEX || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF) {
+                can_inline_res = 0;
+                if (!has_ds && !col_msaa_mask) break;
+                left_pass = 1; same_dep_next = 0; same_col_next = 0; sc_full = 1;
+            } else if (h.op == OP_DISPATCH) {
+                can_inline_res = 0;
+                col_msaa_mask = 0;
+                if (!ds_unsampled) { dep_reused = 1; break; }
+                left_pass = 1; same_dep_next = 0; same_col_next = 0; sc_full = 1;
+            } else if (h.op == OP_UPDATE_UB) {
+                if (++ubd_seen >= 256) can_inline_res = 0;
+            } else if (h.op == OP_RAST_DISCARD || h.op == OP_TF_BIND || h.op == OP_TF_STATE ||
+                       h.op == OP_SIGNAL_EVENT || h.op == OP_REPORT_COUNTER || h.op == OP_RESET_COUNTER ||
+                       h.op == OP_FENCE_SYNC || h.op == OP_RENDER_COND) {
+                can_inline_res = 0;
+            } else if (h.op == OP_DRAW || h.op == OP_DRAW_IDX || h.op == OP_DRAW_TF || h.op == OP_CLEAR_COLOR || h.op == OP_CLEAR_DS) {
+                if (h.op == OP_DRAW_TF) can_inline_res = 0;
+                // Any draw/clear invalidates earlier discards (a discard before a draw is a load-discard, not store-discard).
+                col_disc = 0; ds_disc = 0;
+            } else if (h.op == OP_DISCARD_DS) {
+                ds_disc = 1;
+            } else if (h.op == OP_DISCARD_COLOR) {
+                int idx = ((const p_discard *)a)->index;
+                if (idx >= 0 && idx < 8) col_disc |= 1u << idx;
+            }
+        } else {
+            if (h.op == OP_SET_RT) {
+                const p_set_rt *sr = (const p_set_rt *)a;
+                sc_full = 1;
+                same_dep_next = S.rt_has_dep && tex_same_storage(sr->depth, &S.rt_dep);
+                same_col_next = 0;
+                for (uint32_t m = col_msaa_mask; m; m &= m - 1) {
+                    uint32_t ci = (uint32_t)__builtin_ctz(m);
+                    for (int j = 0; j < sr->n && j < 8; j++)
+                        if (tex_same_storage(sr->color[j], &S.rt_col[ci])) { same_col_next |= 1u << ci; break; }
+                }
+                if (res_cand_dead) {
+                    for (int j = 0; j < sr->n && j < 8; j++)
+                        if (tex_same_storage(sr->color[j], &S.rt_col[0])) { same_col_next |= 1u; break; }
+                }
+            } else if (h.op == OP_SCISSOR && (same_dep_next || same_col_next)) {
+                const p_scissor *sc = (const p_scissor *)a;
+                sc_full = (sc->x <= 0 && sc->y <= 0 && sc->w >= (int32_t)dw_chk && sc->h >= (int32_t)dh_chk);
+            } else if (h.op == OP_CLEAR_DS && same_dep_next) {
+                const p_clear_ds *cd = (const p_clear_ds *)a;
+                if (sc_full && cd->depth_mask && (!P_sa.imageView || (cd->stencil_mask & 0xff) == 0xff)) {
+                    ds_disc = 1;
+                    if (!col_msaa_mask && !res_cand_dead) break;
+                }
+            } else if (h.op == OP_DISCARD_DS && same_dep_next) {
+                ds_disc = 1;
+                if (!col_msaa_mask && !res_cand_dead) break;
+            } else if (h.op == OP_CLEAR_COLOR && (same_col_next & 1u) && sc_full) {
+                // Next pass overwrites MSAA colour 0 completely -> safe to discard after inline resolve!
+                same_col_next &= ~1u;
+            } else if (h.op == OP_DRAW || h.op == OP_DRAW_IDX || h.op == OP_DRAW_TF) {
+                if (same_dep_next) dep_reused = 1;
+                if (same_col_next) {
+                    col_msaa_mask &= ~same_col_next;
+                    if (same_col_next & 1u) res_cand_dead = 0;
+                }
+                if ((!has_ds || dep_reused || ds_disc) && !col_msaa_mask && !res_cand_dead) break;
+                // Non-MSAA sampled depth stops at next pass; unsampled 1x depth scans forward in the SAME CB
+                // solely to prove a deterministic subsequent full OP_CLEAR_DS (or final display pass OP_END).
+                if (!ds_msaa && !ds_unsampled && !col_msaa_mask && !res_cand_dead) break;
+            } else if (h.op == OP_COPY_T2T) {
+                const p_copy_t2t *cp = (const p_copy_t2t *)a;
+                if (S.rt_has_dep && tex_same_storage(cp->src, &S.rt_dep)) dep_reused = 1;
+                if (res_cand_dead && tex_same_storage(cp->src, &S.rt_col[0])) res_cand_dead = 0;
+                for (uint32_t m = col_msaa_mask; m; m &= m - 1) {
+                    uint32_t ci = (uint32_t)__builtin_ctz(m);
+                    if (tex_same_storage(cp->src, &S.rt_col[ci])) col_msaa_mask &= ~(1u << ci);
+                }
+                if ((!has_ds || dep_reused || ds_disc) && !col_msaa_mask && !res_cand_dead) break;
+            } else if (h.op == OP_COPY_T2B) {
+                const p_copy_b2t *cp = (const p_copy_b2t *)a;
+                if (S.rt_has_dep && tex_same_storage(cp->tex, &S.rt_dep)) dep_reused = 1;
+                if (res_cand_dead && tex_same_storage(cp->tex, &S.rt_col[0])) res_cand_dead = 0;
+                for (uint32_t m = col_msaa_mask; m; m &= m - 1) {
+                    uint32_t ci = (uint32_t)__builtin_ctz(m);
+                    if (tex_same_storage(cp->tex, &S.rt_col[ci])) col_msaa_mask &= ~(1u << ci);
+                }
+                if ((!has_ds || dep_reused || ds_disc) && !col_msaa_mask && !res_cand_dead) break;
+            } else if (h.op == OP_DISPATCH) {
+                col_msaa_mask = 0;
+                if (!ds_unsampled && !res_cand_dead) { dep_reused = 1; break; }
+            }
+        }
+        q += h.size;
+    }
+    // Activate Inline TBDR MSAA Resolve (pResolveAttachments + STORE_OP_DONT_CARE) if MSAA colour 0 is
+    // immediately resolved by CommandBufferDownsample and dead for the rest of the command buffer!
+    if (res_cand_op && res_cand_dst && res_cand_dead && reached_end) {
+        vkimg_t *dim = NULL;
+        VkImageView rv = vk_tex_view(res_cand_dst, NULL, 0xff, 0, 1, &dim);
+        uint32_t rly = vk_view_layers ? vk_view_layers : 1u;
+        if (rv && vk_img_valid(dim) && dim->samples == 1u && vk_view_fmt == P_att[0].fmt &&
+            dim->w == S.pass_w && dim->h == S.pass_h && dim->vtype == VK_IMAGE_VIEW_TYPE_2D &&
+            rly == 1u && (vk_view_usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+            vk_tex_prepare(vk_cmd(), dim);
+            vk_tex_mark_written(dim);
+            P_ca[0].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+            P_ca[0].resolveImageView = rv;
+            P_ca[0].resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            P_ca[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            P_res_im = dim;
+            P_res_view = rv;
+            P_res_usage = vk_view_usage;
+            P_res_layers = rly;
+            P_res_op = res_cand_op;
+            S.pass_res_mask = 1u;
+            if (++g_inline_resolve_opt == 1 || g_inline_resolve_opt == 300 || g_inline_resolve_opt % 3000 == 0)
+                VKLOG("TBDR Inline MSAA Resolve + STORE_OP_DONT_CARE active (count=%llu, %ux%u samp=%u fmt=%d)",
+                      (unsigned long long)g_inline_resolve_opt, S.pass_w, S.pass_h, S.samples, (int)dim->fmt);
+        }
+    }
+    // End-of-CB dead store elimination ONLY for:
+    //   1. Multisampled (samples > 1) unsampled attachments (never carried across CBs), OR
+    //   2. Final swapchain/display pass (NVN_TEXTURE_FLAGS_DISPLAY, e.g. 1920x1080) unsampled 1x depth, OR
+    //   3. Proven 1x 3D depth buffers that deterministically start every submission with full LOAD_OP_CLEAR
+    //      (depth_clear_frames >= 2 && !depth_ever_loaded_across_sub && !ever_sampled), saving 15-30 MB/frame DRAM!
+    if (!ds_disc && reached_end && !dep_reused && (ds_msaa_unsampled || ds_display_end || ds_proven_1x_3d_end)) {
+        ds_disc = 1;
+    }
+    if (reached_end && col_msaa_mask) {
+        col_disc |= col_msaa_mask;
+    }
+    if (ds_disc && (P_ri.pDepthAttachment || P_ri.pStencilAttachment)) {
+        P_da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        if (P_sa.imageView) P_sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        if (++g_discard_store_opt == 1 || g_discard_store_opt == 300 || g_discard_store_opt % 3000 == 0)
+            VKLOG("TBDR DiscardDepthStencil -> STORE_OP_DONT_CARE active (count=%llu, samples=%u %ux%u)",
+                  (unsigned long long)g_discard_store_opt, S.samples ? S.samples : 1, S.pass_w, S.pass_h);
+    }
+    if (col_disc) {
+        for (uint32_t i = 0; i < P_ri.colorAttachmentCount && i < 8; i++) {
+            if ((col_disc & (1u << i)) && P_ca[i].imageView) {
+                P_ca[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                if (++g_discard_store_opt == 1 || g_discard_store_opt == 300 || g_discard_store_opt % 3000 == 0)
+                    VKLOG("TBDR DiscardColor(%u) -> STORE_OP_DONT_CARE active (count=%llu, samples=%u %ux%u)",
+                          i, (unsigned long long)g_discard_store_opt, S.samples ? S.samples : 1, S.pass_w, S.pass_h);
+            }
+        }
+    }
+}
 // 0: no pass could be begun (no render pass or framebuffer, and no dynamic rendering to fall back on): the caller records nothing that needs one
 static int pass_commit(void) {
+    if (S.pass_open == 2 && S.skip_tiny_pp) return 1;
     if (S.pass_open != 2) return S.pass_open == 1;
+    S.skip_tiny_pp = 0;
+    // Low-Cost Post-Process (DM_VK_LOW_COST_PP=auto|1, active on Tier 1-3 Mid/Low/Ultra-Low GPUs):
+    // Completely skip tiny 16:9 bloom mip passes (<=160x90: 160x90, 80x45, 40x22, 20x11) BEFORE vkCmdBeginRenderPass!
+    // Clears the target image once to (0,0,0,0) via vkCmdClearColorImage (zero render pass overhead), eliminating
+    // 4-6 Vulkan render passes/frame on Mali-G57/G52/G76 while keeping HUD, 3D scene, and exposure 100% intact.
+    if (vk_low_cost_pp() && !S.daspect && S.ncol == 1 && S.pass_orig_w >= 16u && S.pass_orig_w <= 160u &&
+        S.pass_orig_h >= 10u && S.pass_orig_h <= 90u &&
+        (S.pass_orig_w * 9u >= S.pass_orig_h * 14u && S.pass_orig_w * 9u <= S.pass_orig_h * 18u) &&
+        P_ca[0].imageView && vk_img_valid(P_att[0].im) && P_att[0].im->samples == 1 &&
+        (S.cfmt[0] == VK_FORMAT_R16G16B16A16_SFLOAT || S.cfmt[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+         S.cfmt[0] == VK_FORMAT_R8G8B8A8_UNORM || S.cfmt[0] == VK_FORMAT_R8G8B8A8_SRGB)) {
+        vkimg_t *bim = P_att[0].im;
+        if (!bim->pp_zeroed && (bim->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            VkCommandBuffer cb = vk_cmd();
+            VkClearColorValue zc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+            VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+            vkCmdClearColorImage(cb, bim->img, VK_IMAGE_LAYOUT_GENERAL, &zc, 1, &rr);
+            VkImageMemoryBarrier pb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                bim->img, rr};
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, NULL, 0, NULL, 1, &pb);
+            bim->pp_zeroed = 1;
+            vk_tex_mark_written(bim);
+        }
+        S.skip_tiny_pp = 1;
+        P_cleared = 0;
+        if (++g_pp_skipped == 1 || g_pp_skipped == 300 || g_pp_skipped % 3000 == 0)
+            VKLOG("[low-end] low-cost post-process skipped bloom mip render pass %ux%u fmt=%d (count=%llu)",
+                  S.pass_orig_w, S.pass_orig_h, (int)S.cfmt[0], (unsigned long long)g_pp_skipped);
+        return 1;
+    }
+    pass_apply_fullscreen_load_opt();
+    g_first_draw_cnt = 0; g_first_draw_inst = 0; g_first_draw_ind = 0;
+    // Track per-submission first-use clear proof for 1x 3D depth buffers BEFORE pass_apply_discard_lookahead():
+    if (S.daspect && vk_img_valid(P_att[8].im)) {
+        vkimg_t *dim_chk = P_att[8].im;
+        if (dim_chk->depth_last_sub != g_set_epoch) {
+            dim_chk->depth_last_sub = g_set_epoch;
+            int full_ds_clear = (P_da.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) &&
+                                (!P_sa.imageView || P_sa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR);
+            if (full_ds_clear) {
+                if (dim_chk->depth_clear_frames < 1000u) dim_chk->depth_clear_frames++;
+            } else {
+                dim_chk->depth_ever_loaded_across_sub = 1;
+            }
+        }
+    }
+    for (int ci = 0; ci < S.ncol && ci < 8; ci++) {
+        if (vk_img_valid(P_att[ci].im)) P_att[ci].im->pp_zeroed = 0;
+    }
+    pass_apply_discard_lookahead();
     vkimg_t *dim = S.daspect ? P_att[8].im : NULL;
     if ((g_lrz_touch & LRZ_SWITCH) && dim && g_lrz_prev && g_lrz_prev != dim) lrz_touch(g_lrz_prev, 1);
     if (dim) g_lrz_prev = dim;
     if ((g_lrz_touch & LRZ_READ) && dim && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) lrz_touch(dim, 0);
     void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);
     if (rp_on()) {
-        rpkey k; memset(&k, 0, sizeof k); k.ncol = P_ri.colorAttachmentCount; k.samples = S.samples ? S.samples : 1;
-        fbkey fk; memset(&fk, 0, sizeof fk); VkImageView views[9]; VkClearValue cv[9]; uint32_t na = 0;
+        rpkey k; memset(&k, 0, sizeof k); k.ncol = P_ri.colorAttachmentCount; k.samples = S.samples ? S.samples : 1; k.res_mask = S.pass_res_mask;
+        fbkey fk; memset(&fk, 0, sizeof fk); VkImageView views[17]; VkClearValue cv[17]; uint32_t na = 0;
         for (uint32_t i = 0; i < k.ncol; i++) if (P_ca[i].imageView) {
             k.cfmt[i] = P_att[i].fmt; k.cload[i] = P_ca[i].loadOp; k.cstore[i] = P_ca[i].storeOp; cv[na] = P_ca[i].clearValue; views[na] = P_ca[i].imageView;
             // Imageless framebuffer usage matches the narrowed view (VUID 04627).
@@ -145,8 +576,15 @@ static int pass_commit(void) {
             cv[na] = P_da.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? P_da.clearValue : P_sa.clearValue; if (P_sa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) cv[na].depthStencil.stencil = P_sa.clearValue.depthStencil.stencil;
             views[na] = P_da.imageView;
             fk.a[na].usage = P_att[8].usage; fk.a[na].flags = P_att[8].im->cflags; fk.a[na].w = P_att[8].w; fk.a[na].h = P_att[8].h; fk.a[na].layers = P_att[8].layers; fk.a[na].fmt = P_att[8].fmt; na++; }
+        if (k.res_mask && (k.res_mask & 1u) && P_res_view && vk_img_valid(P_res_im)) {
+            memset(&cv[na], 0, sizeof cv[na]);
+            views[na] = P_res_view;
+            fk.a[na].usage = P_res_usage; fk.a[na].flags = P_res_im->cflags; fk.a[na].w = P_res_im->w; fk.a[na].h = P_res_im->h; fk.a[na].layers = P_res_layers;
+            fk.a[na].fmt = P_res_im->fixed_fmt ? (uint32_t)P_res_im->fmt : (uint32_t)P_att[0].fmt; fk.a[na].fmt2 = (uint32_t)P_res_im->fmt2;
+            fk.a[na].fmt3 = (uint32_t)P_res_im->fmt_cls[0]; fk.a[na].fmt4 = (uint32_t)P_res_im->fmt_cls[1]; na++;
+        }
         VkRenderPass rp = rp_get(&k);
-        fk.rp = rp_compat(k.ncol, k.cfmt, k.dfmt, k.samples); fk.w = P_ri.renderArea.extent.width; fk.h = P_ri.renderArea.extent.height; fk.layers = P_ri.layerCount; fk.n = na;
+        fk.rp = rp_compat(k.ncol, k.cfmt, k.dfmt, k.samples, k.res_mask); fk.w = P_ri.renderArea.extent.width; fk.h = P_ri.renderArea.extent.height; fk.layers = P_ri.layerCount; fk.n = na;
         VkFramebuffer fb = rp && fk.rp ? fb_get(&fk) : VK_NULL_HANDLE;
         if (fb) { VkRenderPassAttachmentBeginInfo abi = {VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO, NULL, na, views};
             VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, &abi, rp, fb, P_ri.renderArea, na, cv};
@@ -173,15 +611,17 @@ static int pass_commit(void) {
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) VKLOG("=== traced pass %d: %ux%u, colour formats %d %d, depth format %d", g_x_tracepass, S.pass_w, S.pass_h, S.cfmt[0], S.cfmt[1], S.dfmt); g_pass_draws = 0; g_list_vs = g_list_fs = 0; g_pass_bb[0] = g_pass_bb[1] = INT32_MAX; g_pass_bb[2] = g_pass_bb[3] = INT32_MIN;
     if (g_d3d_state == 1) {
         static const char LO[] = "LCD", SO[] = "SD";
-        char cb_str[256]; int o = 0;
-        for (uint32_t i = 0; i < P_ri.colorAttachmentCount && i < 8 && o < (int)sizeof cb_str - 36; i++) {
-            if (P_ca[i].imageView && P_att[i].im) {
-                o += snprintf(cb_str + o, sizeof cb_str - (size_t)o, " c%u=f%d:%c/%c", i, (int)S.cfmt[i],
-                              LO[P_ca[i].loadOp < 3 ? P_ca[i].loadOp : 2], SO[P_ca[i].storeOp < 2 ? P_ca[i].storeOp : 1]);
+        char cb_str[256]; cb_str[0] = '\0'; int o = 0;
+        for (uint32_t i = 0; i < P_ri.colorAttachmentCount && i < 8 && o < (int)sizeof cb_str - 48; i++) {
+            if (P_ca[i].imageView && vk_img_valid(P_att[i].im)) {
+                int n = snprintf(cb_str + o, sizeof cb_str - (size_t)o, " c%u=f%d:%c/%c(p%x+%#llx:%#llx)", i, (int)S.cfmt[i],
+                                 LO[P_ca[i].loadOp < 3 ? P_ca[i].loadOp : 2], SO[P_ca[i].storeOp < 2 ? P_ca[i].storeOp : 1],
+                                 (unsigned)(P_att[i].im->pool >> 12) & 0xffffu, (unsigned long long)P_att[i].im->off, (unsigned long long)P_att[i].im->size);
+                if (n > 0) { o += n; if (o >= (int)sizeof cb_str) { o = (int)sizeof cb_str - 1; break; } }
             }
         }
         char db_str[48] = "none";
-        if (P_ri.pDepthAttachment && P_att[8].im) {
+        if (P_ri.pDepthAttachment && vk_img_valid(P_att[8].im)) {
             snprintf(db_str, sizeof db_str, "f%d:%c/%c", (int)S.dfmt,
                      LO[P_da.loadOp < 3 ? P_da.loadOp : 2], SO[P_da.storeOp < 2 ? P_da.storeOp : 1]);
         }
@@ -413,7 +853,9 @@ static void lin_back(void) {
         VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
         VkBufferImageCopy r = {o, (uint32_t)(stride / f->bpb), 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, 1}};
         vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &r); vk_img_barrier_all(cb);
-        void vk_gpu_wrote(uint64_t a, uint64_t n); vk_gpu_wrote((uint64_t)(uintptr_t)t->mem, len); vk_readback_unknown();
+        // Exact linear RT byte range is already tracked in s->gw by vk_gpu_wrote(): do NOT call vk_readback_unknown()
+        // (which forced a 40.99 ms whole-pool cache invalidate & merge across all 64-128 MB copied pools!).
+        void vk_gpu_wrote(uint64_t a, uint64_t n); vk_gpu_wrote((uint64_t)(uintptr_t)t->mem, len);
         { static int n; if (n++ < 4) VKLOG("linear render target %ux%u (nvn format %#x, stride %zu) copied back to its storage %p", im->w, im->h, t->d.format, stride, (void *)t->mem); }
     }
 }
@@ -452,10 +894,84 @@ static void bc_draw_back(void) {
 void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); list_reads("it"); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
-    if (S.pass_open == 1) { if (g_d3d_state == 1) VKLOG("[3D-DUMP] PASS #%u END draws=%llu", g_d3d_passes, (unsigned long long)g_pass_draws); if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); if (g_strict_barriers) vk_img_barrier_all(vk_cmd()); bc_draw_back(); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
+    if (S.pass_open == 1) {
+        if (g_d3d_state == 1) VKLOG("[3D-DUMP] PASS #%u END draws=%llu", g_d3d_passes, (unsigned long long)g_pass_draws);
+        if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd());
+        if (g_strict_barriers) {
+            vk_img_barrier_all(vk_cmd());
+        } else if (vk_quirk(VQ_NO_ZEROCOPY) && g_pass_draws > 0) {
+            // ARM Mali TBDR AFBC / Z-compression flush: ALWAYS emit per-image VkImageMemoryBarrier on ALL
+            // depth, colour, and inline-resolved attachments (including STORE_OP_DONT_CARE attachments via
+            // lightweight attachment-to-attachment ownership sync so Mali TBDR/AFBC/Z metadata never corrupts).
+            VkImageMemoryBarrier ib[10]; uint32_t nib = 0;
+            VkPipelineStageFlags src_st = 0, dst_st = 0;
+            if ((S.daspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) && vk_img_valid(P_att[8].im)) {
+                vkimg_t *dim = P_att[8].im;
+                int ds_dc = (P_da.storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE && (!P_sa.imageView || P_sa.storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE));
+                ib[nib++] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    ds_dc ? (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+                          : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT),
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                    dim->img, {dim->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+                src_st |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                dst_st |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                if (!ds_dc) dst_st |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+            }
+            for (int ci = 0; ci < S.ncol && ci < 8 && nib < 10; ci++) {
+                vkimg_t *cim = P_att[ci].im;
+                if (!vk_img_valid(cim) || cim == &g_s0_image) continue;
+                int col_dc = (P_ca[ci].imageView && P_ca[ci].storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE);
+                int dup = 0;
+                for (uint32_t j = 0; j < nib; j++) if (ib[j].image == cim->img) { dup = 1; break; }
+                if (dup) continue;
+                ib[nib++] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    col_dc ? (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                           : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                              VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT),
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                    cim->img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+                src_st |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                dst_st |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                if (!col_dc) {
+                    dst_st |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                              VK_PIPELINE_STAGE_TRANSFER_BIT;
+                    if (cim->fmt == VK_FORMAT_R8_UNORM || cim->fmt == VK_FORMAT_R16_SFLOAT ||
+                        cim->fmt == VK_FORMAT_R16_UNORM || cim->fmt == VK_FORMAT_R32_SFLOAT ||
+                        (cim->w == cim->h && cim->w >= 256u) || (cim->w == 2048u && cim->h == 1024u)) {
+                        dst_st |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+                    }
+                }
+            }
+            if (S.pass_res_mask && vk_img_valid(P_res_im) && nib < 10) {
+                ib[nib++] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                    P_res_im->img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+                src_st |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                dst_st |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            }
+            if (nib) vkCmdPipelineBarrier(vk_cmd(), src_st, dst_st, 0, 0, NULL, 0, NULL, nib, ib);
+        }
+        if (S.pass_res_mask && P_res_op && g_cur_op_p == P_res_op) {
+            g_inline_resolved_op = P_res_op;
+        }
+        bc_draw_back();
+        void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws);
+        vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));
+        pass_dump();
+        if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; }
+    }
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
-    S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
+    S.pass_open = 0; S.skip_tiny_pp = 0; S.pass_res_mask = 0; P_res_im = NULL; P_res_view = VK_NULL_HANDLE; P_res_op = NULL; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
 // copies, the submission's end): the deferred uniform updates land first (draws read them through their shadows, so ordinary pass ends keep them)
@@ -592,7 +1108,7 @@ static int begin_pass(void) {
     VkRenderingAttachmentInfo *ca = P_ca; memset(ca, 0, sizeof P_ca);
     for (int i = 0; i < 9; i++) P_att[i].im = NULL;
     VkRenderingAttachmentInfo da = {0}, sa = {0};
-    uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX, samples = 1; int ncol = 0, have = 0;
+    uint32_t w = UINT32_MAX, h = UINT32_MAX, ow = UINT32_MAX, oh = UINT32_MAX, layers = UINT32_MAX, samples = 1; int ncol = 0, have = 0;
     for (int i = 0; i < S.rt_n; i++) {
         S.cfmt[i] = VK_FORMAT_UNDEFINED;
         ca[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO; ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL; ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -602,24 +1118,31 @@ static int begin_pass(void) {
         vk_tex_prepare(cb, im);
         uint32_t lv = S.rt_has_cview[i] && S.rt_cview[i].set_levels ? S.rt_cview[i].base_level : 0;
         uint32_t iw = im->w >> lv ? im->w >> lv : 1, ih = im->h >> lv ? im->h >> lv : 1;
+        uint32_t iow = (im->orig_w ? im->orig_w : im->w) >> lv; if (!iow) iow = 1;
+        uint32_t ioh = (im->orig_h ? im->orig_h : im->h) >> lv; if (!ioh) ioh = 1;
         // a block-compressed texture drawn into through an uncompressed view (RGBA32UI over BC3: one texel per 4x4 block, Mario Kart 8 Deluxe compressing its
         // reflection cubemaps on the GPU) is that view's size in blocks: with the texel size the render area was 16 times the attachment, which Vulkan does not allow (the render area must lie within every attachment view)
         { const vkfmt_t *tf = vk_fmt(S.rt_col[i].d.format), *vf = S.rt_has_cview[i] && S.rt_cview[i].set_format ? vk_fmt(S.rt_cview[i].format) : tf;
-          if (tf && vf && tf->compressed && !tf->dec && !vf->compressed && tf->bw && tf->bh) { if (!im->bc_of) { iw = (iw + tf->bw - 1) / tf->bw; ih = (ih + tf->bh - 1) / tf->bh; }   // (a stand-in is in blocks already: vk_tex_view_as)
+          if (tf && vf && tf->compressed && !tf->dec && !vf->compressed && tf->bw && tf->bh) { if (!im->bc_of) { iw = (iw + tf->bw - 1) / tf->bw; ih = (ih + tf->bh - 1) / tf->bh; iow = iw; ioh = ih; }   // (a stand-in is in blocks already: vk_tex_view_as)
               static int said; if (!said++) VKLOG("colour target: block-compressed format %#x drawn through view format %#x: pass in blocks, %ux%u", S.rt_col[i].d.format, S.rt_cview[i].format, iw, ih); } }
-        if (iw < w) w = iw; if (ih < h) h = ih; samples = im->samples; have = 1;
+        if (iw < w) w = iw; if (ih < h) h = ih; if (iow < ow) ow = iow; if (ioh < oh) oh = ioh; samples = im->samples; have = 1;
         ca[i].imageView = v; S.cfmt[i] = vk_view_fmt; ncol = i + 1; P_att[i].im = im;   // (the view's format: a render pass's attachment and its pipelines take it)
         P_att[i].fmt = vk_view_fmt; P_att[i].layers = vk_view_layers ? vk_view_layers : 1; P_att[i].w = iw; P_att[i].h = ih; P_att[i].usage = vk_view_usage;
         P_att[i].bc_lv = im->bc_lv; P_att[i].bc_ly = im->bc_ly; P_att[i].bc_nly = im->bc_nly;
         if (im->bc_of) bc_fill(im, im->bc_lv, im->bc_ly, im->bc_nly);   // (before the pass begins: what it does not cover keeps the image's blocks)
         if (P_att[i].layers < layers) layers = P_att[i].layers;
     }
-    for (int i=0;i<8;i++) P_alias_views[i]=ca[i].imageView;
-    color_alias_map((uint32_t)ncol,P_alias_views,S.chmask.mask,P_alias);
+    for (int i=0;i<8;i++) {
+        P_alias_views[i]=ca[i].imageView;
+        P_alias_imgs[i]=P_att[i].im;
+        P_alias_lv[i]=(S.rt_has_cview[i] && S.rt_cview[i].set_levels) ? S.rt_cview[i].base_level : 0u;
+        P_alias_ly[i]=(S.rt_has_cview[i] && S.rt_cview[i].set_layers) ? S.rt_cview[i].min_layer : 0u;
+    }
+    color_alias_map((uint32_t)ncol,P_alias_views,S.chmask.mask,NULL,P_alias);
     for (int i=0;i<ncol;i++) if (P_alias[i]!=i) {
         ca[i].imageView=VK_NULL_HANDLE;ca[i].loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;ca[i].storeOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;
         S.cfmt[i]=VK_FORMAT_UNDEFINED;P_att[i].im=NULL;
-        static int said;if (!said++) VKLOG("inactive colour attachment alias: slot %d uses slot %u (one image load/store)",i,(unsigned)P_alias[i]);
+        static int said;if (++said<=8) VKLOG("colour attachment alias collapsed: slot %d -> slot %u (single image load/store, mask=%#x)",i,(unsigned)P_alias[i],S.chmask.mask);
     }
     S.dfmt = VK_FORMAT_UNDEFINED; S.daspect = 0;
     if (S.rt_has_dep) {
@@ -628,7 +1151,9 @@ static int begin_pass(void) {
             vk_tex_prepare(cb, im);
             uint32_t lv = S.rt_has_dview && S.rt_dview.set_levels ? S.rt_dview.base_level : 0;
             uint32_t iw = im->w >> lv ? im->w >> lv : 1, ih = im->h >> lv ? im->h >> lv : 1;
-            if (iw < w) w = iw; if (ih < h) h = ih; samples = im->samples; have = 1;
+            uint32_t iow = (im->orig_w ? im->orig_w : im->w) >> lv; if (!iow) iow = 1;
+            uint32_t ioh = (im->orig_h ? im->orig_h : im->h) >> lv; if (!ioh) ioh = 1;
+            if (iw < w) w = iw; if (ih < h) h = ih; if (iow < ow) ow = iow; if (ioh < oh) oh = ioh; samples = im->samples; have = 1;
             da = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, v, VK_IMAGE_LAYOUT_GENERAL, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE};
             S.dfmt = im->fmt; S.daspect = im->aspect; P_att[8].im = im; P_att[8].fmt = vk_view_fmt; P_att[8].layers = vk_view_layers ? vk_view_layers : 1; P_att[8].w = iw; P_att[8].h = ih; P_att[8].usage = vk_view_usage;
             if (P_att[8].layers < layers) layers = P_att[8].layers;
@@ -686,13 +1211,21 @@ static int begin_pass(void) {
     P_da = da; P_sa = sa; P_cleared = 0;
     P_ri = (VkRenderingInfo){VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, layers, 0, (uint32_t)ncol, P_ca,
                              (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? &P_da : NULL, (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? &P_sa : NULL};
-    S.pass_open = 2; S.pass_w = w; S.pass_h = h; S.samples = samples; S.ncol = ncol; S.bound_pipe = VK_NULL_HANDLE;
+    S.pass_open = 2; S.pass_w = w; S.pass_h = h; S.pass_orig_w = (ow < UINT32_MAX ? ow : w); S.pass_orig_h = (oh < UINT32_MAX ? oh : h); S.samples = samples; S.ncol = ncol; S.bound_pipe = VK_NULL_HANDLE;
     return 1;
 }
 static VkRect2D scissor_rect(void) {
     int32_t x = 0, y = 0; int64_t x1 = S.pass_w, y1 = S.pass_h;
     if (S.sc_set) {
         int64_t sx = S.sc.x, sy = S.sc.y, sx1 = (int64_t)S.sc.x + S.sc.w, sy1 = (int64_t)S.sc.y + S.sc.h;
+        if (S.pass_orig_w && S.pass_orig_w != S.pass_w) {
+            sx = (sx * (int64_t)S.pass_w) / (int64_t)S.pass_orig_w;
+            sx1 = (sx1 * (int64_t)S.pass_w + (int64_t)S.pass_orig_w - 1) / (int64_t)S.pass_orig_w;
+        }
+        if (S.pass_orig_h && S.pass_orig_h != S.pass_h) {
+            sy = (sy * (int64_t)S.pass_h) / (int64_t)S.pass_orig_h;
+            sy1 = (sy1 * (int64_t)S.pass_h + (int64_t)S.pass_orig_h - 1) / (int64_t)S.pass_orig_h;
+        }
         if (g_lower_left && !g_flipy) { int64_t t = (int64_t)S.pass_h - sy1; sy1 = (int64_t)S.pass_h - sy; sy = t; }
         if (sx > x) x = (int32_t)sx; if (sy > y) y = (int32_t)sy; if (sx1 < x1) x1 = sx1; if (sy1 < y1) y1 = sy1;
     }
@@ -705,11 +1238,11 @@ static VkRect2D scissor_rect(void) {
 #include "maskclear_vert.spv.h"
 #include "maskclear_frag.spv.h"
 #include "flatdbg_frag.spv.h"
-typedef struct { uint32_t ncol, cfmt[8], dfmt, samples, mask; } mckey;
+typedef struct { uint32_t ncol, cfmt[8], dfmt, samples, mask, res_mask; } mckey;
 static struct { VkPipelineLayout pl; VkShaderModule vs, fs; int bad; mckey k[32]; VkPipeline p[32]; int n; } g_mc;
 static VkPipeline mc_pipeline(uint32_t mask) {
     mckey k; memset(&k, 0, sizeof k); k.ncol = (uint32_t)S.ncol; for (int i = 0; i < S.ncol && i < 8; i++) k.cfmt[i] = (uint32_t)S.cfmt[i];
-    k.dfmt = (uint32_t)S.dfmt; k.samples = S.samples ? S.samples : 1; k.mask = mask;
+    k.dfmt = (uint32_t)S.dfmt; k.samples = S.samples ? S.samples : 1; k.mask = mask; k.res_mask = S.pass_res_mask;
     for (int i = 0; i < g_mc.n; i++) if (!memcmp(&g_mc.k[i], &k, sizeof k)) return g_mc.p[i];
     if (g_mc.bad || g_mc.n == 32) return VK_NULL_HANDLE;
     if (!g_mc.pl) {
@@ -735,10 +1268,12 @@ static VkPipeline mc_pipeline(uint32_t mask) {
     VkFormat cf[8]; for (uint32_t i = 0; i < k.ncol; i++) cf[i] = (VkFormat)k.cfmt[i];
     VkFormat df = (VkFormat)k.dfmt; int has_stencil = df == VK_FORMAT_D24_UNORM_S8_UINT || df == VK_FORMAT_D32_SFLOAT_S8_UINT || df == VK_FORMAT_S8_UINT;
     VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k.ncol, cf, df == VK_FORMAT_S8_UINT ? VK_FORMAT_UNDEFINED : df, has_stencil ? df : VK_FORMAT_UNDEFINED};
-    VkRenderPass prp = rp_on() ? rp_compat(k.ncol, k.cfmt, k.dfmt, k.samples) : VK_NULL_HANDLE;
+    VkRenderPass prp = rp_on() ? rp_compat(k.ncol, k.cfmt, k.dfmt, k.samples, k.res_mask) : VK_NULL_HANDLE;
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, prp ? NULL : &rci, 0, 2, ss, &vin, &ia, NULL, &vs, &rs, &ms, &ds, &cb, &dy, g_mc.pl, prp, 0, VK_NULL_HANDLE, -1};
     VkPipeline p = VK_NULL_HANDLE;
-    if ((!prp && !V.has_dynrender) || vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p)) { VKRED_ONCE(32, "masked clear pipeline failed: cleared in full"); p = VK_NULL_HANDLE; }
+    VkResult mr = VK_ERROR_INITIALIZATION_FAILED;
+    if (prp || V.has_dynrender) { vk_pipe_compile_lock(); mr = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p); vk_pipe_compile_unlock(); }
+    if (mr) { VKRED_ONCE(32, "masked clear pipeline failed: cleared in full"); p = VK_NULL_HANDLE; }
     vk_pipeline_cache_changed();
     g_mc.k[g_mc.n] = k; g_mc.p[g_mc.n++] = p; return p;
 }
@@ -746,8 +1281,8 @@ static int g_bc_stale;
 static int clear_masked(const p_clear_color *c, VkRect2D r) {   // 1 = done
     const vkfmt_t *f = vk_fmt(S.rt_col[c->index].d.format);
     if (c->index != 0 || (f && f->is_int)) return 0;
-    VkPipeline p = mc_pipeline(c->mask); if (!p) return 0;
     if (!pass_commit()) return 1;
+    VkPipeline p = mc_pipeline(c->mask); if (!p) return 0;
     VkCommandBuffer cb = vk_cmd();
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); S.bound_pipe = VK_NULL_HANDLE;
     VkViewport vp = {0, 0, (float)S.pass_w, (float)S.pass_h, 0, 1}; vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &r);
@@ -758,6 +1293,7 @@ static int clear_masked(const p_clear_color *c, VkRect2D r) {   // 1 = done
 }
 static void clear_color(const p_clear_color *c) {
     if (!begin_pass()) return;
+    if (S.pass_open == 2 && S.skip_tiny_pp) return;
     if (c->index < 0 || c->index >= S.ncol) return;
     p_clear_color mapped=*c;mapped.index=P_alias[c->index];c=&mapped;
     if (S.cfmt[c->index] == VK_FORMAT_UNDEFINED || P_att[c->index].im == &g_s0_image || !c->mask) return;   // (slot 0's scratch is the game's empty slot: nothing to clear)
