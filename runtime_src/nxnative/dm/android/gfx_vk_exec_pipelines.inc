@@ -84,19 +84,39 @@ static void *async_pipe_thread(void *arg) {
     }
     return NULL;
 }
-static int async_pipe(const pkey *k) {   // 1: queued (the draw is left out); under nothing (takes g_pipe_mu)
-    if (!g_async_pipe || k->raster_discard || (S.sh[0] && S.sh[0]->xfb) || (S.sh[2] && S.sh[2]->xfb)) return 0;
-    for (int i = 0; i < S.ncol && i < 8; i++) if (S.rt_has_col[i] && (S.rt_col[i].d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 0;   // (the CPU reads it: lin_back)
-    int natt = 0; for (int i = 0; i < 9; i++) { const vkimg_t *a = P_att[i].im; if (!a) continue; natt++; if (a->rt_frames < 3) {
-            if (g_prof_on) { static int n; if (n++ < 300) VKLOG("pipeline built here: attachment %d %ux%u nvn format %#x drawn in %llu presents in a row (shaders %016llx %016llx)", i, a->w, a->h, a->nvn_format, (unsigned long long)a->rt_frames, (unsigned long long)k->key[0], (unsigned long long)k->key[1]); }
-            return 0; } }   // (counted in this present too)
-    if (!natt) return 0;
-    pthread_mutex_lock(&g_apq_mu);
-    if (!g_apq_on) { g_apq_on = 1; for (int i = 0; i < 2; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, async_pipe_thread, NULL); pthread_attr_destroy(&a); } }
+static int async_pipe(const pkey *k, int force_budget) {   // 1: queued (the draw is left out); under nothing (takes g_pipe_mu)
+    int force_r32 = vk_mali_legacy_r32();
+    if (!force_r32) {
+        if (!g_async_pipe && !force_budget) return 0;
+        if (k->raster_discard || (S.sh[0] && S.sh[0]->xfb) || (S.sh[2] && S.sh[2]->xfb)) return 0;
+        for (int i = 0; i < S.ncol && i < 8; i++) if (S.rt_has_col[i] && (S.rt_col[i].d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 0;   // (the CPU reads it: lin_back)
+        int natt = 0; for (int i = 0; i < 9; i++) { const vkimg_t *a = P_att[i].im; if (!a) continue; natt++; if (!force_budget && a->rt_frames < 3) {
+                if (g_prof_on) { static int n; if (n++ < 300) VKLOG("pipeline built here: attachment %d %ux%u nvn format %#x drawn in %llu presents in a row (shaders %016llx %016llx)", i, a->w, a->h, a->nvn_format, (unsigned long long)a->rt_frames, (unsigned long long)k->key[0], (unsigned long long)k->key[1]); }
+                return 0; } }   // (counted in this present too)
+        if (!natt) return 0;
+    }
+    if (force_r32) {
+        if (pthread_mutex_trylock(&g_apq_mu) != 0) return 1;   // never block render thread on Mali <= 32.1.0
+    } else {
+        pthread_mutex_lock(&g_apq_mu);
+    }
+    // Single serialized background worker (guarded by vk_pipe_compile_lock) eliminates 138-279ms frame stutters
+    // universally across Xclipse, Adreno, and Mali without concurrent driver compiler contention!
+    int nworkers = 1;
+    if (!g_apq_on) { g_apq_on = 1; for (int i = 0; i < nworkers; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, async_pipe_thread, NULL); pthread_attr_destroy(&a); } }
     int ok = g_apq_h - g_apq_t < APQ; if (ok) { g_apq[g_apq_h % APQ] = *k; g_apq_h++; pthread_cond_signal(&g_apq_cv); }
     pthread_mutex_unlock(&g_apq_mu);
-    if (ok) { pthread_mutex_lock(&g_pipe_mu); if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, PIPE_PENDING); pthread_mutex_unlock(&g_pipe_mu); }
-    return ok;
+    if (ok) {
+        if (force_r32) {
+            if (pthread_mutex_trylock(&g_pipe_mu) == 0) {
+                if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, PIPE_PENDING);
+                pthread_mutex_unlock(&g_pipe_mu);
+            }
+        } else {
+            pthread_mutex_lock(&g_pipe_mu); if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, PIPE_PENDING); pthread_mutex_unlock(&g_pipe_mu);
+        }
+    }
+    return force_r32 ? 1 : ok;
 }
 static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     g_last_pipe_skip = 0;
@@ -105,12 +125,45 @@ static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
         if (g_pipe_hot[hs].p == (void *)1) { g_last_pipe_skip = 2; return VK_NULL_HANDLE; }
         return g_pipe_hot[hs].p;
     }
+    // Mali <= 32.1.0 (0x08001000) 100% NON-BLOCKING ASYNC PATH (v1.1.2-hybrid37):
+    // NEVER call vkCreateGraphicsPipelines synchronously on the render thread and NEVER block on compile/table locks!
+    if (vk_mali_legacy_r32()) {
+        if (vk_bad_pipe_check(k->key[0], k->key[1])) {
+            g_pipe_hot[hs].k = *k; g_pipe_hot[hs].p = (void *)1;
+            g_last_pipe_skip = 2;
+            return VK_NULL_HANDLE;
+        }
+        if (pthread_mutex_trylock(&g_pipe_mu) != 0) { g_last_pipe_skip = 1; return VK_NULL_HANDLE; }
+        VkPipeline p = nvn_hm_get(&g_pipes, k);
+        pthread_mutex_unlock(&g_pipe_mu);
+        if (p == PIPE_PENDING) { g_last_pipe_skip = 1; return VK_NULL_HANDLE; }
+        if (p) { g_pipe_hot[hs].k = *k; g_pipe_hot[hs].p = p; if (p == (void *)1) { g_last_pipe_skip = 2; return VK_NULL_HANDLE; } return p; }
+        (void)async_pipe(k, 1);
+        g_last_pipe_skip = 1;
+        return VK_NULL_HANDLE;
+    }
     pthread_mutex_lock(&g_pipe_mu); VkPipeline p = nvn_hm_get(&g_pipes, k); pthread_mutex_unlock(&g_pipe_mu);
     if (p == PIPE_PENDING) { g_last_pipe_skip = 1; return VK_NULL_HANDLE; }
     if (p) { g_pipe_hot[hs].k = *k; g_pipe_hot[hs].p = p; if (p == (void *)1) { g_last_pipe_skip = 2; return VK_NULL_HANDLE; } return p; }
-    if (async_pipe(k)) { g_last_pipe_skip = 1; return VK_NULL_HANDLE; }
+    // Universal Per-Frame Synchronous Graphics Pipeline Compile Cap (v1.1.2-hybrid36):
+    // Caps synchronous builds to <= 3/frame on Tier 0-1 (Flagship/Mid-High) and <= 2/frame on Tier 2-3 (Low/Ultra-Low),
+    // delegating overflow builds to the serialized async worker (eliminating 138-279 ms compile spikes on all GPUs!).
+    static uint64_t s_sync_frame; static int s_sync_builds;
+    static int s_async_cap = -1;
+    if (s_async_cap < 0) {
+        const char *e = getenv("DM_VK_ASYNC_PIPE");
+        s_async_cap = (e && *e && !atoi(e)) ? 0 : 1;
+    }
+    if (s_sync_frame != g_tex_frame) { s_sync_frame = g_tex_frame; s_sync_builds = 0; }
+    int sync_budget = (vk_gpu_tier() <= 1) ? 3 : 2;
+    int over_budget = s_async_cap && s_sync_builds >= sync_budget;
+    if (async_pipe(k, over_budget)) { g_last_pipe_skip = 1; return VK_NULL_HANDLE; }
+    s_sync_builds++;
+    vk_diag_note_new_pipe(k->key[0], k->key[1], k->key[2]);
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
+    vk_wd_enter(VK_WD_PIPELINE_COMPILE, k->key[0], k->key[1]);
     uint64_t tb = g_prof_on ? tick() : 0; p = build_pipeline(k, layout, stg); if (g_prof_on) g_prof_ns[0] += tick() - tb; g_vkst.pipes_built++;
+    vk_wd_leave();
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);
     if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
@@ -154,6 +207,7 @@ static void *prewarm_thread(void *arg) {
     for (;;) {
         size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_n) break;
         const pkey *k = &g_pw[i];
+        if (vk_mali_legacy_r32() && vk_bad_pipe_check(k->key[0], k->key[1])) continue;
         pthread_mutex_lock(&g_pipe_mu); int have = nvn_hm_get(&g_pipes, k) != NULL; pthread_mutex_unlock(&g_pipe_mu);
         if (have) continue;
         vkshader_t *stg[3] = {0}; int ok = 1;
@@ -221,6 +275,7 @@ static void build_dump(void) {   // (the crash handler: no locks, no allocation)
     if (!n) fprintf(stderr, "[dm] [vk] no pipeline was being built\n");
 }
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg_in[3]) {
+    if (vk_mali_legacy_r32() && vk_bad_pipe_check(k->key[0], k->key[1])) return (VkPipeline)1;
     // DM_VK_PIPE_LOG: one line per pipeline built, with the state that decides how a material is drawn (shaders, cull/front, depth test/write/func,
     // colour formats, blend). For a game where some materials render wrong and others do not, the lines of the wrong material name the state to compare.
     { static int on = -1; if (on < 0) on = getenv("DM_VK_PIPE_LOG") ? atoi(getenv("DM_VK_PIPE_LOG")) : 0;
@@ -309,7 +364,9 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, prp ? NULL : &rci, 0, ns, ss, &vi, &ia, NULL, &vs, &rs, &ms, &ds, &cb, &dy, layout, prp, 0, VK_NULL_HANDLE, -1};
     if (bs >= 0) g_build[bs].phase = 2;
     vk_pipe_compile_lock();
+    vk_pipe_worker_begin(k->key[0], k->key[1]);
     VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p);
+    vk_pipe_worker_end();
     vk_pipe_compile_unlock();
     vk_pipeline_cache_changed();
     build_end(bs);

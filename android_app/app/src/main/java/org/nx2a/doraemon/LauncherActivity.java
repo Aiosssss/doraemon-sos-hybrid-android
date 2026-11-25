@@ -64,6 +64,7 @@ public final class LauncherActivity extends Activity {
     private static final int REQ_BACKUP_SAVE = 202;
     private static final int REQ_RESTORE_SAVE = 203;
     private static final int REQ_INSTALL_MOD = 204;
+    private static final int REQ_IMPORT_CHEAT = 205;
     private static final int REQ_POST_NOTIF = 301;
 
     private static final int[] SCALE_PRESET_MAP = {
@@ -108,15 +109,31 @@ public final class LauncherActivity extends Activity {
 
     // Settings overlay views
     private TextView mTabBtnBasic;
+    private TextView mTabBtnCheats;
     private TextView mTabBtnAdvanced;
     private View mTabSettingsBasic;
+    private View mTabSettingsCheats;
     private View mTabSettingsAdvanced;
+    private Switch mSwFlexAnalog;
+    private Switch mSwAdaptiveBtn;
+    private Switch mSwCheatMaster;
+    private TextView mBtnImportCheat;
+    private TextView mBtnClearCheats;
+    private LinearLayout mBoxBuiltinCheats;
+    private LinearLayout mBoxImportedCheats;
+    private CheatManager.State mCheatState;
     private TextView mBtnPresetAuto;
     private TextView mBtnPresetLow;
+    private TextView mBtnPresetTurbo;
     private TextView mBtnPresetBalanced;
     private TextView mBtnPresetHigh;
     private Spinner mSpRenderScale;
     private Spinner mSpShadowScale;
+    private Spinner mSpShadowRate;
+    private Spinner mSpScreenMode;
+    private Spinner mSpPadLayout;
+    private Spinner mSpSamsungSafe;
+    private Switch mSwNativeSurfaceRes;
     private Spinner mSpTargetFps;
     private Spinner mSpMsaaMode;
     private Switch mSwDockedMode;
@@ -134,6 +151,7 @@ public final class LauncherActivity extends Activity {
     private TextView mTxtGpuRamInfo;
     private Switch mSwRobustAccess;
     private Switch mSwInlineResolve;
+    private Switch mSwDeferredWait;
     private Switch mSwStrictBarriers;
     private Switch mSwBcCache;
     private Spinner mSpLowRam;
@@ -176,6 +194,7 @@ public final class LauncherActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_launcher);
         applyImmersiveFullscreen();
+        SaveAndLogManager.installJavaCrashHandler(this);
         mConfig = RuntimeConfigManager.load(this);
         bindViews();
         wireEvents();
@@ -222,6 +241,7 @@ public final class LauncherActivity extends Activity {
             }
             mReceiverRegistered = true;
         }
+        SaveAndLogManager.installJavaCrashHandler(this);
         mConfig = RuntimeConfigManager.load(this);
         syncSettingsUiFromConfig();
         refreshInstallAndStorageStatus();
@@ -271,16 +291,31 @@ public final class LauncherActivity extends Activity {
 
         // Settings views
         mTabBtnBasic = findViewById(R.id.tab_btn_basic);
+        mTabBtnCheats = findViewById(R.id.tab_btn_cheats);
         mTabBtnAdvanced = findViewById(R.id.tab_btn_advanced);
         mTabSettingsBasic = findViewById(R.id.tab_settings_basic);
+        mTabSettingsCheats = findViewById(R.id.tab_settings_cheats);
         mTabSettingsAdvanced = findViewById(R.id.tab_settings_advanced);
+        mSwFlexAnalog = findViewById(R.id.sw_flex_analog);
+        mSwAdaptiveBtn = findViewById(R.id.sw_adaptive_btn);
+        mSwCheatMaster = findViewById(R.id.sw_cheat_master);
+        mBtnImportCheat = findViewById(R.id.btn_import_cheat);
+        mBtnClearCheats = findViewById(R.id.btn_clear_cheats);
+        mBoxBuiltinCheats = findViewById(R.id.box_builtin_cheats);
+        mBoxImportedCheats = findViewById(R.id.box_imported_cheats);
         mBtnPresetAuto = findViewById(R.id.btn_preset_auto);
         mBtnPresetLow = findViewById(R.id.btn_preset_low);
+        mBtnPresetTurbo = findViewById(R.id.btn_preset_turbo);
         mBtnPresetBalanced = findViewById(R.id.btn_preset_balanced);
         mBtnPresetHigh = findViewById(R.id.btn_preset_high);
 
         mSpRenderScale = findViewById(R.id.sp_render_scale);
         mSpShadowScale = findViewById(R.id.sp_shadow_scale);
+        mSpShadowRate = findViewById(R.id.sp_shadow_rate);
+        mSpScreenMode = findViewById(R.id.sp_screen_mode);
+        mSpPadLayout = findViewById(R.id.sp_pad_layout);
+        mSpSamsungSafe = findViewById(R.id.sp_samsung_safe);
+        mSwNativeSurfaceRes = findViewById(R.id.sw_native_surface_res);
         mSpTargetFps = findViewById(R.id.sp_target_fps);
         mSpMsaaMode = findViewById(R.id.sp_msaa_mode);
         mSwDockedMode = findViewById(R.id.sw_docked_mode);
@@ -299,6 +334,7 @@ public final class LauncherActivity extends Activity {
         mTxtGpuRamInfo = findViewById(R.id.txt_gpu_ram_info);
         mSwRobustAccess = findViewById(R.id.sw_robust_access);
         mSwInlineResolve = findViewById(R.id.sw_inline_resolve);
+        mSwDeferredWait = findViewById(R.id.sw_deferred_wait);
         mSwStrictBarriers = findViewById(R.id.sw_strict_barriers);
         mSwBcCache = findViewById(R.id.sw_bc_cache);
         mSpLowRam = findViewById(R.id.sp_low_ram);
@@ -362,6 +398,34 @@ public final class LauncherActivity extends Activity {
                 getString(R.string.sp_low_cost_pp_on),
                 getString(R.string.sp_low_cost_pp_off)
         });
+        if (mSpShadowRate != null) {
+            setupSpinner(mSpShadowRate, new String[]{
+                    getString(R.string.sp_shadow_rate_auto),
+                    getString(R.string.sp_shadow_rate_full),
+                    getString(R.string.sp_shadow_rate_half),
+                    getString(R.string.sp_shadow_rate_off)
+            });
+        }
+        if (mSpScreenMode != null) {
+            setupSpinner(mSpScreenMode, new String[]{
+                    getString(R.string.sp_screen_16_9),
+                    getString(R.string.sp_screen_stretch),
+                    getString(R.string.sp_screen_zoom)
+            });
+        }
+        if (mSpPadLayout != null) {
+            setupSpinner(mSpPadLayout, new String[]{
+                    getString(R.string.sp_pad_nintendo),
+                    getString(R.string.sp_pad_xbox)
+            });
+        }
+        if (mSpSamsungSafe != null) {
+            setupSpinner(mSpSamsungSafe, new String[]{
+                    getString(R.string.sp_samsung_safe_auto),
+                    getString(R.string.sp_samsung_safe_on),
+                    getString(R.string.sp_samsung_safe_off)
+            });
+        }
     }
 
     private void setupSpinner(Spinner sp, String[] items) {
@@ -390,12 +454,16 @@ public final class LauncherActivity extends Activity {
         findViewById(R.id.btn_close_import).setOnClickListener(v -> mOverlayImport.setVisibility(View.GONE));
 
         // Settings Tabs
-        mTabBtnBasic.setOnClickListener(v -> showSettingsTab(false));
-        mTabBtnAdvanced.setOnClickListener(v -> showSettingsTab(true));
+        mTabBtnBasic.setOnClickListener(v -> showSettingsTab(0));
+        if (mTabBtnCheats != null) mTabBtnCheats.setOnClickListener(v -> showSettingsTab(1));
+        mTabBtnAdvanced.setOnClickListener(v -> showSettingsTab(2));
 
-        // 4 Quick Presets (1-Click)
+        // 5 Quick Presets (1-Click)
         mBtnPresetAuto.setOnClickListener(v -> applyPresetFromUi(RuntimeConfigManager.PRESET_AUTO, R.string.toast_preset_auto));
         mBtnPresetLow.setOnClickListener(v -> applyPresetFromUi(RuntimeConfigManager.PRESET_LOW_END, R.string.toast_preset_low));
+        if (mBtnPresetTurbo != null) {
+            mBtnPresetTurbo.setOnClickListener(v -> applyPresetFromUi(RuntimeConfigManager.PRESET_TURBO, R.string.toast_preset_turbo));
+        }
         mBtnPresetBalanced.setOnClickListener(v -> applyPresetFromUi(RuntimeConfigManager.PRESET_BALANCED, R.string.toast_preset_balanced));
         mBtnPresetHigh.setOnClickListener(v -> applyPresetFromUi(RuntimeConfigManager.PRESET_HIGH, R.string.toast_preset_high));
 
@@ -450,8 +518,39 @@ public final class LauncherActivity extends Activity {
             }
         });
         mSwOverlay.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.overlayEnabled = checked; persistConfig(); } });
+        if (mSwFlexAnalog != null) {
+            mSwFlexAnalog.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.flexibleAnalog = checked; persistConfig(); } });
+        }
+        if (mSwAdaptiveBtn != null) {
+            mSwAdaptiveBtn.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.adaptiveButton = checked; persistConfig(); } });
+        }
         mSwRumble.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.rumbleEnabled = checked; persistConfig(); } });
         mSwFpsCounter.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.fpsCounter = checked; persistConfig(); } });
+
+        // Cheats Tab listeners (all default OFF)
+        if (mSwCheatMaster != null) {
+            mSwCheatMaster.setOnCheckedChangeListener((b, checked) -> {
+                if (mUpdatingUi || mCheatState == null) return;
+                mCheatState.master = checked;
+                saveCheatsUi();
+            });
+        }
+        if (mBtnImportCheat != null) {
+            mBtnImportCheat.setOnClickListener(v -> {
+                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("*/*");
+                i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"text/plain", "application/octet-stream", "*/*"});
+                startActivityForResult(i, REQ_IMPORT_CHEAT);
+            });
+        }
+        if (mBtnClearCheats != null) {
+            mBtnClearCheats.setOnClickListener(v -> {
+                int removed = CheatManager.clearImportedFiles(this);
+                refreshCheatsUi();
+                Toast.makeText(this, getString(R.string.toast_cheats_cleared, removed), Toast.LENGTH_SHORT).show();
+            });
+        }
 
         // Mod buttons
         mBtnInstallMod.setOnClickListener(v -> {
@@ -489,10 +588,28 @@ public final class LauncherActivity extends Activity {
         // Advanced switches
         mSwRobustAccess.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.robustAccess = checked; persistConfig(); } });
         mSwInlineResolve.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.inlineResolve = checked; persistConfig(); } });
+        mSwDeferredWait.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.deferredWait = checked; persistConfig(); } });
         mSwStrictBarriers.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.strictBarriers = checked; persistConfig(); } });
         mSwBcCache.setOnCheckedChangeListener((b, checked) -> { if (!mUpdatingUi) { mConfig.bcDiskCache = checked; persistConfig(); } });
         onSpinnerSelect(mSpLowRam, pos -> { mConfig.lowRamMode = pos; persistConfig(); });
         onSpinnerSelect(mSpLowCostPp, pos -> { mConfig.lowCostPpMode = pos; persistConfig(); });
+        if (mSpShadowRate != null) {
+            onSpinnerSelect(mSpShadowRate, pos -> { mConfig.shadowRateMode = pos; updatePresetHighlight(); persistConfig(); });
+        }
+        if (mSpScreenMode != null) {
+            onSpinnerSelect(mSpScreenMode, pos -> { mConfig.screenMode = pos; persistConfig(); });
+        }
+        if (mSpPadLayout != null) {
+            onSpinnerSelect(mSpPadLayout, pos -> { mConfig.padXboxLayout = (pos == 1); persistConfig(); });
+        }
+        if (mSpSamsungSafe != null) {
+            onSpinnerSelect(mSpSamsungSafe, pos -> { mConfig.samsungSafeMode = pos; persistConfig(); });
+        }
+        if (mSwNativeSurfaceRes != null) {
+            mSwNativeSurfaceRes.setOnCheckedChangeListener((b, checked) -> {
+                if (!mUpdatingUi) { mConfig.nativeSurfaceRes = checked; persistConfig(); }
+            });
+        }
 
         // Import panel file pickers & actions
         findViewById(R.id.row_pick_keys).setOnClickListener(v -> openDocumentPicker(REQ_PICK_KEYS, false));
@@ -523,7 +640,8 @@ public final class LauncherActivity extends Activity {
     private void openSettingsOverlay() {
         mOverlayImport.setVisibility(View.GONE);
         syncSettingsUiFromConfig();
-        showSettingsTab(false);
+        refreshCheatsUi();
+        showSettingsTab(0);
         mOverlaySettings.setVisibility(View.VISIBLE);
     }
 
@@ -533,11 +651,83 @@ public final class LauncherActivity extends Activity {
         mOverlayImport.setVisibility(View.VISIBLE);
     }
 
-    private void showSettingsTab(boolean advanced) {
-        mTabSettingsBasic.setVisibility(advanced ? View.GONE : View.VISIBLE);
-        mTabSettingsAdvanced.setVisibility(advanced ? View.VISIBLE : View.GONE);
-        stylePill(mTabBtnBasic, !advanced);
-        stylePill(mTabBtnAdvanced, advanced);
+    private void showSettingsTab(int tab) {
+        mTabSettingsBasic.setVisibility(tab == 0 ? View.VISIBLE : View.GONE);
+        if (mTabSettingsCheats != null) mTabSettingsCheats.setVisibility(tab == 1 ? View.VISIBLE : View.GONE);
+        mTabSettingsAdvanced.setVisibility(tab == 2 ? View.VISIBLE : View.GONE);
+        stylePill(mTabBtnBasic, tab == 0);
+        stylePill(mTabBtnCheats, tab == 1);
+        stylePill(mTabBtnAdvanced, tab == 2);
+        if (tab == 1) refreshCheatsUi();
+    }
+
+    private void saveCheatsUi() {
+        if (mCheatState == null) return;
+        try {
+            CheatManager.save(this, mCheatState);
+        } catch (Exception e) {
+            Toast.makeText(this, getString(R.string.toast_config_save_fail, e.getMessage()), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void refreshCheatsUi() {
+        if (mBoxBuiltinCheats == null || mBoxImportedCheats == null) return;
+        mCheatState = CheatManager.load(this);
+        mUpdatingUi = true;
+        if (mSwCheatMaster != null) mSwCheatMaster.setChecked(mCheatState.master);
+        mBoxBuiltinCheats.removeAllViews();
+        mBoxImportedCheats.removeAllViews();
+        int importedCount = 0;
+        for (CheatManager.Entry entry : mCheatState.entries) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            int padV = (int) (3 * getResources().getDisplayMetrics().density);
+            row.setPadding(0, padV, 0, padV);
+
+            LinearLayout col = new LinearLayout(this);
+            col.setOrientation(LinearLayout.VERTICAL);
+            col.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+            TextView tvName = new TextView(this);
+            tvName.setText(entry.name);
+            tvName.setTextColor(Color.parseColor("#4A2E14"));
+            tvName.setTextSize(11.5f);
+            tvName.setMaxLines(1);
+            tvName.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            col.addView(tvName);
+
+            if (!entry.builtin) {
+                TextView tvSrc = new TextView(this);
+                tvSrc.setText(entry.source);
+                tvSrc.setTextColor(Color.parseColor("#8A6A4A"));
+                tvSrc.setTextSize(9f);
+                col.addView(tvSrc);
+                importedCount++;
+            }
+
+            Switch sw = new Switch(this);
+            sw.setChecked(entry.enabled);
+            sw.setOnCheckedChangeListener((btn, checked) -> {
+                if (mUpdatingUi) return;
+                CheatManager.toggleEntry(mCheatState, entry, checked);
+                saveCheatsUi();
+                refreshCheatsUi();
+            });
+
+            row.addView(col);
+            row.addView(sw);
+            if (entry.builtin) mBoxBuiltinCheats.addView(row);
+            else mBoxImportedCheats.addView(row);
+        }
+        if (importedCount == 0) {
+            TextView empty = new TextView(this);
+            empty.setText(R.string.cheats_imported_empty);
+            empty.setTextColor(Color.parseColor("#8A6A4A"));
+            empty.setTextSize(10.5f);
+            mBoxImportedCheats.addView(empty);
+        }
+        mUpdatingUi = false;
     }
 
     private void applyPresetFromUi(int preset, int toastResId) {
@@ -589,15 +779,23 @@ public final class LauncherActivity extends Activity {
         mSeekAudioVol.setProgress(mConfig.audioVolumePct);
         mTxtAudioVol.setText(getString(R.string.lbl_audio_vol_fmt, mConfig.audioVolumePct));
         mSwOverlay.setChecked(mConfig.overlayEnabled);
+        if (mSwFlexAnalog != null) mSwFlexAnalog.setChecked(mConfig.flexibleAnalog);
+        if (mSwAdaptiveBtn != null) mSwAdaptiveBtn.setChecked(mConfig.adaptiveButton);
         mSwRumble.setChecked(mConfig.rumbleEnabled);
         mSwFpsCounter.setChecked(mConfig.fpsCounter);
 
         mSwRobustAccess.setChecked(mConfig.robustAccess);
         mSwInlineResolve.setChecked(mConfig.inlineResolve);
+        mSwDeferredWait.setChecked(mConfig.deferredWait);
         mSwStrictBarriers.setChecked(mConfig.strictBarriers);
         mSwBcCache.setChecked(mConfig.bcDiskCache);
         mSpLowRam.setSelection(Math.max(0, Math.min(3, mConfig.lowRamMode)));
         mSpLowCostPp.setSelection(Math.max(0, Math.min(2, mConfig.lowCostPpMode)));
+        if (mSpShadowRate != null) mSpShadowRate.setSelection(Math.max(0, Math.min(3, mConfig.shadowRateMode)));
+        if (mSpScreenMode != null) mSpScreenMode.setSelection(Math.max(0, Math.min(2, mConfig.screenMode)));
+        if (mSpPadLayout != null) mSpPadLayout.setSelection(mConfig.padXboxLayout ? 1 : 0);
+        if (mSpSamsungSafe != null) mSpSamsungSafe.setSelection(Math.max(0, Math.min(2, mConfig.samsungSafeMode)));
+        if (mSwNativeSurfaceRes != null) mSwNativeSurfaceRes.setChecked(mConfig.nativeSurfaceRes);
         updatePresetHighlight();
         mUpdatingUi = false;
     }
@@ -606,6 +804,7 @@ public final class LauncherActivity extends Activity {
         int active = RuntimeConfigManager.detectQuickPreset(mConfig);
         stylePill(mBtnPresetAuto, active == RuntimeConfigManager.PRESET_AUTO);
         stylePill(mBtnPresetLow, active == RuntimeConfigManager.PRESET_LOW_END);
+        stylePill(mBtnPresetTurbo, active == RuntimeConfigManager.PRESET_TURBO);
         stylePill(mBtnPresetBalanced, active == RuntimeConfigManager.PRESET_BALANCED);
         stylePill(mBtnPresetHigh, active == RuntimeConfigManager.PRESET_HIGH);
     }
@@ -642,9 +841,16 @@ public final class LauncherActivity extends Activity {
         try {
             JSONObject j = new JSONObject(json);
             if (j.optBoolean("available", false)) {
-                sb.append("GPU : ").append(j.optString("gpu_name")).append("\n");
+                String gpuName = j.optString("gpu_name");
+                String vendorId = j.optString("vendor_id");
+                String devId = j.optString("device_id");
+                RuntimeConfigManager.saveDetectedGpuProfile(this, gpuName, vendorId, devId);
+                boolean bcFeat = j.optBoolean("bc_feature", false);
+                boolean bc7 = j.optBoolean("bc7_sampled", false);
+                sb.append("GPU : ").append(gpuName).append("\n");
                 sb.append("API : Vulkan ").append(j.optString("vulkan_api"))
                         .append(" (Drv ").append(j.optString("driver_version")).append(")\n");
+                sb.append("Tex : ").append((bcFeat && bc7) ? "Native BCn" : "CPU BC Decode + Cache").append("\n");
             } else {
                 sb.append(getString(R.string.gpu_not_available)).append("\n");
             }
@@ -1042,6 +1248,23 @@ public final class LauncherActivity extends Activity {
                     }, "mod-install").start())
                     .setNegativeButton(R.string.btn_cancel, null)
                     .show();
+        } else if (requestCode == REQ_IMPORT_CHEAT && data.getData() != null) {
+            final Uri src = data.getData();
+            new Thread(() -> {
+                try {
+                    CheatManager.ImportResult res = CheatManager.importCheatFile(this, src);
+                    runOnUiThread(() -> {
+                        refreshCheatsUi();
+                        String msg = res.buildIdMismatch
+                                ? getString(R.string.toast_cheat_imported_mismatch, res.fileName, res.cheatCount)
+                                : getString(R.string.toast_cheat_imported, res.fileName, res.cheatCount);
+                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+                    });
+                } catch (Exception e) {
+                    runOnUiThread(() -> Toast.makeText(this,
+                            getString(R.string.toast_cheat_import_fail, e.getMessage()), Toast.LENGTH_LONG).show());
+                }
+            }, "import-cheat").start();
         }
     }
 

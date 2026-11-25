@@ -256,9 +256,14 @@ void vk_init(void) {
     // imageless framebuffers need render pass 2 (gfx_vk_exec.c rp_get): core in 1.2, else its extension
     V.has_draw_count = v12 ? f12.drawIndirectCount : is_on(on, non, "VK_KHR_draw_indirect_count");
     V.has_imageless = v12 ? f12.imagelessFramebuffer : featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES)[0] && is_on(on, non, "VK_KHR_create_renderpass2");
-    if (!V.has_imageless && !V.has_dynrender) die("[vk] the device has neither dynamic rendering nor imageless framebuffers with render pass 2: passes cannot be begun");
+    V.use_classic_fb = 0;
+    if (!V.has_imageless && !V.has_dynrender) {
+        V.use_classic_fb = 1;
+        VKLOG("Vulkan %u.%u fallback: neither dynamicRendering nor imagelessFramebuffer — activating classic vkCreateRenderPass + cached VkFramebuffer",
+              VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion));
+    }
     if (!v13) VKLOG("Vulkan %u.%u device: %u extensions enabled for the features promoted to 1.2 / 1.3; dynamic rendering %s", VK_API_VERSION_MAJOR(V.props.apiVersion),
-                    VK_API_VERSION_MINOR(V.props.apiVersion), npromo, V.has_dynrender ? "yes" : "no (render pass objects only)");
+                    VK_API_VERSION_MINOR(V.props.apiVersion), npromo, V.has_dynrender ? "yes" : (V.use_classic_fb ? "no (classic VkRenderPass + VkFramebuffer)" : "no (render pass objects only)"));
     VkPhysicalDeviceCustomBorderColorFeaturesEXT fcb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT fr2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, &fcb};
     VkPhysicalDeviceDepthClipControlFeaturesEXT fdc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &fr2};
@@ -284,6 +289,24 @@ void vk_init(void) {
     V.has_custom_border = fcb.customBorderColors && has_ext(ex, ne, "VK_EXT_custom_border_color");
     V.has_robust2 = fr2.nullDescriptor && has_ext(ex, ne, "VK_EXT_robustness2");
     V.has_depth_clip_ctl = fdc.depthClipControl && has_ext(ex, ne, "VK_EXT_depth_clip_control");
+    // Samsung Xclipse Safe Render Path (DM_VK_SAMSUNG_SAFE, auto-ON on vendor 0x144D Xclipse 940/920):
+    // Mirrors exact Mali-safe feature set so 3D skinned characters render reliably on Exynos RDNA3:
+    // disables depth_clip_control, robustness2 nullDescriptor, dynamicRendering (plus disable_msaa=1 in gfx_vk_tex.c),
+    // and EXCLUSIVELY on vendor 0x144D disables timeline semaphores (switches to classic VkFence).
+    if (vk_samsung_safe()) {
+        V.has_depth_clip_ctl = 0; fdc.depthClipControl = 0;
+        V.has_robust2 = 0; fr2.nullDescriptor = 0; fr2.robustBufferAccess2 = 0; fr2.robustImageAccess2 = 0;
+        V.has_dynrender = 0; f13.dynamicRendering = 0;
+        featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES)[0] = 0;
+        if (!V.has_imageless) V.use_classic_fb = 1;
+        if (V.props.vendorID == 0x144Du) {
+            V.has_timeline = 0;
+            f12.timelineSemaphore = 0;
+            featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES)[0] = 0;
+        }
+        VKLOG("[samsung-safe] Xclipse isolated safe mode active (vendor=%#x dev=%s): msaa=1, depth_clip_control=0, robustness2=0, dynamicRendering=0, timeline=%d, def_wait=%d, inline_resolve=%d, strict_barriers=%d, classic_fb=%d",
+              V.props.vendorID, V.props.deviceName, V.has_timeline, vk_deferred_wait(), vk_inline_resolve(), vk_strict_barriers(), V.use_classic_fb);
+    }
     V.has_depth_bias_clamp = ff.features.depthBiasClamp ? 1 : 0;
     V.has_dtiming = has_ext(ex, ne, "VK_GOOGLE_display_timing");   // frame pacing on the display (gfx_vk_present.c pace_*)
     V.has_bc = ff.features.textureCompressionBC; V.has_astc = ff.features.textureCompressionASTC_LDR; V.has_gs = ff.features.geometryShader;
@@ -318,10 +341,16 @@ void vk_init(void) {
       V.sg_min = sc.minSubgroupSize ? sc.minSubgroupSize : sg.subgroupSize; V.sg_max = sc.maxSubgroupSize ? sc.maxSubgroupSize : sg.subgroupSize; V.sg_maxwgs = sc.maxComputeWorkgroupSubgroups;
       uint32_t pinnable = ctl ? sc.requiredSubgroupSizeStages : 0, st = pinnable & (VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
       VKLOG("subgroups: size %u (%u-%u), stages %#x, ops %#x, quad all stages %s, pinnable %#x", V.sg_size, V.sg_min, V.sg_max, V.sg_stages, V.sg_ops, V.sg_quad_all ? "yes" : "no", pinnable);
-      const char *e = getenv("DM_VK_SUBGROUP_PIN"); uint32_t pin = e ? (uint32_t)atoi(e) : 0;
+      const char *e = getenv("DM_VK_SUBGROUP_PIN"); uint32_t pin = (e && *e) ? (uint32_t)atoi(e) : 0;
+      // Samsung Xclipse 940 (AMD RDNA3, vendor 0x144d) and other Wave64 GPUs report subgroupSize=64 (32-64) with
+      // compute pinnable (0x20). Switch shaders are authored for Maxwell Warp32: auto-pin compute shaders to 32 lanes!
+      int auto_pin_cs = 0;
+      if (!e && V.sg_size > 32 && V.sg_min <= 32 && (pinnable & VK_SHADER_STAGE_COMPUTE_BIT)) {
+          pin = 32; st = VK_SHADER_STAGE_COMPUTE_BIT; auto_pin_cs = 1;
+      }
       if (pin && (!st || (pin & (pin - 1)) || pin < V.sg_min || pin > V.sg_max)) VKLOG("[RED] DM_VK_SUBGROUP_PIN=%u: the device cannot pin fragment or compute shaders to it (sizes %u-%u, pinnable stages %#x): the driver picks", pin, V.sg_min, V.sg_max, pinnable);
       else if (pin) { V.sg_pin_stages = st; V.sg_pin = (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, NULL, pin};
-                      VKLOG("subgroups: stages %#x pinned to %u lanes (DM_VK_SUBGROUP_PIN)", st, pin); } }
+                      VKLOG("subgroups: stages %#x pinned to %u lanes (%s, vendor=%#x)", st, pin, auto_pin_cs ? "auto Wave32 compute pin" : "DM_VK_SUBGROUP_PIN", V.props.vendorID); } }
     // Load memory tier (DM_LOW_RAM) & low-end Mali profile EARLY — BEFORE vkCreateDevice and unified policy —
     // so MSAA, render scale, texture downscale, and shader robustness are active from frame 0.
     int low_ram_early = vk_low_ram_tier();
@@ -376,13 +405,14 @@ void vk_init(void) {
     } while (0);
     VK_DEV_FNS(VK_LOADD)
     if (V.has_imageless && !vkCreateRenderPass2) {
-        VKLOG("[RED] [vk] imagelessFramebuffer reported but vkCreateRenderPass2(KHR) failed to load");
+        VKLOG("[vk] imagelessFramebuffer reported but vkCreateRenderPass2(KHR) failed to load: falling back to classic VkRenderPass + VkFramebuffer");
         V.has_imageless = 0;
-        if (!V.has_dynrender) die("[vk] neither vkCreateRenderPass2 nor dynamic rendering loaded");
+        if (!V.has_dynrender) V.use_classic_fb = 1;
     }
     if (V.has_dynrender && (!vkCmdBeginRendering || !vkCmdEndRendering)) {
         VKLOG("[vk] dynamicRendering reported but vkCmdBeginRendering(KHR) did not load: falling back to render pass objects");
         V.has_dynrender = 0;
+        if (!V.has_imageless) V.use_classic_fb = 1;
     }
     // A driver can report the timeline-semaphore feature (and Vulkan 1.3) and still export no vkWaitSemaphores: the emulator's ranchu / gfxstream driver does
     // (both the device and the instance dispatcher return null for it and for vkGetSemaphoreCounterValue), and the first wait then called address 0
@@ -416,15 +446,17 @@ void vk_init(void) {
         int ubwc_val = (ubwc_e && *ubwc_e) ? atoi(ubwc_e) : (vk_quirk(VQ_NO_UBWC) ? 0 : 3);
         const char *cbd_e = getenv("DM_VK_CB_DRAWS");
         int cbd_val = (cbd_e && *cbd_e) ? atoi(cbd_e) : ((vk_quirk(VQ_NO_CB_SPLIT) || pool_ovl) ? 0 : 128);
-        VKLOG("unified Mali+Adreno policy: vendor=%#x (%s), gpu_tier=%d, low_ram=%d, mali_low_end=%d, ultra_low_end=%d, bifrost_legacy=%d, bc_path=%s, zerocopy=%s, pool_cached=%d, readback_ranges=%d, disable_msaa=%d, inline_resolve=%d, low_cost_pp=%d, shadow_scale=%.2f, no_a2c=%d, depth_bias_clamp=%d, render_scale=%.2f, tex_downscale=1/%d, robust_access=%d, ubwc=%d, cb_draws=%d, pool_safe_sync=%d (safe1: hot=%d rb=%d d1k=%d), pool_overlap=%d, ubd_copyback=%d, dump_3d_frame=%d, strict_barriers=%d, emu_first_instance=%d",
-              V.props.vendorID, vk_driver_kind(), vk_gpu_tier(), low_ram_early, mali_low_early, vk_gpu_ultra_low_end(), vk_mali_bifrost_legacy(), V.has_bc ? "hardware-native (per-format verified)" : "cpu-bcdec+disk-cache",
-              (getenv("DM_VK_NO_ZEROCOPY") || mali_zc_off) ? "disabled (copied pools)" : "enabled", pool_cached, rb_ranges, no_msaa, vk_inline_resolve(), vk_low_cost_pp(), vk_shadow_scale(), no_a2c, V.has_depth_bias_clamp, rscale, tex_ds, en.robustBufferAccess ? 1 : 0, ubwc_val, cbd_val, safe_sync, vk_safe1_hot_blocks(), vk_safe1_rb_staged(), vk_safe1_diff1k(), pool_ovl, ubd_cb, dump_3d, strict_bar, emu_fi);
+        VKLOG("unified Mali+Adreno policy: vendor=%#x (%s), gpu_tier=%d, low_ram=%d, mali_low_end=%d, ultra_low_end=%d, bifrost_legacy=%d, samsung_safe=%d, classic_fb=%d, bc_path=%s, zerocopy=%s, pool_cached=%d, readback_ranges=%d, disable_msaa=%d, inline_resolve=%d, low_cost_pp=%d, shadow_scale=%.2f, shadow_rate=%d, no_a2c=%d, depth_bias_clamp=%d, render_scale=%.2f, tex_downscale=1/%d, robust_access=%d, ubwc=%d, cb_draws=%d, pool_safe_sync=%d (def_wait=%d safe1: hot=%d rb=%d d1k=%d), pool_overlap=%d, ubd_copyback=%d, dump_3d_frame=%d, strict_barriers=%d, emu_first_instance=%d",
+              V.props.vendorID, vk_driver_kind(), vk_gpu_tier(), low_ram_early, mali_low_early, vk_gpu_ultra_low_end(), vk_mali_bifrost_legacy(), vk_samsung_safe(), V.use_classic_fb, V.has_bc ? "hardware-native (per-format verified)" : "cpu-bcdec+disk-cache",
+              (getenv("DM_VK_NO_ZEROCOPY") || mali_zc_off) ? "disabled (copied pools)" : "enabled", pool_cached, rb_ranges, no_msaa, vk_inline_resolve(), vk_low_cost_pp(), vk_shadow_scale(), vk_shadow_rate(), no_a2c, V.has_depth_bias_clamp, rscale, tex_ds, en.robustBufferAccess ? 1 : 0, ubwc_val, cbd_val, safe_sync, vk_deferred_wait(), vk_safe1_hot_blocks(), vk_safe1_rb_staged(), vk_safe1_diff1k(), pool_ovl, ubd_cb, dump_3d, strict_bar, emu_fi);
     }
     if (mem_diag_on()) VKLOG("[memdiag] enabled storage-image features: extended-formats %s, read-without-format %s, write-without-format %s",
         en.shaderStorageImageExtendedFormats ? "yes" : "no", en.shaderStorageImageReadWithoutFormat ? "yes" : "no", en.shaderStorageImageWriteWithoutFormat ? "yes" : "no");
     slots_init();
+    vk_bad_pipes_init();
     completion_start();
     memlog_start();
+    { void vk_wd_start(void); vk_wd_start(); }
     { void crash_handlers_check(const char *when); crash_handlers_check("after the Vulkan device was made"); }   // (again at present 600, gfx_vk_present.c: the shader compiler loads with the first pipelines)
 }
 const void *vk_sg_pin(VkShaderStageFlagBits stage, const uint32_t *local) {
@@ -458,6 +490,289 @@ int vk_pool_safe_sync(void) {
     }
     return v;
 }
+static int vk_has_device_lost_marker(void);
+int vk_samsung_safe(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_VK_SAMSUNG_SAFE");
+        if (e && *e && strcmp(e, "auto") != 0) v = atoi(e) != 0;
+        else v = (V.props.vendorID == 0x144Du) ? 1 : 0;   // Auto-ON on Samsung Xclipse (AMD RDNA3/2 0x144D)
+    }
+    return v;
+}
+int vk_deferred_wait(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_VK_DEFERRED_WAIT");
+        if (e && *e) v = atoi(e) != 0;
+        else if (vk_has_device_lost_marker()) v = 0;
+        else if (V.props.vendorID == 0x144Du) v = 0;   // Samsung Xclipse (0x144d) EXCLUSIVE: pure serial avoids RDNA3 async fence/pool TDR
+        else if (V.props.vendorID == 0x13B5u && V.props.driverVersion <= 0x08001000u) v = 0;   // Legacy Mali <= 32.1.0 (G76/G57/G52): pure serial avoids 21s submit hangs
+        else v = 1;   // Modern Mali (>= 40.x/49.x) & Adreno: safe CPU+GPU pipelining via per-slot s->up + rb_staged
+    }
+    return v;
+}
+// ---- Last-Submitted Diagnostic Snapshot & 5-second Render-Thread Watchdog (v1.1.2-hybrid36) ----
+extern uint64_t g_tex_frame;
+static pthread_mutex_t g_diag_mu = PTHREAD_MUTEX_INITIALIZER;
+void vk_diag_note_draw(uint64_t vs, uint64_t fs, uint64_t gs) {
+    V.cur_sub_diag.draws++;
+    if (vs) V.cur_sub_diag.last_vs = vs;
+    if (fs) V.cur_sub_diag.last_fs = fs;
+    if (gs) V.cur_sub_diag.last_gs = gs;
+}
+void vk_diag_note_dispatch(uint64_t cs) {
+    V.cur_sub_diag.dispatches++;
+    if (cs) V.cur_sub_diag.last_cs = cs;
+}
+void vk_diag_note_new_pipe(uint64_t vs, uint64_t fs, uint64_t gs) {
+    pthread_mutex_lock(&g_diag_mu);
+    if (V.cur_sub_diag.n_new_pipes < 8u) {
+        uint32_t i = V.cur_sub_diag.n_new_pipes++;
+        V.cur_sub_diag.new_pipes[i].vs = vs;
+        V.cur_sub_diag.new_pipes[i].fs = fs;
+        V.cur_sub_diag.new_pipes[i].gs = gs;
+    }
+    pthread_mutex_unlock(&g_diag_mu);
+}
+static void vk_diag_format_pipes(const vk_sub_diag_t *d, char *buf, size_t nbuf) {
+    if (!d || !d->n_new_pipes) { snprintf(buf, nbuf, "none"); return; }
+    size_t o = 0;
+    uint32_t cnt = d->n_new_pipes > 8u ? 8u : d->n_new_pipes;
+    for (uint32_t i = 0; i < cnt && o + 56 < nbuf; i++) {
+        o += (size_t)snprintf(buf + o, nbuf - o, "%s(%016llx/%016llx/%016llx)",
+            i ? "," : "",
+            (unsigned long long)d->new_pipes[i].vs,
+            (unsigned long long)d->new_pipes[i].fs,
+            (unsigned long long)d->new_pipes[i].gs);
+    }
+}
+static int g_wd_phase = VK_WD_IDLE;
+static uint64_t g_wd_since_ns = 0, g_wd_vs = 0, g_wd_fs = 0;
+static inline uint64_t wd_now_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+void vk_wd_enter(int phase, uint64_t vs, uint64_t fs) {
+    __atomic_store_n(&g_wd_vs, vs, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wd_fs, fs, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wd_since_ns, wd_now_ns(), __ATOMIC_RELEASE);
+    __atomic_store_n(&g_wd_phase, phase, __ATOMIC_RELEASE);
+}
+void vk_wd_leave(void) {
+    __atomic_store_n(&g_wd_phase, VK_WD_IDLE, __ATOMIC_RELEASE);
+}
+static const char *wd_phase_name(int ph) {
+    switch (ph) {
+        case VK_WD_ACQUIRE_IMAGE:    return "ACQUIRE_IMAGE";
+        case VK_WD_POOL_UPLOAD:      return "POOL_UPLOAD";
+        case VK_WD_REPLAY_DRAW:      return "REPLAY_DRAW";
+        case VK_WD_PIPELINE_COMPILE: return "PIPELINE_COMPILE";
+        case VK_WD_VK_SUBMIT:        return "VK_SUBMIT";
+        case VK_WD_FENCE_WAIT:       return "FENCE_WAIT";
+        case VK_WD_PRESENT:          return "PRESENT";
+        case VK_WD_POOL_READBACK:    return "POOL_READBACK";
+        default:                     return "IDLE";
+    }
+}
+// ---- Persistent Bad-Shader Guard & Worker Compile Watchdog for Mali <= 32.1.0 (v1.1.2-hybrid37) ----
+enum { BAD_PIPE_MAX = 256 };
+static struct { uint64_t vs, fs; int logged; } g_bad_pipes[BAD_PIPE_MAX];
+static int g_nbad_pipes = 0;
+static pthread_mutex_t g_bad_pipe_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_wd_w_active = 0;
+static uint64_t g_wd_w_since_ns = 0, g_wd_w_vs = 0, g_wd_w_fs = 0;
+
+static void bad_pipe_insert_mem_locked(uint64_t vs, uint64_t fs) {
+    if (!vs && !fs) return;
+    for (int i = 0; i < g_nbad_pipes; i++) {
+        if (g_bad_pipes[i].vs == vs && g_bad_pipes[i].fs == fs) return;
+    }
+    if (g_nbad_pipes < BAD_PIPE_MAX) {
+        g_bad_pipes[g_nbad_pipes].vs = vs;
+        g_bad_pipes[g_nbad_pipes].fs = fs;
+        g_bad_pipes[g_nbad_pipes].logged = 0;
+        g_nbad_pipes++;
+    }
+}
+static void bad_pipe_append_disk(uint32_t drv, uint64_t vs, uint64_t fs) {
+    const char *root = getenv("DM_ROOT");
+    if (!root || !*root) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/bad_pipelines.txt", root);
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "%#x %016llx %016llx\n", drv, (unsigned long long)vs, (unsigned long long)fs);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+}
+void vk_bad_pipe_add(uint64_t vs, uint64_t fs, const char *reason) {
+    if (!vk_mali_legacy_r32()) return;
+    int is_new = 0;
+    pthread_mutex_lock(&g_bad_pipe_mu);
+    int prev = g_nbad_pipes;
+    bad_pipe_insert_mem_locked(vs, fs);
+    is_new = (g_nbad_pipes > prev);
+    pthread_mutex_unlock(&g_bad_pipe_mu);
+    if (is_new) {
+        bad_pipe_append_disk(V.props.driverVersion, vs, fs);
+        VKLOG("[vk] blacklisted bad shader pair (%s): drv=%#x vs=%016llx fs=%016llx -> bad_pipelines.txt",
+              reason ? reason : "hang", V.props.driverVersion, (unsigned long long)vs, (unsigned long long)fs);
+    }
+}
+int vk_bad_pipe_check(uint64_t vs, uint64_t fs) {
+    if (!vk_mali_legacy_r32()) return 0;
+    int hit = 0, do_log = 0;
+    pthread_mutex_lock(&g_bad_pipe_mu);
+    for (int i = 0; i < g_nbad_pipes; i++) {
+        if (g_bad_pipes[i].vs == vs && g_bad_pipes[i].fs == fs) {
+            hit = 1;
+            if (!g_bad_pipes[i].logged) { g_bad_pipes[i].logged = 1; do_log = 1; }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_bad_pipe_mu);
+    if (do_log) {
+        VKLOG("[vk] skipped blacklisted shader vs=%016llx fs=%016llx (drv=%#x)",
+              (unsigned long long)vs, (unsigned long long)fs, V.props.driverVersion);
+    }
+    return hit;
+}
+void vk_bad_pipes_init(void) {
+    if (!vk_mali_legacy_r32()) return;
+    const char *root = getenv("DM_ROOT");
+    if (root && *root) {
+        char tmp_path[1024], bad_path[1024];
+        snprintf(tmp_path, sizeof tmp_path, "%s/compiling_pipeline.tmp", root);
+        snprintf(bad_path, sizeof bad_path, "%s/bad_pipelines.txt", root);
+        // 1. Recover any previous run killed/hung mid-compile: move compiling_pipeline.tmp -> bad_pipelines.txt
+        FILE *tf = fopen(tmp_path, "r");
+        if (tf) {
+            unsigned int drv = 0;
+            unsigned long long vs = 0, fs = 0;
+            if (fscanf(tf, "%x %llx %llx", &drv, &vs, &fs) == 3 && (vs || fs)) {
+                VKLOG("[vk] detected interrupted compile in compiling_pipeline.tmp (drv=%#x vs=%016llx fs=%016llx) -> promoting to bad_pipelines.txt",
+                      drv, vs, fs);
+                bad_pipe_append_disk((uint32_t)drv, (uint64_t)vs, (uint64_t)fs);
+            }
+            fclose(tf);
+            unlink(tmp_path);
+        }
+        // 2. Load persistent bad_pipelines.txt entries matching this Mali driver
+        FILE *bf = fopen(bad_path, "r");
+        if (bf) {
+            char line[256];
+            pthread_mutex_lock(&g_bad_pipe_mu);
+            while (fgets(line, sizeof line, bf)) {
+                unsigned int drv = 0;
+                unsigned long long vs = 0, fs = 0;
+                if (sscanf(line, "%x %llx %llx", &drv, &vs, &fs) == 3) {
+                    if (drv == 0 || drv == V.props.driverVersion) {
+                        bad_pipe_insert_mem_locked((uint64_t)vs, (uint64_t)fs);
+                    }
+                }
+            }
+            pthread_mutex_unlock(&g_bad_pipe_mu);
+            fclose(bf);
+        }
+    }
+    // 3. Pre-seed known Mali r32p1 (0x08001000) hang pair (passthrough 0-output VS + 3-MRT OpKill FS)
+    //    unless explicitly disabled for A/B testing via DM_VK_ALLOW_BAD_PIPES=1.
+    const char *allow = getenv("DM_VK_ALLOW_BAD_PIPES");
+    if (!(allow && atoi(allow) != 0)) {
+        pthread_mutex_lock(&g_bad_pipe_mu);
+        bad_pipe_insert_mem_locked(0x2a27276db82273d7ull, 0x48736f6b5e6c55e3ull);
+        pthread_mutex_unlock(&g_bad_pipe_mu);
+    }
+    VKLOG("[vk] Mali <= 32.1.0 bad-shader guard active (drv=%#x): %d blacklisted pair(s), 100%% non-blocking async compile ON",
+          V.props.driverVersion, g_nbad_pipes);
+}
+void vk_pipe_worker_begin(uint64_t vs, uint64_t fs) {
+    if (!vk_mali_legacy_r32()) return;
+    const char *root = getenv("DM_ROOT");
+    if (root && *root) {
+        char tmp_path[1024];
+        snprintf(tmp_path, sizeof tmp_path, "%s/compiling_pipeline.tmp", root);
+        FILE *f = fopen(tmp_path, "w");
+        if (f) {
+            fprintf(f, "%#x %016llx %016llx\n", V.props.driverVersion, (unsigned long long)vs, (unsigned long long)fs);
+            fflush(f);
+            fsync(fileno(f));
+            fclose(f);
+        }
+    }
+    __atomic_store_n(&g_wd_w_vs, vs, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wd_w_fs, fs, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wd_w_since_ns, wd_now_ns(), __ATOMIC_RELEASE);
+    __atomic_store_n(&g_wd_w_active, 1, __ATOMIC_RELEASE);
+}
+void vk_pipe_worker_end(void) {
+    if (!vk_mali_legacy_r32()) return;
+    __atomic_store_n(&g_wd_w_active, 0, __ATOMIC_RELEASE);
+    const char *root = getenv("DM_ROOT");
+    if (root && *root) {
+        char tmp_path[1024];
+        snprintf(tmp_path, sizeof tmp_path, "%s/compiling_pipeline.tmp", root);
+        unlink(tmp_path);
+    }
+}
+static void *vk_wd_main(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "vk watchdog");
+    uint64_t last_log_ns = 0;
+    uint64_t last_w_vs = 0, last_w_fs = 0;
+    for (;;) {
+        sleep(1);
+        uint64_t now = wd_now_ns();
+        // Check background pipeline compiler worker hang (> 8s on Mali <= 32.1.0 -> auto-blacklist to bad_pipelines.txt)
+        if (__atomic_load_n(&g_wd_w_active, __ATOMIC_ACQUIRE) && vk_mali_legacy_r32()) {
+            uint64_t wsince = __atomic_load_n(&g_wd_w_since_ns, __ATOMIC_ACQUIRE);
+            if (wsince && now > wsince && (now - wsince) >= 8000000000ull) {
+                uint64_t wvs = __atomic_load_n(&g_wd_w_vs, __ATOMIC_RELAXED);
+                uint64_t wfs = __atomic_load_n(&g_wd_w_fs, __ATOMIC_RELAXED);
+                if (wvs != last_w_vs || wfs != last_w_fs) {
+                    last_w_vs = wvs; last_w_fs = wfs;
+                    vk_bad_pipe_add(wvs, wfs, "watchdog_worker_hang_8s");
+                    VKLOG("[WATCHDOG] WORKER PIPELINE_COMPILE HANG >8s (elapsed=%.1fs) vs=%016llx fs=%016llx drv=%#x -> recorded in bad_pipelines.txt (render thread stays unblocked)",
+                          (double)(now - wsince) / 1e9, (unsigned long long)wvs, (unsigned long long)wfs, V.props.driverVersion);
+                    fflush(stderr);
+                }
+            }
+        } else {
+            last_w_vs = 0; last_w_fs = 0;
+        }
+        int ph = __atomic_load_n(&g_wd_phase, __ATOMIC_ACQUIRE);
+        if (ph == VK_WD_IDLE) { last_log_ns = 0; continue; }
+        uint64_t since = __atomic_load_n(&g_wd_since_ns, __ATOMIC_ACQUIRE);
+        if (since && now > since && (now - since) >= 5000000000ull) {
+            if (!last_log_ns || (now - last_log_ns) >= 5000000000ull) {
+                last_log_ns = now;
+                uint64_t vs = __atomic_load_n(&g_wd_vs, __ATOMIC_RELAXED);
+                uint64_t fs = __atomic_load_n(&g_wd_fs, __ATOMIC_RELAXED);
+                uint64_t fr = __atomic_load_n(&g_tex_frame, __ATOMIC_RELAXED);
+                vk_sub_diag_t d;
+                pthread_mutex_lock(&g_diag_mu);
+                d = V.last_sub_diag;
+                pthread_mutex_unlock(&g_diag_mu);
+                char pbuf[512];
+                vk_diag_format_pipes(&d, pbuf, sizeof pbuf);
+                uint64_t dvs = vs ? vs : d.last_vs;
+                uint64_t dfs = fs ? fs : d.last_fs;
+                VKLOG("[WATCHDOG] RENDER HANG >5s in phase=%s elapsed=%.1fs frame=%llu (sub_frame=%llu fence=%llu draws=%u passes=%u dispatches=%u) vs=%016llx fs=%016llx gs=%016llx cs=%016llx new_pipes[%u]=%s dev=%s drv=%#x",
+                      wd_phase_name(ph), (double)(now - since) / 1e9, (unsigned long long)fr,
+                      (unsigned long long)d.frame, (unsigned long long)d.fence, d.draws, d.passes, d.dispatches,
+                      (unsigned long long)dvs, (unsigned long long)dfs, (unsigned long long)d.last_gs, (unsigned long long)d.last_cs,
+                      d.n_new_pipes, pbuf, V.props.deviceName, V.props.driverVersion);
+                fflush(stderr);
+            }
+        }
+    }
+    return NULL;
+}
+void vk_wd_start(void) {
+    static int started;
+    if (started++) return;
+    pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_create(&th, &a, vk_wd_main, NULL);
+    pthread_attr_destroy(&a);
+}
 int vk_safe1_hot_blocks(void) {
     static int v = -1;
     // Default 0: hot_blocks PROT_RW bypassed dirty tracking and caused shadow/red flicker.
@@ -477,7 +792,11 @@ int vk_safe1_diff1k(void) {
 }
 int vk_inline_resolve(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("DM_VK_INLINE_RESOLVE"); v = (e && *e) ? (atoi(e) != 0) : 1; }
+    if (v < 0) {
+        const char *e = getenv("DM_VK_INLINE_RESOLVE");
+        // Mali-TBDR inline MSAA resolve is not beneficial on Samsung Xclipse AMD RDNA3 (0x144D); default off on Xclipse.
+        v = (e && *e) ? (atoi(e) != 0) : (V.props.vendorID == 0x144Du ? 0 : 1);
+    }
     return v;
 }
 static pthread_mutex_t g_pipe_compile_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -485,6 +804,11 @@ int vk_mali_legacy_compiler(void) {
     // ARM Mali (0x13B5) Vulkan 1.1 or driver < 40.0 (e.g. Mali-G57 r32p1 = 0x08001000):
     // concurrent vkCreate*Pipelines across vk present + vk compute warm crashes in libGLES_mali.so (SIGSEGV).
     return V.props.vendorID == 0x13B5u && (V.props.apiVersion < VK_API_VERSION_1_2 || V.props.driverVersion < 0x0A000000u);
+}
+int vk_mali_legacy_r32(void) {
+    // ARM Mali driver <= 32.1.0 (0x08001000: Mali-G76 SM-G975F, Mali-G57 r32p1, Mali-G52 r26p0).
+    // Modern Mali (e.g. Mali-G720 49.1.0 = 0x0C401000), Adreno (0x5143), and Xclipse (0x144d) return 0!
+    return V.props.vendorID == 0x13B5u && V.props.driverVersion > 0u && V.props.driverVersion <= 0x08001000u;
 }
 int vk_mali_bifrost_legacy(void) {
     // ARM Mali Bifrost driver < 32.0 (0x08000000; e.g. Mali-G52 MC2 driver 26.0.0 = 0x06800000 on vivo V2109):
@@ -496,15 +820,30 @@ int vk_mali_old_driver(void) {
     // Xiaomi Mali-G720 MC7 driver 49.1.0 (0x0C401000) is >= 0x0C400000 -> modern driver.
     return V.props.vendorID == 0x13B5u && (V.props.apiVersion < VK_API_VERSION_1_2 || V.props.driverVersion < 0x0C400000u);
 }
+static int vk_adreno_640_650(void) {
+    if (V.props.vendorID != 0x5143u) return 0;
+    const char *nm = V.props.deviceName;
+    return V.props.deviceID == 0x6050002u || V.props.deviceID == 0x6040001u ||
+           strstr(nm, "Adreno (TM) 650") != NULL || strstr(nm, "Adreno (TM) 640") != NULL;
+}
+static int vk_adreno_618_619(void) {
+    if (V.props.vendorID != 0x5143u) return 0;
+    const char *nm = V.props.deviceName;
+    return V.props.deviceID == 0x6010800u || V.props.deviceID == 0x6010900u ||
+           strstr(nm, "Adreno (TM) 618") != NULL || strstr(nm, "Adreno (TM) 619") != NULL;
+}
 int vk_gpu_tier(void) {
     // 4-tier automatic mobile GPU & RAM classifier:
     //   0 = Flagship / Upper-Mid (Mali-G720/G715/G710/G78, Adreno 730+, Xclipse, >=6 GB): 1.00x, MSAA 2x, Tex 1/1
-    //   1 = Mid-Range / Helio G90T (Mali-G76/G68/G610, Adreno 642/650/710): 0.75x, MSAA OFF, Shadow 0.50x, Low-Cost PP, Tex 1/1 -> 60 FPS
-    //   2 = Low-End / Helio G99 (Mali-G57 MC2+, Adreno 618/619, or 4 GB RAM): 0.67x, MSAA OFF, Shadow 0.50x, Low-Cost PP, Tex 1/2 -> 60 FPS
-    //   3 = Ultra Low-End / Below G90 (Mali-G52/G51/G31, Mali-G57 MC1, Adreno 610/612/5xx, PowerVR, or <=3.5 GB RAM): 0.50x, MSAA OFF, Shadow 0.50x, Low-Cost PP, Tex 1/2 -> 30 FPS Stabil
+    //   1 = Mid-Range / Upper-Mid Adreno 6xx (Adreno 650/640 0.85x + shadow 0.75x; Mali-G76/G68/G610 0.75x + shadow 0.50x): MSAA OFF, Low-Cost PP OFF, Tex 1/1 -> 60 FPS
+    //   2 = Low-End / Mid Adreno 6xx (Adreno 618/619 0.65x; Mali-G57 MC2 0.55x / MC3+ 0.67x; or 4 GB RAM): MSAA OFF, Shadow 0.50x 30Hz, Low-Cost PP ON, Tex 1/2
+    //   3 = Ultra Low-End (Adreno 610 0x6010001, Mali-G52/G51/G31, Mali-G57 MC1, PowerVR, or <=3.5 GB RAM): 0.50x, MSAA OFF, Shadow 0.50x 30Hz, Low-Cost PP ON, Tex 1/2
     if (!V.props.deviceName[0]) return 0;
     static int tier = -1;
     if (tier >= 0) return tier;
+    // Samsung Xclipse (0x144d, Galaxy S22/S23/S24/S25 RDNA2/RDNA3): always flagship Tier 0
+    // (1.00x render scale, 1.00x shadow 60Hz, low_cost_pp=0, tex 1/1). Mali & Adreno untouched!
+    if (V.props.vendorID == 0x144Du) { tier = 0; return tier; }
     const char *nm = V.props.deviceName;
     int ram_t = vk_low_ram_tier();
     int is_ultra = (ram_t >= 2) ||
@@ -512,22 +851,34 @@ int vk_gpu_tier(void) {
                    strstr(nm, "Mali-G31") != NULL || strstr(nm, "Mali-T") != NULL ||
                    (strstr(nm, "Mali-G57") != NULL && (strstr(nm, "MC1") != NULL || (V.sg_size > 0 && V.sg_size <= 4))) ||
                    strstr(nm, "PowerVR") != NULL || V.props.vendorID == 0x1010u ||
+                   V.props.deviceID == 0x6010001u ||
                    strstr(nm, "Adreno (TM) 610") != NULL || strstr(nm, "Adreno (TM) 612") != NULL ||
                    strstr(nm, "Adreno (TM) 5") != NULL || strstr(nm, "Adreno (TM) 4") != NULL ||
                    strstr(nm, "Adreno (TM) 3") != NULL;
     if (is_ultra) { tier = 3; return tier; }
-    int is_mid = strstr(nm, "Mali-G76") != NULL || strstr(nm, "Mali-G77") != NULL ||
+    int is_mid = strstr(nm, "Mali-G76") != NULL || V.props.deviceID == 0x72110000u ||
+                 strstr(nm, "Mali-G77") != NULL ||
                  strstr(nm, "Mali-G68") != NULL || strstr(nm, "Mali-G610") != NULL ||
-                 strstr(nm, "Adreno (TM) 642") != NULL || strstr(nm, "Adreno (TM) 650") != NULL ||
+                 vk_adreno_640_650() ||
+                 strstr(nm, "Adreno (TM) 642") != NULL ||
                  strstr(nm, "Adreno (TM) 660") != NULL || strstr(nm, "Adreno (TM) 710") != NULL ||
                  strstr(nm, "Adreno (TM) 720") != NULL;
+    // Keep Mid-High GPUs (e.g. Mali-G76 0x72110000, Adreno 650/640) in Tier 1 even if low_ram==1!
+    if (is_mid) { tier = 1; return tier; }
     int is_low = (ram_t == 1) ||
                  strstr(nm, "Mali-G57") != NULL ||
-                 strstr(nm, "Adreno (TM) 618") != NULL || strstr(nm, "Adreno (TM) 619") != NULL ||
-                 (!is_mid && V.props.vendorID == 0x13B5u && ((V.sg_size > 0 && V.sg_size <= 8) || V.props.driverVersion < 0x0A000000u));
+                 vk_adreno_618_619() ||
+                 (V.props.vendorID == 0x13B5u && ((V.sg_size > 0 && V.sg_size <= 8) || V.props.driverVersion < 0x0A000000u));
     if (is_low) { tier = 2; return tier; }
-    tier = is_mid ? 1 : 0;
+    tier = 0;
     return tier;
+}
+static int vk_mali_g57_mc2(void) {
+    const char *nm = V.props.deviceName;
+    if (!nm[0]) return 0;
+    if (strstr(nm, "Mali-G57 MC2") != NULL) return 1;
+    // Mali-G57 Vulkan 1.1 drivers (r32p1 / Helio G99 / Dimensity 6080 / 6100+ / Unisoc T760) are 2-core MC2 class
+    return strstr(nm, "Mali-G57") != NULL && VK_API_VERSION_MINOR(V.props.apiVersion) < 3;
 }
 int vk_mali_low_end(void) {
     // Returns 1 for Mid-Range / Low-End / Ultra Low-End GPUs (Tier >= 1) where auto MSAA is disabled.
@@ -542,7 +893,7 @@ int vk_low_cost_pp(void) {
     if (v < 0) {
         const char *e = getenv("DM_VK_LOW_COST_PP");
         if (e && *e && strcmp(e, "auto") != 0) v = atoi(e) != 0;
-        else v = (vk_gpu_tier() >= 1) ? 1 : 0;   // Active on Mid-Range, Low-End & Ultra Low-End (Tier 1-3) for 60 FPS push
+        else v = (vk_gpu_tier() >= 2) ? 1 : 0;   // Active on Low-End & Ultra Low-End (Tier 2-3: Mali-G57 MC2 / Mali-G52); off on Tier 0-1 (Flagship / Mali-G76)
     }
     return v;
 }
@@ -556,11 +907,24 @@ float vk_shadow_scale(void) {
     } else {
         int gt = vk_gpu_tier();
         // 4-tier shadow target resolution policy:
-        //   Tier 0 (Flagship): 1.00x | Tier 1-3 (Mid-Range / Low-End / Ultra Low-End): 0.50x (1024x1024 -> 512x512, 75% less shadow fillrate)
-        sc = (gt >= 1) ? 0.50f : 1.0f;
+        //   Tier 0 (Flagship): 1.00x | Adreno 640/650 Tier 1: 0.75x | Other Tier 1-3: 0.50x (75% less shadow fillrate)
+        sc = (gt == 0) ? 1.0f : (gt == 1 && vk_adreno_640_650()) ? 0.75f : 0.50f;
     }
     if (sc > 0.995f) sc = 1.0f;
     return sc;
+}
+int vk_shadow_rate(void) {
+    static int r = -1;
+    if (r >= 0) return r;
+    const char *e = getenv("DM_VK_SHADOW_RATE");
+    if (e && *e && strcmp(e, "auto") != 0) {
+        int v = atoi(e);
+        r = v <= 0 ? 0 : (v >= 2 ? 2 : 1);
+    } else {
+        // Auto: 30Hz half-rate shadows on Tier >= 2 (Mali-G57/G52/Adreno 618), full 60Hz on Tier 0-1
+        r = (vk_gpu_tier() >= 2) ? 2 : 1;
+    }
+    return r;
 }
 int vk_low_ram_tier(void) {
     static int tier = -1;
@@ -574,9 +938,17 @@ int vk_low_ram_tier(void) {
     }
     long pages = sysconf(_SC_PHYS_PAGES), psize = sysconf(_SC_PAGE_SIZE);
     uint64_t total_mb = (pages > 0 && psize > 0) ? ((uint64_t)pages * (uint64_t)psize) >> 20 : 8192;
-    tier = total_mb <= 3584 ? 2 : (total_mb <= 5632 ? 1 : 0);
+    // Samsung Xclipse (0x144d) EXCLUSIVE: Exynos DMA carveouts can reduce _SC_PHYS_PAGES to <= 6144 MiB on 8 GB phones.
+    // Keep Xclipse at standard RAM tier 0 whenever >= 5500 MiB is visible. Mali & Adreno thresholds untouched!
+    if (V.props.vendorID == 0x144Du && total_mb >= 5500ull) {
+        tier = 0;
+        VKLOG("memory tier: 0 (Xclipse 0x144d flagship override: %llu MiB visible RAM)", (unsigned long long)total_mb);
+        return tier;
+    }
+    // Trim RAM (< 1.8 GB target on 4-6 GB phones): <=3.75 GB -> tier 2, <=6.0 GB -> tier 1, >6 GB -> tier 0
+    tier = total_mb <= 3840 ? 2 : (total_mb <= 6144 ? 1 : 0);
     VKLOG("memory tier: %d (auto-detected %llu MiB RAM: %s)", tier, (unsigned long long)total_mb,
-          tier == 2 ? "ultra low-RAM <=3.5 GB" : tier == 1 ? "low-RAM 4 GB Anti-LMK" : "standard >=6 GB");
+          tier == 2 ? "ultra low-RAM <=3.8 GB" : tier == 1 ? "low-RAM 4-6 GB Anti-LMK" : "standard >6 GB");
     return tier;
 }
 float vk_render_scale(void) {
@@ -588,10 +960,13 @@ float vk_render_scale(void) {
         sc = (v >= 0.45f && v <= 1.0f) ? v : 1.0f;
     } else {
         int gt = vk_gpu_tier();
-        if (gt >= 3) sc = 0.50f;       // Ultra Low-End (Mali-G52, Adreno 610/612, <=4 GB) -> 640x360 3D, UI 720p crisp
-        else if (gt == 2) sc = 0.67f;  // Low-End (Mali-G57 MC2, Adreno 618/619, 4-6 GB) -> 858x482 3D -> crisp & fast
-        else if (gt == 1) sc = 0.75f;  // Mid-Range (Mali-G76/G68/G610, Adreno 642/650/710) -> 960x540 3D -> locked 60 FPS
-        else sc = 1.0f;                // Flagship (Mali-G720/G715, Adreno 730+) -> 1280x720 native
+        if (gt >= 3) sc = 0.50f;                     // Ultra Low-End (Adreno 610, Mali-G52, <=3.5 GB) -> 640x360 3D, UI 720p crisp
+        else if (gt == 2 && vk_mali_g57_mc2()) sc = 0.55f; // Mali-G57 MC2 (2-core, e.g. RMX3636 / Helio G99) -> 704x396 3D for 45-60 FPS push
+        else if (gt == 2 && vk_adreno_618_619()) sc = 0.65f; // Adreno 618/619 (M2101K6G / SM-M236B) -> 832x468 3D + 30Hz shadow
+        else if (gt == 2) sc = 0.67f;                // Low-End (Mali-G57 MC3+, 4-6 GB) -> 858x482 3D
+        else if (gt == 1 && vk_adreno_640_650()) sc = 0.85f; // Adreno 640/650 (SD 855/865/870) -> 1088x612 3D -> crisp 60 FPS
+        else if (gt == 1) sc = 0.75f;                // Mid-Range (Mali-G76/G68/G610, Adreno 642/710) -> 960x540 3D -> locked 60 FPS
+        else sc = 1.0f;                              // Flagship (Mali-G720/G715, Adreno 730+, Xclipse 940) -> 1280x720 native
     }
     if (sc > 0.995f) sc = 1.0f;
     return sc;
@@ -623,10 +998,13 @@ static int vk_has_device_lost_marker(void) {
     return seen;
 }
 void vk_pipe_compile_lock(void) {
-    if (vk_mali_legacy_compiler()) pthread_mutex_lock(&g_pipe_compile_mu);
+    pthread_mutex_lock(&g_pipe_compile_mu);
+}
+int vk_pipe_compile_trylock(void) {
+    return pthread_mutex_trylock(&g_pipe_compile_mu) == 0;
 }
 void vk_pipe_compile_unlock(void) {
-    if (vk_mali_legacy_compiler()) pthread_mutex_unlock(&g_pipe_compile_mu);
+    pthread_mutex_unlock(&g_pipe_compile_mu);
 }
 int vk_pool_overlap(void) {
     static int v = -1;
@@ -662,7 +1040,11 @@ int vk_dump_3d_frame(void) {
 }
 int vk_strict_barriers(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("DM_VK_STRICT_BARRIERS"); v = (e && *e) ? (atoi(e) != 0) : 0; }
+    if (v < 0) {
+        const char *e = getenv("DM_VK_STRICT_BARRIERS");
+        // Default 1 EXCLUSIVELY on Samsung Xclipse (0x144d); Mali & Adreno stay 0!
+        v = (e && *e) ? (atoi(e) != 0) : (V.props.vendorID == 0x144Du ? 1 : 0);
+    }
     return v;
 }
 int vk_emu_first_instance(void) {
@@ -690,6 +1072,7 @@ void vk_sub_timing_snapshot(uint64_t out[7]) {
 }
 static uint64_t g_rb_seen, g_rb_narrowed;
 static uint64_t g_ovl_used, g_ovl_skip_off, g_ovl_skip_rb, g_ovl_skip_init, g_ovl_skip_conflict, g_rb_staged_cnt;
+static uint64_t g_defwait_saved_ns, g_hot16_last;
 static pthread_mutex_t g_baseline_mu = PTHREAD_MUTEX_INITIALIZER;   // guards p->baseline between vk_pools_sync/vk_ubd_land and completion_main's pool_merge_back
 
 // ---------------- memory pools ----------------
@@ -737,14 +1120,59 @@ static cpfree_t g_cpf[CPF_N]; static int g_ncpf; static uint64_t g_cpf_bytes, g_
 static pthread_mutex_t g_cpf_mu = PTHREAD_MUTEX_INITIALIZER;
 static int zcf_on(void);
 uint64_t mtl_last_fence(void);
+// Non-blocking fence-tagged deferred retire queue for pool buffers (pool_drop & cpf):
+// Every retired VkBuffer + VkDeviceMemory is tagged with retire_fence = V.sub_seq + 3 and ONLY
+// destroyed non-blockingly once V.completed_seq >= retire_fence. ZERO vkQueueWaitIdle/vkDeviceWaitIdle!
+typedef struct { VkBuffer buf; VkDeviceMemory mem; void *ahb; uint64_t retire_fence; } pool_retire_t;
+static pool_retire_t *g_pool_retire;
+static int g_npool_retire, g_cappool_retire;
+static pthread_mutex_t g_pool_retire_mu = PTHREAD_MUTEX_INITIALIZER;
+static void pool_retire_push(VkBuffer buf, VkDeviceMemory mem, void *ahb, uint64_t retire_fence) {
+    if (!buf && !mem && !ahb) return;
+    { const char *e = getenv("DM_VK_X_LEAK"); if (e && (atoi(e) & 1)) return; }
+    pthread_mutex_lock(&g_pool_retire_mu);
+    if (g_npool_retire == g_cappool_retire) {
+        g_cappool_retire = g_cappool_retire ? g_cappool_retire * 2 : 64;
+        g_pool_retire = realloc(g_pool_retire, (size_t)g_cappool_retire * sizeof *g_pool_retire);
+    }
+    g_pool_retire[g_npool_retire++] = (pool_retire_t){buf, mem, ahb, retire_fence};
+    pthread_mutex_unlock(&g_pool_retire_mu);
+}
+void vk_pool_retire_drain(void) {
+    uint64_t done = __atomic_load_n(&V.completed_seq, __ATOMIC_ACQUIRE);
+    uint64_t fd = vk_fence_done();
+    if (fd > done) done = fd;
+    pool_retire_t ready[64];
+    for (;;) {
+        int n = 0;
+        pthread_mutex_lock(&g_pool_retire_mu);
+        int o = 0;
+        for (int i = 0; i < g_npool_retire; i++) {
+            if (g_pool_retire[i].retire_fence <= done && n < 64) ready[n++] = g_pool_retire[i];
+            else g_pool_retire[o++] = g_pool_retire[i];
+        }
+        g_npool_retire = o;
+        pthread_mutex_unlock(&g_pool_retire_mu);
+        if (!n) break;
+        for (int i = 0; i < n; i++) {
+            if (ready[i].buf) vkDestroyBuffer(V.dev, ready[i].buf, NULL);
+            if (ready[i].mem) vkFreeMemory(V.dev, ready[i].mem, NULL);
+            if (ready[i].ahb) AHardwareBuffer_release((AHardwareBuffer *)ready[i].ahb);
+        }
+    }
+}
 static void cpf_free_now(const cpfree_t *e) {
     vkDestroyBuffer(V.dev, e->buf, NULL);
     vkFreeMemory(V.dev, e->mem, NULL);
     free(e->baseline);
 }
 static int cpf_take(uint64_t size, int cached, vkpool_t *p) {
+    vk_pool_retire_drain();
     if (!zcf_on()) return 0;
-    uint64_t done = vk_fence_done(); int hit = 0; cpfree_t e = {0};
+    uint64_t done = __atomic_load_n(&V.completed_seq, __ATOMIC_ACQUIRE);
+    uint64_t fd = vk_fence_done();
+    if (fd > done) done = fd;
+    int hit = 0; cpfree_t e = {0};
     pthread_mutex_lock(&g_cpf_mu);
     for (int i = 0; i < g_ncpf; i++) {
         if (g_cpf[i].size == size && g_cpf[i].cached == cached && g_cpf[i].fence <= done) {
@@ -767,20 +1195,34 @@ static int cpf_take(uint64_t size, int cached, vkpool_t *p) {
 }
 static uint64_t cpf_budget_bytes(void) {
     int t = vk_low_ram_tier();
-    // Anti-LMK for 3-4 GB RAM devices:
-    //   tier >= 2 (<=3.5 GB RAM, e.g. vivo V2109): 0 MiB kept buffers (free immediately on drop to keep footprint <2.2 GB)
-    //   tier == 1 (4 GB RAM): 16 MiB kept buffers
-    return t >= 2 ? 0ull : (t == 1 ? (16ull << 20) : CPF_BYTES);
+    // Tight RAM trim (< 1.8 GB on 4-6 GB devices):
+    //   tier >= 2 (<=3.8 GB RAM): 0 MiB kept buffers
+    //   tier == 1 (4-6 GB RAM):  24 MiB kept buffers
+    //   tier == 0 (>6 GB RAM):   64 MiB kept buffers
+    return t >= 2 ? 0ull : (t == 1 ? (24ull << 20) : (64ull << 20));
+}
+static void madvise_release_buf(void *ptr, size_t len) {
+    if (!ptr || len < (256u << 10)) return;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    uintptr_t a = ((uintptr_t)ptr + (uintptr_t)ps - 1u) & ~((uintptr_t)ps - 1u);
+    uintptr_t end = ((uintptr_t)ptr + len) & ~((uintptr_t)ps - 1u);
+    if (end > a) madvise((void *)a, (size_t)(end - a), MADV_DONTNEED);
 }
 static int cpf_put(const vkpool_t *p) {
     uint64_t size = p->hi - p->lo, cap = cpf_budget_bytes();
-    if (!zcf_on() || !p->buf || !p->shadow || size > cap / 2) return 0;
+    if (!zcf_on() || !p->buf || !p->shadow || cap == 0 || size > (cap * 3u) / 4u) return 0;
     // IMPORTANT: p->baseline is NEVER freed inside cpf_put() — mtl_pool_del() is the sole owner that
     // frees p.baseline exactly once (prevents hybrid24 SIGSEGV double-free when kept == 0 on Scudo!).
-    // Wait at least 3 full submissions (mtl_last_fence() + 3) before reuse or eviction to prevent Mali MMU -4 faults.
-    cpfree_t e = {p->buf, p->mem, p->shadow, NULL, size, mtl_last_fence() + 3, p->noncoherent, p->cached};
+    // Wait at least 3 full submissions (V.sub_seq + 3) before reuse or eviction to prevent GPU MMU -4 faults.
+    uint64_t sub_now = __atomic_load_n(&V.sub_seq, __ATOMIC_ACQUIRE);
+    uint64_t lf = mtl_last_fence();
+    if (lf > sub_now) sub_now = lf;
+    cpfree_t e = {p->buf, p->mem, p->shadow, NULL, size, sub_now + 3, p->noncoherent, p->cached};
     cpfree_t old[CPF_N]; int nold = 0;
-    uint64_t done = vk_fence_done();
+    uint64_t done = __atomic_load_n(&V.completed_seq, __ATOMIC_ACQUIRE);
+    uint64_t fd = vk_fence_done();
+    if (fd > done) done = fd;
     pthread_mutex_lock(&g_cpf_mu);
     while (g_ncpf == CPF_N || g_cpf_bytes + size > cap) {
         int i = 0; while (i < g_ncpf && g_cpf[i].fence > done) i++;
@@ -1132,6 +1574,12 @@ static int pool_fd(const vkpool_t *p, int *own) {
 // rounded up to them; or the first mmap failed); -1 = failed after mapping a part read-only (nvn_dirty_defrag makes the writable pages writable again)
 int vk_pool_remap_ro(void *mem, size_t len) {
     int rc = 0, mapped = 0; uint64_t done = 0;
+    // Drain in-flight GPU work ONLY on zero-copy enabled GPUs before mmap(MAP_FIXED) remaps dma-buf memory.
+    if (V.q && !vk_quirk(VQ_NO_ZEROCOPY)) {
+        pthread_mutex_lock(&g_vk_queue_mu);
+        vkQueueWaitIdle(V.q);
+        pthread_mutex_unlock(&g_vk_queue_mu);
+    }
     pthread_mutex_lock(&g_nest_mu);
     pthread_rwlock_rdlock(&g_pool_mu);
     for (int i = 0; i < g_npool && !rc; i++) {
@@ -1420,15 +1868,20 @@ void mtl_pool_del(const void *mem) {
         free(p.cpu_blk_gen); p.cpu_blk_gen = NULL;
         // Single authoritative free of p.baseline (calloc'd in vk_pools_sync_): NEVER freed inside cpf_put(),
         // eliminating 100% of Scudo double-free SIGSEGVs (0x75e2820ff0) when cpf_put() returns kept == 0!
+        if (p.baseline) madvise_release_buf(p.baseline, (size_t)(p.hi - p.lo));
         free(p.baseline); p.baseline = NULL;
         { void vk_tbuf_drop_pool(uint64_t); vk_tbuf_drop_pool(p.serial); }   // the texel buffer views over its buffer (gfx_vk_tex.c), before the buffer itself goes or is kept
-        if (p.slab) { slab_give(p.slab, p.slot, mtl_last_fence() + 3); }   // 3-submission margin before slab slot reuse
+        uint64_t sub_now = __atomic_load_n(&V.sub_seq, __ATOMIC_ACQUIRE);
+        uint64_t lf = mtl_last_fence();
+        if (lf > sub_now) sub_now = lf;
+        if (p.slab) { slab_give(p.slab, p.slot, sub_now + 3); }   // 3-submission margin before slab slot reuse
         else if (!p.zero_copy && p.shadow && cpf_put(&p)) {
             // Kept (buf, mem, shadow) in copied-pool reuse cache (baseline already freed above)
         } else {
-            if (p.buf && !(p.zero_copy && p.ahb && zcf_put(p.ahb, p.buf, p.mem, p.hi - p.lo))) {   // (kept for the next pool of its size; a lazy pool may have no buffer)
-                vk_defer_free_buffer(p.buf, p.mem);   // the AHardwareBuffer goes with the imported memory's last reference
-                if (p.ahb) AHardwareBuffer_release(p.ahb);
+            if (p.buf && !(p.zero_copy && p.ahb && zcf_put(p.ahb, p.buf, p.mem, p.hi - p.lo))) {
+                // Non-blocking fence-tagged deferred retire (retire_fence = V.sub_seq + 3):
+                // thread-safe from game threads without touching g_cur or calling vkQueueWaitIdle!
+                pool_retire_push(p.buf, p.mem, p.ahb, sub_now + 3);
             }
         }
         pool_note(1, p.hi - p.lo, pool_ns() - t0);
@@ -1672,7 +2125,10 @@ static void vk_pools_sync_(VkCommandBuffer cb, int staged_overlap) {
             }
             if (mem_diag_on()) VKLOG("[memdiag] copy-back baseline allocated: %.2f MiB", size / 1048576.0);
         }
-        if (!p->hot && nblk && !(p->flags & 0x1) && !serial_safe) p->hot = calloc(nblk, 1);
+        if (!p->hot && !(p->flags & 0x1)) {
+            size_t hcnt = serial_safe ? (size_t)((size + (4u << 10) - 1u) / (4u << 10)) : nblk;
+            if (hcnt) p->hot = calloc(hcnt, 1);
+        }
         if (!p->gpu_blk && nblk && !(p->flags & 0x1) && !serial_safe) p->gpu_blk = calloc(nblk, 1);
         if (!p->no_hot && nblk && !(p->flags & 0x1)) p->no_hot = calloc(nblk, 1);
         if (!p->cpu_blk_gen && nblk && !(p->flags & 0x1)) p->cpu_blk_gen = calloc(nblk, sizeof *p->cpu_blk_gen);
@@ -1689,9 +2145,9 @@ static void vk_pools_sync_(VkCommandBuffer cb, int staged_overlap) {
                 g_sync_full++; p->synced = 1; p->baseline_complete = 1; p->baseline_fresh = 0; p->cpf_reused = 0; p->sync_gen = 0; p->stamp0 = p->stamp = st; continue;
             }
         if (p->span) {
-            // One coalesced O(1) mprotect(PROT_READ) per fresh pool (16 KB chunks in safe_sync=2, 64 KB otherwise).
+            // One coalesced O(1) mprotect(PROT_READ) per fresh pool (4 KB pages in safe_sync=2, 64 KB otherwise).
             uint64_t tr = st_now_ns();
-            SYNC_MEASURE(1, size, nvn_dirty_protect_span_blk(p->span, lo, size, serial_safe ? (16u << 10) : BLK));
+            SYNC_MEASURE(1, size, nvn_dirty_protect_span_blk(p->span, lo, size, serial_safe ? (4u << 10) : BLK));
             rearm_ns += st_now_ns() - tr;
         }
             if (!p->synced && !p->baseline_complete && p->span && size >= (1ull << 20) && !(size & 3ull)) {
@@ -1844,42 +2300,85 @@ static void vk_pools_sync_(VkCommandBuffer cb, int staged_overlap) {
                 host_wrote_any = 1;
                 g_sync_bytes += size;
             }
-            if (p->hot) memset(p->hot, 0, nblk);
+            if (p->hot) memset(p->hot, 0, serial_safe ? (size_t)((size + (4u << 10) - 1u) / (4u << 10)) : nblk);
             if (p->gpu_blk) memset(p->gpu_blk, 0, nblk);
             g_sync_full++; p->synced = 1; p->baseline_complete = (p->baseline != NULL); p->baseline_fresh = 0; p->cpf_reused = 0; p->sync_gen = 0; p->stamp0 = p->stamp = st; continue; }
         p->sync_gen++;
-        // ---- Pure Mode 2 (serial_safe) 16 KB Exact Fast-Path (v1.1.2-hybrid27) ----
-        // Zero hot_blocks, zero baseline diff skip, zero clean-block mprotect bridging:
-        //   1. Only strictly contiguous dirty 16 KB runs (off == s_prot_hi) are re-protected FIRST (never
-        //      touches clean blocks or shatters packaged texture/font atlas spans!).
-        //   2. Every dirty 16 KB block is copied verbatim from L1-hot Guest RAM to BOTH HOST_CACHED p->shadow
-        //      AND p->baseline (+ pool_bump_cpu_gen) under g_baseline_mu — keeping CPU_UNCACHED & CPU_CACHED
-        //      baselines 100% coherent with pools_copy_back() (fixes hybrid26 dialogue top-glyph corruption!).
-        //   3. Batched vkFlushMappedMemoryRanges (up to 64 disjoint ranges per call) cuts driver flush overhead.
+        // ---- Mode 2 (serial_safe) 4 KB Safe Hot-Page Exemption + 60-Frame Decay + Lossless Compare Skip (v1.1.2-hybrid34) ----
+        // 100% 0% flicker AND ultra-low upload bandwidth (fixes hybrid33 vivo V2109 3.1 MB unconditional copy regression!):
+        //   1. 4 KB page granularity (SBLK = 4096) with tiered global cap: 128 pages (512 KB) on Tier >= 2, 384 pages (1.5 MB) on Tier <= 1.
+        //   2. GPU-written 64 KB blocks (p->no_hot[b >> 4]) are NEVER promoted to hot, so every hot 4 KB page is 100% CPU-only!
+        //   3. Lossless compare skip: for hot CPU-only 4 KB pages, memcmp against p->baseline (or cached p->shadow) skips
+        //      redundant uploads when unchanged (0% flicker!) and auto-cools to PROT_READ after 60 frames (HOT4_DECAY)!
         if (serial_safe) {
-            enum { SBLK = 16 << 10, FLUSH_BATCH = 64 };
+            enum { SBLK = 4 << 10, FLUSH_BATCH = 64, HOT4_THR = 3, HOT4_DECAY = 63 };
+            uint32_t hot_cap = (vk_gpu_tier() >= 2) ? 128u : 384u;
             size_t snblk = (size_t)((size + SBLK - 1) / SBLK);
             uint8_t sact_stk[4096];
             uint8_t *sact = snblk <= sizeof sact_stk ? sact_stk : (uint8_t *)malloc(snblk);
             if (!sact) die("[RED] [vk] serial_safe action table alloc failed (%zu blocks)", snblk);
             uint64_t s_prot_lo = size, s_prot_hi = 0, s_run_lo = size, s_run_hi = 0;
             uint64_t scan_start = diag ? mem_diag_ns() : 0, work_start = ns[1] + ns[2] + ns[3];
-            // Pass 1: identify dirty 16 KB blocks & re-protect strictly contiguous dirty runs BEFORE reading Guest RAM.
-            // Note: vk_pools_pre_rearm_serial() already ran mprotect(PROT_READ) before mtl_wait(g_fence), so pages
-            // untouched during the wait are already PG_PROT (~0.00 ms post-wait dirty_rearm!); any page written
-            // during the wait is protected cleanly here before memcpy.
+            int has_base = (p->baseline != NULL);
+            int can_cmp_base = has_base && p->baseline_complete && !p->gpu_wrote_ever;
+            int can_cmp_shadow = !has_base && p->cached && p->shadow && !p->gpu_wrote_ever;
+            int any_cooled = 0;
+            // Pass 1: classify dirty & hot 4 KB pages; skip unchanged CPU-only hot pages & decay after 60 frames.
             for (size_t b = 0; b < snblk; b++) {
                 uint64_t off = (uint64_t)b * SBLK;
                 uint64_t n = size - off < SBLK ? size - off : SBLK;
-                if (!nvn_dirty_since_span(p->span, lo + off, n, p->stamp0)) { sact[b] = 0; continue; }
-                sact[b] = 1;
-                if (s_prot_hi == 0) { s_prot_lo = off; s_prot_hi = off + n; }
-                else if (off == s_prot_hi) { s_prot_hi = off + n; }
-                else {
-                    uint64_t tr = st_now_ns();
-                    SYNC_MEASURE(1, s_prot_hi - s_prot_lo, nvn_dirty_protect_span_blk(p->span, lo + s_prot_lo, s_prot_hi - s_prot_lo, SBLK));
-                    rearm_ns += st_now_ns() - tr;
-                    s_prot_lo = off; s_prot_hi = off + n;
+                uint8_t nohot = p->no_hot ? __atomic_load_n(&p->no_hot[b >> 4], __ATOMIC_ACQUIRE) : 0;
+                uint8_t hcnt = p->hot ? __atomic_load_n(&p->hot[b], __ATOMIC_ACQUIRE) : 0;
+                if (hcnt >= HOT4_THR) {
+                    if (nohot || hot_blocks_now >= hot_cap) {
+                        __atomic_store_n(&p->hot[b], 0, __ATOMIC_RELEASE);
+                        sact[b] = 1;
+                        if (s_prot_hi == 0) { s_prot_lo = off; s_prot_hi = off + n; }
+                        else if (off == s_prot_hi) { s_prot_hi = off + n; }
+                        else {
+                            uint64_t tr = st_now_ns();
+                            SYNC_MEASURE(1, s_prot_hi - s_prot_lo, nvn_dirty_protect_span_blk(p->span, lo + s_prot_lo, s_prot_hi - s_prot_lo, SBLK));
+                            rearm_ns += st_now_ns() - tr;
+                            s_prot_lo = off; s_prot_hi = off + n;
+                        }
+                        continue;
+                    }
+                    // 60-frame decay: periodically re-arm hot page to PROT_READ so cold pages stop being scanned
+                    uint8_t next_hc = (uint8_t)(hcnt + 1);
+                    int unchanged = 0;
+                    if (can_cmp_base) unchanged = (memcmp(lo + off, p->baseline + off, (size_t)n) == 0);
+                    else if (can_cmp_shadow) unchanged = (memcmp(lo + off, p->shadow + off, (size_t)n) == 0);
+                    if (next_hc >= HOT4_DECAY) {
+                        __atomic_store_n(&p->hot[b], 0, __ATOMIC_RELEASE);
+                        any_cooled = 1;
+                        sact[b] = unchanged ? 4 : 3;   // 4 = unchanged + re-protect; 3 = upload + re-protect
+                        continue;
+                    }
+                    __atomic_store_n(&p->hot[b], next_hc, __ATOMIC_RELEASE);
+                    hot_blocks_now++;
+                    sact[b] = unchanged ? 0 : 2;       // lossless skip when CPU-only page is byte-identical!
+                    continue;
+                }
+                if (!nvn_dirty_since_span(p->span, lo + off, n, p->stamp0)) {
+                    if (p->hot && hcnt) __atomic_store_n(&p->hot[b], 0, __ATOMIC_RELEASE);
+                    sact[b] = 0;
+                    continue;
+                }
+                int promote = (!nohot && p->hot && hot_blocks_now < hot_cap && (hcnt + 1 >= HOT4_THR));
+                if (p->hot) __atomic_store_n(&p->hot[b], nohot ? 0 : (promote ? HOT4_THR : (uint8_t)(hcnt + 1)), __ATOMIC_RELEASE);
+                if (promote) {
+                    hot_blocks_now++;
+                    sact[b] = 2;   // promoted to hot: skip mprotect(PROT_READ) so next frame incurs 0 SIGSEGV faults!
+                } else {
+                    sact[b] = 1;
+                    if (s_prot_hi == 0) { s_prot_lo = off; s_prot_hi = off + n; }
+                    else if (off == s_prot_hi) { s_prot_hi = off + n; }
+                    else {
+                        uint64_t tr = st_now_ns();
+                        SYNC_MEASURE(1, s_prot_hi - s_prot_lo, nvn_dirty_protect_span_blk(p->span, lo + s_prot_lo, s_prot_hi - s_prot_lo, SBLK));
+                        rearm_ns += st_now_ns() - tr;
+                        s_prot_lo = off; s_prot_hi = off + n;
+                    }
                 }
             }
             if (s_prot_hi > s_prot_lo) {
@@ -1887,36 +2386,71 @@ static void vk_pools_sync_(VkCommandBuffer cb, int staged_overlap) {
                 SYNC_MEASURE(1, s_prot_hi - s_prot_lo, nvn_dirty_protect_span_blk(p->span, lo + s_prot_lo, s_prot_hi - s_prot_lo, SBLK));
                 rearm_ns += st_now_ns() - tr;
             }
-            // Pass 2: copy verbatim from L1-hot Guest RAM -> p->shadow & p->baseline, batching non-coherent flushes.
+            // Pass 2: copy changed/dirty 4 KB runs -> either slot-owned s->up staging (when staged_overlap==1)
+            // or directly to p->shadow + batched vkFlushMappedMemoryRanges (serial). Coalesces adjacent 4 KB runs!
             VkMappedMemoryRange fbatch[FLUSH_BATCH]; uint32_t nfb = 0;
+            VkBufferCopy scbatch[COPY_BATCH]; uint32_t nscb = 0; VkBuffer scur_sb = VK_NULL_HANDLE;
             uint64_t fatom = V.props.limits.nonCoherentAtomSize ? V.props.limits.nonCoherentAtomSize : 1;
-            int has_base = (p->baseline != NULL);
-            for (size_t b = 0; b < snblk; b++) {
-                if (!sact[b]) continue;
-                uint64_t off = (uint64_t)b * SBLK;
-                uint64_t n = size - off < SBLK ? size - off : SBLK;
-                if (has_base) {
-                    pthread_mutex_lock(&g_baseline_mu);
-                    SYNC_MEASURE(2, n, memcpy(p->shadow + off, lo + off, n)); g_sync_bytes += n;
-                    SYNC_MEASURE(3, n, memcpy(p->baseline + off, lo + off, n));
-                    pool_bump_cpu_gen(p, off, n);
-                    pthread_mutex_unlock(&g_baseline_mu);
-                } else {
-                    SYNC_MEASURE(2, n, memcpy(p->shadow + off, lo + off, n)); g_sync_bytes += n;
+            for (size_t b = 0; b < snblk; ) {
+                if (sact[b] == 0 || sact[b] == 4) { b++; continue; }
+                // Coalesce contiguous active 4 KB blocks (up to 512 KB per staging/copy run)
+                size_t b0 = b;
+                uint64_t off0 = (uint64_t)b0 * SBLK;
+                uint64_t rlen = 0;
+                while (b < snblk && (sact[b] == 1 || sact[b] == 2 || sact[b] == 3) && rlen < STAGE_MAX_RUN) {
+                    uint64_t boff = (uint64_t)b * SBLK;
+                    uint64_t bn = size - boff < SBLK ? size - boff : SBLK;
+                    rlen += bn;
+                    b++;
                 }
-                if (s_run_hi == 0) { s_run_lo = off; s_run_hi = off + n; }
-                else if (off <= s_run_hi + FLUSH_GAP) { s_run_hi = off + n; }
-                else {
-                    if (p->noncoherent) {
-                        uint64_t alo = s_run_lo - s_run_lo % fatom;
-                        uint64_t pad = (fatom - s_run_hi % fatom) % fatom;
-                        VkDeviceSize rsz = (s_run_hi < size && pad < size - s_run_hi) ? (s_run_hi + pad - alo) : VK_WHOLE_SIZE;
-                        fbatch[nfb++] = (VkMappedMemoryRange){VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, p->mem, alo, rsz};
-                        if (nfb == FLUSH_BATCH) { VKCHK(vkFlushMappedMemoryRanges(V.dev, nfb, fbatch)); nfb = 0; }
+                if (staged_overlap) {
+                    VkCommandBuffer ucb = vk_upload_cmd();
+                    VkBuffer sb; VkDeviceSize so;
+                    uint8_t *stg = vk_scratch(rlen, 16, &sb, &so);
+                    if (has_base) {
+                        pthread_mutex_lock(&g_baseline_mu);
+                        SYNC_MEASURE(2, rlen, memcpy(stg, lo + off0, (size_t)rlen)); g_sync_bytes += rlen;
+                        SYNC_MEASURE(3, rlen, memcpy(p->baseline + off0, stg, (size_t)rlen));
+                        pool_bump_cpu_gen(p, off0, rlen);
+                        pthread_mutex_unlock(&g_baseline_mu);
+                    } else {
+                        SYNC_MEASURE(2, rlen, memcpy(stg, lo + off0, (size_t)rlen)); g_sync_bytes += rlen;
                     }
-                    s_run_lo = off; s_run_hi = off + n;
+                    if (nscb && (sb != scur_sb || nscb == COPY_BATCH)) {
+                        vkCmdCopyBuffer(ucb, scur_sb, p->buf, nscb, scbatch);
+                        nscb = 0;
+                    }
+                    scur_sb = sb;
+                    scbatch[nscb++] = (VkBufferCopy){so, p->boff + off0, rlen};
+                    staged_any = 1;
+                } else {
+                    if (has_base) {
+                        pthread_mutex_lock(&g_baseline_mu);
+                        SYNC_MEASURE(2, rlen, memcpy(p->shadow + off0, lo + off0, (size_t)rlen)); g_sync_bytes += rlen;
+                        SYNC_MEASURE(3, rlen, memcpy(p->baseline + off0, lo + off0, (size_t)rlen));
+                        pool_bump_cpu_gen(p, off0, rlen);
+                        pthread_mutex_unlock(&g_baseline_mu);
+                    } else {
+                        SYNC_MEASURE(2, rlen, memcpy(p->shadow + off0, lo + off0, (size_t)rlen)); g_sync_bytes += rlen;
+                    }
+                    if (s_run_hi == 0) { s_run_lo = off0; s_run_hi = off0 + rlen; }
+                    else if (off0 <= s_run_hi + FLUSH_GAP) { s_run_hi = off0 + rlen; }
+                    else {
+                        if (p->noncoherent) {
+                            uint64_t alo = s_run_lo - s_run_lo % fatom;
+                            uint64_t pad = (fatom - s_run_hi % fatom) % fatom;
+                            VkDeviceSize rsz = (s_run_hi < size && pad < size - s_run_hi) ? (s_run_hi + pad - alo) : VK_WHOLE_SIZE;
+                            fbatch[nfb++] = (VkMappedMemoryRange){VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, p->mem, alo, rsz};
+                            if (nfb == FLUSH_BATCH) { VKCHK(vkFlushMappedMemoryRanges(V.dev, nfb, fbatch)); nfb = 0; }
+                        }
+                        s_run_lo = off0; s_run_hi = off0 + rlen;
+                    }
+                    host_wrote_any = 1;
                 }
-                host_wrote_any = 1;
+            }
+            if (nscb) {
+                vkCmdCopyBuffer(vk_upload_cmd(), scur_sb, p->buf, nscb, scbatch);
+                nscb = 0;
             }
             if (s_run_hi > s_run_lo && p->noncoherent) {
                 uint64_t alo = s_run_lo - s_run_lo % fatom;
@@ -1929,9 +2463,31 @@ static void vk_pools_sync_(VkCommandBuffer cb, int staged_overlap) {
                 VKCHK(vkFlushMappedMemoryRanges(V.dev, nfb, fbatch));
                 if (dflush) mem_diag_note(3, tf, nfb * SBLK);
             }
+            // Pass 3: re-protect any hot 4 KB pages that hit 60-frame decay
+            if (any_cooled) {
+                uint64_t clo = size, chi = 0;
+                for (size_t b = 0; b < snblk; b++) {
+                    if (sact[b] != 3 && sact[b] != 4) continue;
+                    uint64_t off = (uint64_t)b * SBLK;
+                    uint64_t n = size - off < SBLK ? size - off : SBLK;
+                    if (chi == 0) { clo = off; chi = off + n; }
+                    else if (off == chi) { chi = off + n; }
+                    else {
+                        uint64_t tr = st_now_ns();
+                        nvn_dirty_protect_span_blk(p->span, lo + clo, chi - clo, SBLK);
+                        rearm_ns += st_now_ns() - tr;
+                        clo = off; chi = off + n;
+                    }
+                }
+                if (chi > clo) {
+                    uint64_t tr = st_now_ns();
+                    nvn_dirty_protect_span_blk(p->span, lo + clo, chi - clo, SBLK);
+                    rearm_ns += st_now_ns() - tr;
+                }
+            }
             if (sact != sact_stk) free(sact);
             if (diag) { ns[0] += mem_diag_ns() - scan_start - (ns[1] + ns[2] + ns[3] - work_start); amount[0] += size; }
-            if (!p->baseline_complete && p->baseline) {
+            if (!p->baseline_complete && p->baseline && !staged_overlap) {
                 pthread_mutex_lock(&g_baseline_mu);
                 SYNC_MEASURE(3, size, memcpy(p->baseline, p->shadow, size));
                 pthread_mutex_unlock(&g_baseline_mu);
@@ -2199,7 +2755,8 @@ static void vk_pools_sync_(VkCommandBuffer cb, int staged_overlap) {
     if (diag) for (unsigned k = 0; k < 4; k++) mem_diag_note(6 + k, mem_diag_ns() - ns[k], amount[k]);
     if (diag) mem_diag_baselines(reason_count, reason_bytes);
 #undef SYNC_MEASURE
-    static uint64_t n, last, last_rb_seen, last_rb_nar, last_ovl, last_soff, last_srb, last_sinit, last_sconf, last_rbstg;
+    static uint64_t n, last, last_rb_seen, last_rb_nar, last_ovl, last_soff, last_srb, last_sinit, last_sconf, last_rbstg, last_defsaved;
+    __atomic_store_n(&g_hot16_last, hot_blocks_now, __ATOMIC_RELAXED);
     if (++n % 300 == 0) {
         uint64_t rbs = __atomic_load_n(&g_rb_seen, __ATOMIC_RELAXED);
         uint64_t rbn = __atomic_load_n(&g_rb_narrowed, __ATOMIC_RELAXED);
@@ -2209,14 +2766,17 @@ static void vk_pools_sync_(VkCommandBuffer cb, int staged_overlap) {
         uint64_t sinit = __atomic_load_n(&g_ovl_skip_init, __ATOMIC_RELAXED);
         uint64_t sconf = __atomic_load_n(&g_ovl_skip_conflict, __ATOMIC_RELAXED);
         uint64_t rbstg = __atomic_load_n(&g_rb_staged_cnt, __ATOMIC_RELAXED);
-        VKLOG("copied pools (last 300, safe_sync=%d safe1=[hot=%d rb=%d d1k=%d] overlap=%llu/300 [skip: off=%llu rb=%llu init=%llu conf=%llu, rb_staged=%llu]): %.1f MB synced (%.2f MB/sub), %llu full copies, %llu hot 64KB blocks (%.1f MB), readback narrowed %llu/%llu",
-              safe_sync, vk_safe1_hot_blocks(), vk_safe1_rb_staged(), vk_safe1_diff1k(),
+        uint64_t dsaved = __atomic_load_n(&g_defwait_saved_ns, __ATOMIC_RELAXED);
+        VKLOG("copied pools (last 300, safe_sync=%d def_wait=%d overlap=%llu/300 [skip: off=%llu rb=%llu init=%llu conf=%llu, rb_staged=%llu], deferred_wait_saved_ms=%.2f): %.1f MB synced (%.2f MB/sub), %llu full copies, %llu hot %s blocks (%.1f MB), readback narrowed %llu/%llu",
+              safe_sync, vk_deferred_wait(),
               (unsigned long long)(ovl - last_ovl), (unsigned long long)(soff - last_soff), (unsigned long long)(srb - last_srb), (unsigned long long)(sinit - last_sinit), (unsigned long long)(sconf - last_sconf), (unsigned long long)(rbstg - last_rbstg),
+              (dsaved - last_defsaved) / 3e8,
               (g_sync_bytes - last) / 1048576.0, (g_sync_bytes - last) / 300.0 / 1048576.0,
-              (unsigned long long)g_sync_full, (unsigned long long)hot_blocks_now, hot_blocks_now * 64.0 / 1024.0,
+              (unsigned long long)g_sync_full, (unsigned long long)hot_blocks_now, serial_safe ? "16KB" : "64KB",
+              hot_blocks_now * (serial_safe ? 16.0 : 64.0) / 1024.0,
               (unsigned long long)(rbn - last_rb_nar), (unsigned long long)(rbs - last_rb_seen));
         last = g_sync_bytes; last_rb_seen = rbs; last_rb_nar = rbn;
-        last_ovl = ovl; last_soff = soff; last_srb = srb; last_sinit = sinit; last_sconf = sconf; last_rbstg = rbstg;
+        last_ovl = ovl; last_soff = soff; last_srb = srb; last_sinit = sinit; last_sconf = sconf; last_rbstg = rbstg; last_defsaved = dsaved;
     }
 }
 // Copied pools after a submission: merge GPU changes against their baseline, preserving independent CPU writes made after the sync. Never-synced pools are left alone.
@@ -2497,9 +3057,30 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns);
 // it); everyone else waits for the completion thread to pass the fence (g_done), so a fence is never waited on while the commit resets it for reuse
 static void wait_fence(uint64_t f) {
     if (!f) return;
-    if (!V.has_timeline) { mtl_wait(f, ~0ull); return; }
+    if (!V.has_timeline) {
+        if (!mtl_wait(f, 3000000000ull)) {
+            VKLOG("[RED] [vk] FENCE TIMEOUT / DEVICE_LOST (wait=%llu done=%llu vendor=%#x dev=%s)",
+                  (unsigned long long)f, (unsigned long long)vk_fence_done(), V.props.vendorID, V.props.deviceName);
+            vk_record_device_lost("wait_fence_timeout", VK_ERROR_DEVICE_LOST);
+            mtl_wait(f, 10000000000ull);
+        } else {
+            __atomic_store_n(&V.dev_lost_streak, 0, __ATOMIC_RELAXED);
+        }
+        return;
+    }
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &g_timeline, &f};
-    VkResult r = vkWaitSemaphores(V.dev, &wi, UINT64_MAX); if (r != VK_SUCCESS) die("[vk] GPU timeline wait did not complete: %d", r);
+    VkResult r = vkWaitSemaphores(V.dev, &wi, 3000000000ull);
+    if (r == VK_TIMEOUT) {
+        VKLOG("[RED] [vk] FENCE TIMEOUT / DEVICE_LOST (timeline=%llu done=%llu vendor=%#x dev=%s)",
+              (unsigned long long)f, (unsigned long long)vk_fence_done(), V.props.vendorID, V.props.deviceName);
+        vk_record_device_lost("wait_semaphore_timeout", VK_ERROR_DEVICE_LOST);
+        r = vkWaitSemaphores(V.dev, &wi, 10000000000ull);
+    }
+    if (r != VK_SUCCESS) {
+        if (r == VK_ERROR_DEVICE_LOST || r == VK_TIMEOUT) vk_record_device_lost("wait_fence", r);
+        die("[vk] GPU timeline wait did not complete: %d", r);
+    }
+    __atomic_store_n(&V.dev_lost_streak, 0, __ATOMIC_RELAXED);
 }
 // The slot's command buffers are reset on the completion thread once its submission is done (completion_main), not when the replay begins them again: an
 // implicit reset at vkBeginCommandBuffer took 7% of Xenoblade Chronicles 3's replay thread at a submission's start and more at every part (its battles
@@ -2518,6 +3099,7 @@ static void slot_recycle(vksub_t *s) {   // the GPU has passed this slot's last 
     for (int i = 0; i < ndf; i++) df_destroy_one(df[i]);
     free(df);
     df_drain_pending();
+    vk_pool_retire_drain();
     s->rb_snap_used = 0;
     s->rb_used = 0;
     s->nrb = 0; s->rb_staged = 0;
@@ -2827,7 +3409,7 @@ static void pools_readback_barrier(VkCommandBuffer cb) {
 // with GPU Frame N-1. After mtl_wait(g_fence) finishes, vk_pools_sync_() sees these pages already PG_PROT
 // (~0.00 ms post-wait dirty_rearm!) while still re-protecting any page newly dirtied during the wait before memcpy.
 static void vk_pools_pre_rearm_serial(void) {
-    enum { SBLK = 16 << 10 };
+    enum { SBLK = 4 << 10 };
     uint64_t rearm_ns = 0;
     pthread_rwlock_rdlock(&g_pool_mu);
     for (int i = 0; i < g_npool; i++) {
@@ -2840,6 +3422,9 @@ static void vk_pools_pre_rearm_serial(void) {
         for (size_t b = 0; b < snblk; b++) {
             uint64_t off = (uint64_t)b * SBLK;
             uint64_t n = size - off < SBLK ? size - off : SBLK;
+            // Respect active Hot 4 KB pages: never mprotect(PROT_READ) a hot page unless no_hot is set!
+            if (p->hot && __atomic_load_n(&p->hot[b], __ATOMIC_ACQUIRE) >= 3 &&
+                !(p->no_hot && __atomic_load_n(&p->no_hot[b >> 4], __ATOMIC_ACQUIRE))) continue;
             if (!nvn_dirty_since_span(p->span, lo + off, n, p->stamp0)) continue;
             if (phi == 0) { plo = off; phi = off + n; }
             else if (off == phi) { phi = off + n; }
@@ -2859,6 +3444,7 @@ static void vk_pools_pre_rearm_serial(void) {
     pthread_rwlock_unlock(&g_pool_mu);
     if (rearm_ns) vk_sub_timing_add(2, rearm_ns);
 }
+double vk_gpu_ms_recent(void);
 static void begin_segment(int continuing) {
     vk_init();
     pthread_mutex_lock(&g_sub_lock);
@@ -2885,26 +3471,44 @@ static void begin_segment(int continuing) {
     if (shadow) {
         int diag = mem_diag_on(); uint64_t t = diag ? mem_diag_ns() : 0;
         int safe_sync = vk_pool_safe_sync();
-        int overlap = (safe_sync >= 2) ? 0 : vk_pool_overlap();
+        // Deferred Fence Wait (v1.1.2-hybrid33): in Mode 2 (serial_safe), enable safe CPU+GPU pipelining via
+        // per-slot s->up staging whenever DM_VK_DEFERRED_WAIT=1 (default ON) and prior sub needs no CPU readback!
+        int overlap = (safe_sync >= 2) ? vk_deferred_wait() : vk_pool_overlap();
         int rb_conf = (overlap && !g_last_sub_needs_rb && g_fence && g_prev_rb_slot >= 0)
             ? rb_conflicts_with_dirty(&g_slot[g_prev_rb_slot]) : 0;
         int need_full = !overlap || g_last_sub_needs_rb || !g_fence || rb_conf;
-        if (!need_full) __atomic_fetch_add(&g_ovl_used, 1, __ATOMIC_RELAXED);
+        if (!need_full) {
+            __atomic_fetch_add(&g_ovl_used, 1, __ATOMIC_RELAXED);
+            if (vk_fence_done() < g_fence) {
+                double g_recent = vk_gpu_ms_recent();
+                if (g_recent > 0.5 && g_recent < 30.0)
+                    __atomic_fetch_add(&g_defwait_saved_ns, (uint64_t)(g_recent * 500000.0), __ATOMIC_RELAXED);
+            }
+        }
         else if (!overlap) __atomic_fetch_add(&g_ovl_skip_off, 1, __ATOMIC_RELAXED);
         else if (g_last_sub_needs_rb) __atomic_fetch_add(&g_ovl_skip_rb, 1, __ATOMIC_RELAXED);
         else if (rb_conf) __atomic_fetch_add(&g_ovl_skip_conflict, 1, __ATOMIC_RELAXED);
         uint64_t wait_target = need_full ? g_fence : (g_fence > 1 ? g_fence - 1 : 0);
-        // Late-Wait CPU Work Hiding (Mode 2): execute mprotect(PROT_READ) rearm while GPU Frame N-1 finishes!
+        // Late-Wait CPU Work Hiding (Mode 2): execute non-hot mprotect(PROT_READ) rearm while GPU finishes!
         if (safe_sync >= 2 && wait_target) vk_pools_pre_rearm_serial();
         if (wait_target) {
             uint64_t tw = st_now_ns();
-            mtl_wait(wait_target, ~0ull);
+            vk_wd_enter(VK_WD_FENCE_WAIT, V.last_sub_diag.last_vs, V.last_sub_diag.last_fs);
+            if (!mtl_wait(wait_target, 3000000000ull)) {
+                VKLOG("[RED] [vk] FENCE TIMEOUT / DEVICE_LOST in begin_segment (wait=%llu done=%llu vendor=%#x dev=%s)",
+                      (unsigned long long)wait_target, (unsigned long long)vk_fence_done(), V.props.vendorID, V.props.deviceName);
+                vk_record_device_lost("begin_segment_fence_timeout", VK_ERROR_DEVICE_LOST);
+                mtl_wait(wait_target, 10000000000ull);
+            } else {
+                __atomic_store_n(&V.dev_lost_streak, 0, __ATOMIC_RELAXED);
+            }
+            vk_wd_leave();
             vk_sub_timing_add(5, st_now_ns() - tw);
         }
         if (diag) mem_diag_note(0, t, 0);
         vk_pools_sync_ex(NULL, !need_full);
         int serial_safe = (safe_sync >= 2);
-        int used_stage = (!serial_safe) && ((safe_sync == 1) || !need_full || vk_pool_overlap());
+        int used_stage = (!need_full) || ((!serial_safe) && ((safe_sync == 1) || vk_pool_overlap()));
         if (!used_stage) {
             VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
                 VK_ACCESS_HOST_WRITE_BIT, POOL_CONSUMER_ACCESS};
@@ -3215,7 +3819,10 @@ void vk_gpu_wrote_ssbo(uint64_t a, uint64_t n) {
     }
     pthread_rwlock_unlock(&g_pool_mu);
     if (is_no_access) return;   // CPU_NO_ACCESS pools are strictly GPU-only (0 readback)
-    if (!is_uncached || !pipelined || n <= (2ull << 20)) {
+    // GPU-only compute SSBO buffers (>64 KiB) in CPU_UNCACHED pools (e.g. Unity SkinnedMeshRenderer dynamic vertex pools)
+    // are GPU-produced / GPU-consumed (never read back by CPU); skipping CPU readback here eliminates 0.5-126 ms
+    // pool_readback stalls AND unlocks Deferred Fence Wait overlap (~99%) while keeping <=64 KiB queries & CPU_CACHED intact!
+    if (!is_uncached || n <= (64ull << 10)) {
         sub_gpu_wrote(a, n);
         if (g_cur >= 0) g_slot[g_cur].needs_cpu_rb = 1;
     }
@@ -3337,7 +3944,22 @@ static void *completion_main(void *a) {
         pthread_mutex_lock(&g_cmu);
         while (!g_ch) pthread_cond_wait(&g_ccv, &g_cmu);
         cpend *c = g_ch; pthread_mutex_unlock(&g_cmu);
-        if (V.has_timeline) wait_fence(c->fence); else { VkResult r = vkWaitForFences(V.dev, 1, &g_fring[c->fence % NFRING], VK_TRUE, UINT64_MAX); if (r != VK_SUCCESS) die("[vk] GPU fence wait did not complete: %d", r); }
+        if (V.has_timeline) {
+            wait_fence(c->fence);
+        } else {
+            VkResult r = vkWaitForFences(V.dev, 1, &g_fring[c->fence % NFRING], VK_TRUE, 3000000000ull);
+            if (r == VK_TIMEOUT) {
+                VKLOG("[RED] [vk] FENCE TIMEOUT / DEVICE_LOST (vkWaitForFences=%llu done=%llu vendor=%#x dev=%s)",
+                      (unsigned long long)c->fence, (unsigned long long)vk_fence_done(), V.props.vendorID, V.props.deviceName);
+                vk_record_device_lost("completion_fence_timeout", VK_ERROR_DEVICE_LOST);
+                r = vkWaitForFences(V.dev, 1, &g_fring[c->fence % NFRING], VK_TRUE, 10000000000ull);
+            }
+            if (r != VK_SUCCESS) {
+                if (r == VK_ERROR_DEVICE_LOST || r == VK_TIMEOUT) vk_record_device_lost("completion_fence", r);
+                die("[vk] GPU fence wait did not complete: %d", r);
+            }
+            __atomic_store_n(&V.dev_lost_streak, 0, __ATOMIC_RELAXED);
+        }
         if (g_shadow_pools && c->rslot >= 0) pools_copy_back(&g_slot[c->rslot]);
         if (g_tsq && c->slot >= 0) { uint64_t t[2]; if (vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
             { uint64_t ns = (uint64_t)((double)(t[1] - t[0]) * V.props.limits.timestampPeriod); g_gpu_ns += ns; int k = (int)(c->frame % 64);
@@ -3362,7 +3984,13 @@ static void *completion_main(void *a) {
         pthread_mutex_lock(&g_cmu); g_ch = c->next; if (!g_ch) g_ct = NULL; pthread_mutex_unlock(&g_cmu);
         if (g_prereset > 0 && c->rslot >= 0) { vksub_t *s = &g_slot[c->rslot];   // its command buffers reset here (slot_recycle); the slot is not taken before g_done passes this fence
             if (s->fence == c->fence) { for (int i = 0; i < s->nmain_alloc; i++) vkResetCommandBuffer(s->mains[i], 0); for (int i = 0; i < s->nup_alloc; i++) vkResetCommandBuffer(s->ups[i], 0); } }
-        pthread_mutex_lock(&g_done_mu); if (c->fence > g_done) __atomic_store_n(&g_done, c->fence, __ATOMIC_RELEASE); pthread_cond_broadcast(&g_done_cv); pthread_mutex_unlock(&g_done_mu);
+        pthread_mutex_lock(&g_done_mu);
+        if (c->fence > g_done) {
+            __atomic_store_n(&g_done, c->fence, __ATOMIC_RELEASE);
+            __atomic_store_n(&V.completed_seq, c->fence, __ATOMIC_RELEASE);
+        }
+        pthread_cond_broadcast(&g_done_cv);
+        pthread_mutex_unlock(&g_done_mu);
         free(c->ops); free(c);
     }
     return NULL;
@@ -3394,37 +4022,57 @@ static void memlog_start(void) {
     pthread_t t; if (!pthread_create(&t, NULL, memlog_main, (void *)(uintptr_t)s)) pthread_detach(t);
 }
 void vk_record_device_lost(const char *where, VkResult r) {
-    static int recorded;
-    if (__atomic_exchange_n(&recorded, 1, __ATOMIC_ACQ_REL)) return;
-    extern uint32_t g_sub_ops[64];
-    uint64_t frame = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED);
+    int streak = __atomic_add_fetch(&V.dev_lost_streak, 1, __ATOMIC_ACQ_REL);
+    vk_sub_diag_t d;
+    pthread_mutex_lock(&g_diag_mu);
+    d = V.last_sub_diag;
+    pthread_mutex_unlock(&g_diag_mu);
+    char pbuf[512];
+    vk_diag_format_pipes(&d, pbuf, sizeof pbuf);
+    uint64_t frame = d.frame ? d.frame : __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED);
+    uint64_t fence = d.fence ? d.fence : __atomic_load_n(&V.sub_seq, __ATOMIC_RELAXED);
     uint64_t drops = __atomic_load_n(&g_pool_drops_total, __ATOMIC_RELAXED);
-    uint32_t draws = g_sub_ops[25] + g_sub_ops[26] + g_sub_ops[48];
-    uint32_t dispatches = g_sub_ops[27];
-    uint32_t passes = (g_cur >= 0 && g_cur < NSLOT) ? (uint32_t)g_npass[g_cur] : 0u;
-    VKLOG("[RED] [vk] DEVICE_LOST diagnostics (%s, VkResult=%d): GPU=%s driver=%#x api=%u.%u | frame=%llu fence=%llu | sub draws=%u passes=%u dispatches=%u | pool_overlap=%d disable_msaa=%d strict_barriers=%d low_ram=%d | pool_drops=%llu cpf_kept=%llu cpf_hit=%llu copied=%.1f MB",
-          where ? where : "?", (int)r, V.props.deviceName, V.props.driverVersion,
+    VKLOG("[RED] [vk] DEVICE_LOST diagnostics (%s, VkResult=%d, streak=%d): GPU=%s vendor=%#x driver=%#x api=%u.%u | frame=%llu fence=%llu (done=%llu) | sub draws=%u passes=%u dispatches=%u | last_vs=%016llx last_fs=%016llx last_gs=%016llx last_cs=%016llx | new_pipes[%u]=%s | timeline=%d def_wait=%d pool_overlap=%d disable_msaa=%d strict_barriers=%d low_ram=%d | pool_drops=%llu cpf_kept=%llu cpf_hit=%llu copied=%.1f MB",
+          where ? where : "?", (int)r, streak, V.props.deviceName, V.props.vendorID, V.props.driverVersion,
           VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion),
-          (unsigned long long)frame, (unsigned long long)g_fence, draws, passes, dispatches,
+          (unsigned long long)frame, (unsigned long long)fence, (unsigned long long)vk_fence_done(),
+          d.draws, d.passes, d.dispatches,
+          (unsigned long long)d.last_vs, (unsigned long long)d.last_fs, (unsigned long long)d.last_gs, (unsigned long long)d.last_cs,
+          d.n_new_pipes, pbuf, V.has_timeline, vk_deferred_wait(),
           vk_pool_overlap(), vk_disable_msaa(), vk_strict_barriers(), vk_low_ram_tier(),
           (unsigned long long)drops, (unsigned long long)g_cpf_kept, (unsigned long long)g_cpf_hit, g_cp_bytes / 1048576.0);
+    fflush(stderr);
     const char *root = getenv("DM_ROOT");
-    if (!root || !*root) return;
-    char path[1024];
-    snprintf(path, sizeof path, "%s/last_launch_error.txt", root);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        fprintf(f, "VK_ERROR_DEVICE_LOST (%d) at %s\nGPU: %s (vendor=%#x, driver=%#x, Vulkan %u.%u)\nFrame: %llu (fence %llu)\nSubmission: draws=%u, passes=%u, dispatches=%u\nSettings: pool_overlap=%d, disable_msaa=%d, strict_barriers=%d, low_ram_tier=%d\nPools: drops=%llu, cpf_kept=%llu, cpf_hit=%llu, copied=%.1f MiB\n",
-                (int)r, where ? where : "?", V.props.deviceName, V.props.vendorID, V.props.driverVersion,
-                VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion),
-                (unsigned long long)frame, (unsigned long long)g_fence, draws, passes, dispatches,
-                vk_pool_overlap(), vk_disable_msaa(), vk_strict_barriers(), vk_low_ram_tier(),
-                (unsigned long long)drops, (unsigned long long)g_cpf_kept, (unsigned long long)g_cpf_hit, g_cp_bytes / 1048576.0);
-        fclose(f);
+    if (root && *root) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/last_launch_error.txt", root);
+        FILE *f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "VK_ERROR_DEVICE_LOST (%d, streak=%d) at %s\nGPU: %s (vendor=%#x, driver=%#x, Vulkan %u.%u)\nFrame: %llu (fence %llu, done %llu)\nSubmission: draws=%u, passes=%u, dispatches=%u\nShaders: vs=%016llx fs=%016llx gs=%016llx cs=%016llx\nNewPipelines[%u]: %s\nSettings: timeline=%d, def_wait=%d, pool_overlap=%d, disable_msaa=%d, strict_barriers=%d, low_ram_tier=%d\nPools: drops=%llu, cpf_kept=%llu, cpf_hit=%llu, copied=%.1f MiB\n",
+                    (int)r, streak, where ? where : "?", V.props.deviceName, V.props.vendorID, V.props.driverVersion,
+                    VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion),
+                    (unsigned long long)frame, (unsigned long long)fence, (unsigned long long)vk_fence_done(),
+                    d.draws, d.passes, d.dispatches,
+                    (unsigned long long)d.last_vs, (unsigned long long)d.last_fs, (unsigned long long)d.last_gs, (unsigned long long)d.last_cs,
+                    d.n_new_pipes, pbuf, V.has_timeline, vk_deferred_wait(),
+                    vk_pool_overlap(), vk_disable_msaa(), vk_strict_barriers(), vk_low_ram_tier(),
+                    (unsigned long long)drops, (unsigned long long)g_cpf_kept, (unsigned long long)g_cpf_hit, g_cp_bytes / 1048576.0);
+            fclose(f);
+        }
+        snprintf(path, sizeof path, "%s/.gpu_device_lost", root);
+        f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "code=%d\nstreak=%d\ngpu=%s\nvendor=%#x\ndriver=%#x\nframe=%llu\nvs=%016llx\nfs=%016llx\n",
+                    (int)r, streak, V.props.deviceName, V.props.vendorID, V.props.driverVersion,
+                    (unsigned long long)frame, (unsigned long long)d.last_vs, (unsigned long long)d.last_fs);
+            fclose(f);
+        }
     }
-    snprintf(path, sizeof path, "%s/.gpu_device_lost", root);
-    f = fopen(path, "w");
-    if (f) { fprintf(f, "code=%d\ngpu=%s\ndriver=%#x\nframe=%llu\n", (int)r, V.props.deviceName, V.props.driverVersion, (unsigned long long)frame); fclose(f); }
+    if (streak >= 2) {
+        VKLOG("[RED] [vk] Consecutive VK_ERROR_DEVICE_LOST streak=%d (>=2): flushing logs and exiting cleanly (_exit 88) to prevent infinite TDR hang loop", streak);
+        fflush(stderr);
+        _exit(88);
+    }
 }
 uint64_t mtl_sub_commit(void) {
     { void vk_prof_end(void); vk_prof_end(); }
@@ -3432,9 +4080,10 @@ uint64_t mtl_sub_commit(void) {
     vk_end_pass_land();
     // Stage small GPU->CPU readbacks into slot-owned HOST_CACHED s->rb_buf inside s->main before the submission
     // finishes, so completion_main() reads slot N-1's cached copy (~0.015 ms!) while GPU frame N's s->up updates p->buf.
-    // Enabled for Mode 1 (when DM_VK_SAFE1_RB_STAGED=1) and Mode 0; disabled for Mode 2 (Hard Serial Debug).
+    // Enabled for Mode 2 when vk_deferred_wait()==1 (unlocks >90% CPU+GPU overlap on modern GPUs!), Mode 1, and Mode 0.
     int ss_mode = vk_pool_safe_sync();
-    int allow_rb_stage = vk_pool_overlap() && ss_mode != 2 && (ss_mode != 1 || vk_safe1_rb_staged());
+    int allow_rb_stage = (ss_mode >= 2) ? (vk_deferred_wait() && vk_safe1_rb_staged())
+                                        : (vk_pool_overlap() && (ss_mode != 1 || vk_safe1_rb_staged()));
     if (g_shadow_pools && allow_rb_stage && s->readback_ranges && s->needs_cpu_rb && s->ngw > 0) {
         uint64_t total_rb = 0; int count_rb = 0;
         VkDeviceSize rb_align = V.props.limits.nonCoherentAtomSize > 64 ? V.props.limits.nonCoherentAtomSize : 64;
@@ -3527,7 +4176,22 @@ uint64_t mtl_sub_commit(void) {
         }
     }
     else vk_bisect_result(1);
-    { extern uint32_t g_sub_ops[64]; memset(g_sub_ops, 0, sizeof g_sub_ops); }
+    {
+        extern uint32_t g_sub_ops[64];
+        uint32_t draws = g_sub_ops[25] + g_sub_ops[26] + g_sub_ops[48];
+        uint32_t dispatches = g_sub_ops[27];
+        uint32_t passes = (g_cur >= 0 && g_cur < NSLOT) ? (uint32_t)g_npass[g_cur] : 0u;
+        pthread_mutex_lock(&g_diag_mu);
+        V.cur_sub_diag.frame = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED);
+        V.cur_sub_diag.fence = g_fence + 1;
+        if (draws > V.cur_sub_diag.draws) V.cur_sub_diag.draws = draws;
+        if (dispatches > V.cur_sub_diag.dispatches) V.cur_sub_diag.dispatches = dispatches;
+        V.cur_sub_diag.passes = passes;
+        V.last_sub_diag = V.cur_sub_diag;
+        memset(&V.cur_sub_diag, 0, sizeof V.cur_sub_diag);
+        pthread_mutex_unlock(&g_diag_mu);
+        memset(g_sub_ops, 0, sizeof g_sub_ops);
+    }
     if (s->up_used) { vk_post_transfer_barrier(s->up); VKCHK(vkEndCommandBuffer(s->up)); }
     // Defensive flush for any non-coherent scratch blocks before vkQueueSubmit (0 cost on HOST_COHERENT GPUs).
     if (s->nblk > 0 && vkFlushMappedMemoryRanges) {
@@ -3544,6 +4208,7 @@ uint64_t mtl_sub_commit(void) {
         if (nfl) VKCHK(vkFlushMappedMemoryRanges(V.dev, nfl, fl));
     }
     uint64_t f = ++g_fence;
+    __atomic_store_n(&V.sub_seq, f, __ATOMIC_RELEASE);
     VkCommandBuffer cbs[1 + MAIN_CBS]; uint32_t ncb = 0; if (s->up_used) cbs[ncb++] = s->up; for (int i = s->nmain_sent; i < s->nmain_used; i++) cbs[ncb++] = s->mains[i];
     // GPU-only hardware submission chain wait (zero CPU fence_wait, zero GPU bubble):
     // Wait at VK_PIPELINE_STAGE_ALL_COMMANDS_BIT (covers EVERY execution stage: VERTEX_INPUT, VERTEX_SHADER,
@@ -3575,8 +4240,9 @@ uint64_t mtl_sub_commit(void) {
             g_chain_pending = sig_sem;
         }
     }
-    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); pthread_mutex_lock(&g_vk_queue_mu); VkResult r = vkQueueSubmit(V.q, 1, &si, fe); pthread_mutex_unlock(&g_vk_queue_mu); clock_gettime(CLOCK_MONOTONIC, &t1);
-    { uint64_t sd = (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec)); g_ns_submit += sd; vk_sub_timing_add(4, sd); }
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); vk_wd_enter(VK_WD_VK_SUBMIT, V.last_sub_diag.last_vs, V.last_sub_diag.last_fs); pthread_mutex_lock(&g_vk_queue_mu); VkResult r = vkQueueSubmit(V.q, 1, &si, fe); pthread_mutex_unlock(&g_vk_queue_mu); vk_wd_leave(); clock_gettime(CLOCK_MONOTONIC, &t1);
+    { uint64_t sd = (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec)); g_ns_submit += sd; vk_sub_timing_add(4, sd);
+      if (sd > 1500000000ull) VKLOG("[RED] [vk] GPU submit stall %.1f ms (vendor=%#x dev=%s) — possible TDR/hang!", sd / 1e6, V.props.vendorID, V.props.deviceName); }
     if (r) { if (r == VK_ERROR_DEVICE_LOST) vk_record_device_lost("mtl_sub_commit", r); void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit: %d (device lost?)", r); }
     s->fence = f;
     g_last_sub_needs_rb = (!s->readback_ranges) || (s->needs_cpu_rb && !s->rb_staged);

@@ -334,16 +334,53 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     // Chronicles 3's are rewritten there. DM_VK_SUBGROUP_ONE_LANE=0 (start-up): no module is rewritten, as before, for A/B tests
     static int one_lane = -1; if (one_lane < 0) { const char *e = getenv("DM_VK_SUBGROUP_ONE_LANE"); one_lane = !(e && !atoi(e)); if (!one_lane) VKLOG("subgroups: no one-invocation rewrite (DM_VK_SUBGROUP_ONE_LANE=0)"); }
     if (one_lane) { uint32_t ops = V.sg_stages & stage_flag(stage) ? V.sg_ops : 0; if (stage != 1 && stage != 5 && !V.sg_quad_all) ops &= ~(uint32_t)VK_SUBGROUP_FEATURE_QUAD_BIT;
+      // Samsung Xclipse AMD RDNA3 (0x144d): graphics/geometry stages run at Wave64 (sg_size=64) when not pinned to 32;
+      // Maxwell shaders expect Warp32 ballots/shuffles, so rewrite non-compute OpGroupNonUniform* safely to 1-lane on 0x144d.
+      if (V.props.vendorID == 0x144Du && stage != 5 && V.sg_size > 32 && !(V.sg_pin_stages & stage_flag(stage))) ops = 0;
       char why[64]; uint32_t n2 = 0, *w2 = spv_one_lane(w, nw, ops, &n2, why, sizeof why);
       if (w2) { free(w); w = w2; nw = n2; VKLOG("shader %016llx (stage %d): subgroups of one invocation (the device's subgroup operations in this stage: %#x)", (unsigned long long)key, stage, ops); }
       else if (why[0]) VKLOG("[RED] shader %016llx (stage %d) uses subgroup operations the device lacks in this stage (it has %#x), and %s is not covered by the one-invocation rewrite: left as it is", (unsigned long long)key, stage, ops, why); }
     if (stage == 0) { uint32_t n2 = 0, *w2 = spv_vs_init(w, nw, &n2); if (w2) { free(w); w = w2; nw = n2; } }
+    // Mali <= 32.1.0 (0x08001000) SPIR-V capability sanitizer (v1.1.2-hybrid37):
+    // Deduplicate OpCapability Shader and strip unused optional capabilities (GroupNonUniform*, DrawParameters,
+    // ImageQuery, ImageGatherExtended, ImageBuffer/SampledBuffer) so Bifrost r32p1's SPIR-V frontend compiles cleanly.
+    if (vk_mali_legacy_r32()) {
+        int use_grp = 0, use_drawp = 0, use_imgq = 0, use_imgg = 0, use_bufimg = 0;
+        for (uint32_t i = 5; i < nw;) {
+            uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+            if (!n || i + n > nw) break;
+            if (op >= 332 && op <= 365) use_grp = 1;
+            else if ((op == 71 && n >= 4 && w[i + 2] == 11) || (op == 72 && n >= 5 && w[i + 3] == 11)) {
+                uint32_t bi = (op == 71) ? w[i + 3] : w[i + 4];
+                if (bi >= 36 && bi <= 43) use_grp = 1;
+                if (bi >= 4424 && bi <= 4426) use_drawp = 1;
+            } else if (op >= 103 && op <= 107) use_imgq = 1;
+            else if (op == 96 || op == 97) use_imgg = 1;
+            else if (op == 25 && n >= 4 && w[i + 3] == 5) use_bufimg = 1;
+            i += n;
+        }
+        uint32_t o = 5; int seen_shader = 0;
+        for (uint32_t i = 5; i < nw;) {
+            uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+            if (!n || i + n > nw) { while (i < nw) w[o++] = w[i++]; break; }
+            int drop = 0;
+            if (op == 17 && n == 2) {
+                uint32_t cap = w[i + 1];
+                if (cap == 1) { if (seen_shader) drop = 1; else seen_shader = 1; }
+                else if (cap >= 61 && cap <= 68 && !use_grp) drop = 1;
+                else if (cap == 4427 && !use_drawp) drop = 1;
+                else if (cap == 50 && !use_imgq) drop = 1;
+                else if (cap == 25 && !use_imgg) drop = 1;
+                else if ((cap == 46 || cap == 47) && !use_bufimg) drop = 1;
+            }
+            if (drop) i += n; else for (uint32_t k = 0; k < n; k++) w[o++] = w[i++];
+        }
+        nw = o;
+    }
     // Maxwell's FMNMX returns the operand that is a number when the other is NaN, and its saturate turns NaN into 0 (IEEE minNum / maxNum, as Metal's fmin / fmax).
     // The translator emits GLSL.std.450 FMin / FMax / FClamp, whose result is undefined for a NaN operand, and Adreno passes the NaN on: their NaN-aware forms NMin /
-    // NMax / NClamp give Maxwell's results. Xenoblade Chronicles 3's fur pixel shaders (4fd6e9e891e821cf, f8cc7339c930dc07) take max(0, sqrt(1 - x² - y²)) of
-    // their fur direction texels; where x² + y² is just over 1 the NaN went through, the whole fur vector became NaN and its saturate 0, which the motion blur
-    // reads as full speed down-left: the Nopons' fur smeared over their faces (the Mac and Eden: clean). DM_VK_NAN_MINMAX=0 (start-up, A/B): as translated
-    { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NAN_MINMAX"); on = !(e && !strcmp(e, "0")); }
+    // NMax / NClamp give Maxwell's results. Keep standard FMin/FMax/FClamp on Mali <= 32.1.0 to avoid Bifrost r32p1 compiler stalls.
+    { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NAN_MINMAX"); on = (e && *e) ? (strcmp(e, "0") != 0) : !vk_mali_legacy_r32(); }
       uint32_t glsl = 0;
       for (uint32_t i = 5; on && i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) break;
           if (op == 11 && n >= 3 && !memcmp(&w[i + 2], "GLSL.std.450", 12)) glsl = w[i + 1];   // OpExtInstImport

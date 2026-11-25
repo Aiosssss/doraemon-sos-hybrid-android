@@ -54,15 +54,82 @@ static void bind_chmask(uint32_t mask) {
 typedef struct { uint32_t ncol, cfmt[8], cload[8], dfmt, dload, sload, dstore, samples, cstore[8], res_mask; } rpkey;   // cstore: 0 (memset) STORE; res_mask: bit i = inline TBDR MSAA resolve for colour slot i
 typedef struct { VkRenderPass rp; uint32_t w, h, layers, n; struct { uint32_t usage, flags, w, h, layers, fmt, fmt2, fmt3, fmt4; } a[17]; } fbkey;   // up to 8 colour + 1 depth + 8 resolve attachments
 static nvn_hmap g_rps = {.klen = sizeof(rpkey)}, g_fbs = {.klen = sizeof(fbkey)}; static pthread_mutex_t g_rp_mu = PTHREAD_MUTEX_INITIALIZER;
-// Inline TBDR MSAA resolve & low-cost post-process skip counters:
-uint64_t g_inline_resolve_opt, g_pp_skipped;
-// Without dynamic rendering (a Vulkan 1.1 / 1.2 device, V.has_dynrender) passes must be render pass objects, whatever DM_VK_RP says (vk_init refuses a device with neither)
-static int rp_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_RP"); on = V.has_imageless && (!V.has_dynrender || !(e && !atoi(e))); VKLOG("passes: %s", on ? "render pass objects with imageless framebuffers" : "dynamic rendering"); } return on; }
+// Classic Vulkan 1.0/1.1 VkFramebuffer cache (active when V.use_classic_fb == 1, e.g. Adreno 650/618 Vulkan 1.1.128):
+typedef struct {
+    VkRenderPass rp; uint32_t w, h, layers, n;
+    VkImageView views[17];
+    VkFramebuffer fb;
+} cfb_entry_t;
+static cfb_entry_t *g_cfbs; static int g_ncfbs, g_capcfbs;
+// Inline TBDR MSAA resolve, low-cost post-process & shadow-rate skip counters:
+uint64_t g_inline_resolve_opt, g_pp_skipped, g_shadow_skipped;
+// Without dynamic rendering (or on Vulkan 1.0/1.1 classic_fb fallback) passes MUST use VkRenderPass objects.
+static int rp_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DM_VK_RP");
+        on = V.use_classic_fb || (V.has_imageless && (!V.has_dynrender || !(e && !atoi(e))));
+        VKLOG("passes: %s", V.use_classic_fb ? "classic Vulkan 1.0/1.1 VkRenderPass + cached VkFramebuffer"
+                                             : (on ? "render pass objects with imageless framebuffers" : "dynamic rendering"));
+    }
+    return on;
+}
 static int fmt_has_depth(uint32_t f) { return f && f != VK_FORMAT_S8_UINT; }
 static int fmt_has_stencil(uint32_t f) { return f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_S8_UINT || f == VK_FORMAT_D16_UNORM_S8_UINT; }
 static VkRenderPass rp_get(const rpkey *k) {
     pthread_mutex_lock(&g_rp_mu); VkRenderPass rp = nvn_hm_get(&g_rps, k);
     if (!rp) {
+        if (V.use_classic_fb || !vkCreateRenderPass2) {
+            // Standard Vulkan 1.0 core vkCreateRenderPass (Adreno 650/618 Vulkan 1.1.128 without renderpass2):
+            // Preserves all loadOps & STORE_OP_DONT_CARE for Adreno GMEM tile bandwidth savings!
+            VkAttachmentDescription ad[17]; VkAttachmentReference cr[8], rr[8], dr; uint32_t na = 0;
+            for (uint32_t i = 0; i < k->ncol; i++) {
+                if (!k->cfmt[i]) { cr[i] = (VkAttachmentReference){VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_GENERAL}; continue; }
+                ad[na] = (VkAttachmentDescription){0, (VkFormat)k->cfmt[i], (VkSampleCountFlagBits)k->samples, (VkAttachmentLoadOp)k->cload[i], (VkAttachmentStoreOp)k->cstore[i],
+                    VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL};
+                cr[i] = (VkAttachmentReference){na++, VK_IMAGE_LAYOUT_GENERAL};
+            }
+            if (k->dfmt) {
+                int hd = fmt_has_depth(k->dfmt), hs = fmt_has_stencil(k->dfmt);
+                ad[na] = (VkAttachmentDescription){0, (VkFormat)k->dfmt, (VkSampleCountFlagBits)k->samples,
+                    hd ? (VkAttachmentLoadOp)k->dload : VK_ATTACHMENT_LOAD_OP_DONT_CARE, hd ? (VkAttachmentStoreOp)k->dstore : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                    hs ? (VkAttachmentLoadOp)k->sload : VK_ATTACHMENT_LOAD_OP_DONT_CARE, hs ? (VkAttachmentStoreOp)k->dstore : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL};
+                dr = (VkAttachmentReference){na++, VK_IMAGE_LAYOUT_GENERAL};
+            }
+            if (k->res_mask) {
+                for (uint32_t i = 0; i < k->ncol; i++) {
+                    if ((k->res_mask & (1u << i)) && k->cfmt[i]) {
+                        ad[na] = (VkAttachmentDescription){0, (VkFormat)k->cfmt[i], VK_SAMPLE_COUNT_1_BIT,
+                            VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE,
+                            VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL};
+                        rr[i] = (VkAttachmentReference){na++, VK_IMAGE_LAYOUT_GENERAL};
+                    } else {
+                        rr[i] = (VkAttachmentReference){VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_GENERAL};
+                    }
+                }
+            }
+            VkSubpassDescription sd = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, k->ncol, cr, k->res_mask ? rr : NULL, k->dfmt ? &dr : NULL, 0, NULL};
+            VkSubpassDependency deps[2] = {
+                {VK_SUBPASS_EXTERNAL, 0,
+                 VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                 VK_ACCESS_MEMORY_WRITE_BIT,
+                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                 VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT |
+                 VK_ACCESS_SHADER_READ_BIT, 0},
+                {0, VK_SUBPASS_EXTERNAL,
+                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                 VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                 VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0}
+            };
+            VkRenderPassCreateInfo ci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, na, ad, 1, &sd, 2, deps};
+            if (vkCreateRenderPass(V.dev, &ci, NULL, &rp)) { VKRED_ONCE(70, "vkCreateRenderPass (classic 1.0/1.1) failed"); rp = VK_NULL_HANDLE; }
+            else nvn_hm_put(&g_rps, k, rp);
+            pthread_mutex_unlock(&g_rp_mu); return rp;
+        }
         VkAttachmentDescription2 ad[17]; VkAttachmentReference2 cr[8], rr[8], dr; uint32_t na = 0;
         for (uint32_t i = 0; i < k->ncol; i++) {
             if (!k->cfmt[i]) { cr[i] = (VkAttachmentReference2){VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, NULL, VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT}; continue; }
@@ -128,6 +195,65 @@ static VkFramebuffer fb_get(const fbkey *k) {
     }
     pthread_mutex_unlock(&g_rp_mu); return fb;
 }
+static VkFramebuffer cfb_get(VkRenderPass rp, uint32_t w, uint32_t h, uint32_t layers, uint32_t na, const VkImageView *views) {
+    if (!rp || !w || !h || !layers || na > 17) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_rp_mu);
+    for (int i = 0; i < g_ncfbs; i++) {
+        const cfb_entry_t *e = &g_cfbs[i];
+        if (e->rp == rp && e->w == w && e->h == h && e->layers == layers && e->n == na &&
+            (na == 0 || memcmp(e->views, views, na * sizeof(VkImageView)) == 0)) {
+            VkFramebuffer fb = e->fb;
+            pthread_mutex_unlock(&g_rp_mu);
+            return fb;
+        }
+    }
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    VkFramebufferCreateInfo ci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, na, na ? views : NULL, w, h, layers};
+    if (vkCreateFramebuffer(V.dev, &ci, NULL, &fb)) {
+        VKRED_ONCE(71, "vkCreateFramebuffer (classic 1.0/1.1) failed");
+        pthread_mutex_unlock(&g_rp_mu);
+        return VK_NULL_HANDLE;
+    }
+    // Bound cache size (evict oldest via deferred free if > 512 entries)
+    if (g_ncfbs >= 512) {
+        vk_defer_free_framebuffer(g_cfbs[0].fb);
+        memmove(&g_cfbs[0], &g_cfbs[1], (size_t)(g_ncfbs - 1) * sizeof *g_cfbs);
+        g_ncfbs--;
+    }
+    if (g_ncfbs == g_capcfbs) {
+        int nc = g_capcfbs ? g_capcfbs * 2 : 64;
+        cfb_entry_t *arr = realloc(g_cfbs, (size_t)nc * sizeof *g_cfbs);
+        if (arr) { g_cfbs = arr; g_capcfbs = nc; }
+    }
+    if (g_ncfbs < g_capcfbs) {
+        cfb_entry_t *e = &g_cfbs[g_ncfbs++];
+        memset(e, 0, sizeof *e);
+        e->rp = rp; e->w = w; e->h = h; e->layers = layers; e->n = na;
+        if (na) memcpy(e->views, views, na * sizeof(VkImageView));
+        e->fb = fb;
+    } else {
+        vk_defer_free_framebuffer(fb);
+    }
+    pthread_mutex_unlock(&g_rp_mu);
+    return fb;
+}
+void vk_classic_fb_drop_view(VkImageView v) {
+    if (!v || !V.use_classic_fb) return;
+    pthread_mutex_lock(&g_rp_mu);
+    for (int i = 0; i < g_ncfbs; ) {
+        int hit = 0;
+        for (uint32_t j = 0; j < g_cfbs[i].n; j++) {
+            if (g_cfbs[i].views[j] == v) { hit = 1; break; }
+        }
+        if (hit) {
+            vk_defer_free_framebuffer(g_cfbs[i].fb);
+            g_cfbs[i] = g_cfbs[--g_ncfbs];
+        } else {
+            i++;
+        }
+    }
+    pthread_mutex_unlock(&g_rp_mu);
+}
 // the attachments begin_pass found, for the render pass begin: each colour slot's (and the depth's) image, view, view format and layers, size at the view's level
 static struct { vkimg_t *im; VkImageView v; uint32_t fmt, layers, w, h, bc_lv, bc_ly, bc_nly; VkImageUsageFlags usage; } P_att[9];   // (bc_*: a block-compressed image's stand-in, the level and layers this pass draws)
 
@@ -171,6 +297,8 @@ static uint32_t g_first_draw_cnt, g_first_draw_inst; static int g_first_draw_ind
 // with no blending, full RGBA write mask, no fragment discard (OpKill/Demote), no active depth/stencil test, full viewport &
 // scissor, shader outputting to the slot, and no self-feedback sampling of that slot.
 static void pass_apply_fullscreen_load_opt(void) {
+    // Non-TBDR AMD RDNA3 (Samsung Xclipse 940, vendor 0x144D) gains nothing from TBDR LOAD_OP_DONT_CARE folding; skip to avoid MSAA/character hazards.
+    if (V.props.vendorID == 0x144Du) return;
     if (g_strict_barriers || P_cleared || S.rast_discard || !S.sh[1] || S.sh[1]->has_discard) return;
     // NVN polygon mode: 0 = POINT, 1 = LINE, 2 = FILL (fix hybrid20 bug where != 0 rejected all FILL passes and zeroed dc_folded!).
     if (S.poly.mode != 2 || (S.ms.enable && S.ms.a2c && S.samples > 1u)) return;
@@ -503,39 +631,97 @@ static int pass_commit(void) {
     if (S.pass_open == 2 && S.skip_tiny_pp) return 1;
     if (S.pass_open != 2) return S.pass_open == 1;
     S.skip_tiny_pp = 0;
-    // Low-Cost Post-Process (DM_VK_LOW_COST_PP=auto|1, active on Tier 1-3 Mid/Low/Ultra-Low GPUs):
-    // Completely skip tiny 16:9 bloom mip passes (<=160x90: 160x90, 80x45, 40x22, 20x11) BEFORE vkCmdBeginRenderPass!
-    // Clears the target image once to (0,0,0,0) via vkCmdClearColorImage (zero render pass overhead), eliminating
-    // 4-6 Vulkan render passes/frame on Mali-G57/G52/G76 while keeping HUD, 3D scene, and exposure 100% intact.
-    if (vk_low_cost_pp() && !S.daspect && S.ncol == 1 && S.pass_orig_w >= 16u && S.pass_orig_w <= 160u &&
-        S.pass_orig_h >= 10u && S.pass_orig_h <= 90u &&
-        (S.pass_orig_w * 9u >= S.pass_orig_h * 14u && S.pass_orig_w * 9u <= S.pass_orig_h * 18u) &&
-        P_ca[0].imageView && vk_img_valid(P_att[0].im) && P_att[0].im->samples == 1 &&
-        (S.cfmt[0] == VK_FORMAT_R16G16B16A16_SFLOAT || S.cfmt[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
-         S.cfmt[0] == VK_FORMAT_R8G8B8A8_UNORM || S.cfmt[0] == VK_FORMAT_R8G8B8A8_SRGB)) {
-        vkimg_t *bim = P_att[0].im;
-        if (!bim->pp_zeroed && (bim->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-            VkCommandBuffer cb = vk_cmd();
-            VkClearColorValue zc = {{0.0f, 0.0f, 0.0f, 0.0f}};
-            VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-            vkCmdClearColorImage(cb, bim->img, VK_IMAGE_LAYOUT_GENERAL, &zc, 1, &rr);
-            VkImageMemoryBarrier pb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
-                VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
-                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-                bim->img, rr};
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, NULL, 0, NULL, 1, &pb);
-            bim->pp_zeroed = 1;
-            vk_tex_mark_written(bim);
+    // 1. Half-Rate (30Hz) or Off (Turbo) Shadow Map Pass Skip (DM_VK_SHADOW_RATE=2|0, v1.1.2-hybrid34):
+    //    Identifies dedicated depth-only square shadow map passes (is_shadow or >=512x512 square depth-only).
+    //    Rate 2 (Auto Tier >=2): renders shadow map on even frames, skips odd frames (reuses previous shadow map -> 50% savings!).
+    //    Rate 0 (Turbo Kentang): clears shadow depth to 1.0 once then skips all shadow passes (100% shadow savings!).
+    {
+        int srate = vk_shadow_rate();
+        if (srate != 1 && S.daspect && S.ncol == 0 && P_da.imageView && vk_img_valid(P_att[8].im)) {
+            vkimg_t *dim = P_att[8].im;
+            int is_sh = dim->is_shadow || (S.pass_orig_w == S.pass_orig_h && S.pass_orig_w >= 512u);
+            if (is_sh) {
+                if (srate == 0) {
+                    if (!dim->shadow_cleared_off && (dim->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+                        VkCommandBuffer cb = vk_cmd();
+                        VkClearDepthStencilValue zd = {1.0f, 0};
+                        VkImageSubresourceRange rr = {dim->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+                        vkCmdClearDepthStencilImage(cb, dim->img, VK_IMAGE_LAYOUT_GENERAL, &zd, 1, &rr);
+                        VkImageMemoryBarrier pb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                            VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                            dim->img, rr};
+                        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                            0, 0, NULL, 0, NULL, 1, &pb);
+                        dim->shadow_cleared_off = 1;
+                        vk_tex_mark_written(dim);
+                    }
+                    S.skip_tiny_pp = 1; P_cleared = 0;
+                    if (++g_shadow_skipped == 1 || g_shadow_skipped == 300 || g_shadow_skipped % 3000 == 0)
+                        VKLOG("[perf] shadow_rate=0 (OFF) skipped shadow pass %ux%u (count=%llu)",
+                              S.pass_w, S.pass_h, (unsigned long long)g_shadow_skipped);
+                    return 1;
+                } else if (srate == 2) {
+                    if (dim->shadow_rendered_once && (g_tex_frame & 1ull)) {
+                        S.skip_tiny_pp = 1; P_cleared = 0;
+                        if (++g_shadow_skipped == 1 || g_shadow_skipped == 300 || g_shadow_skipped % 3000 == 0)
+                            VKLOG("[perf] shadow_rate=2 (30Hz half-rate) reused previous shadow map %ux%u (count=%llu)",
+                                  S.pass_w, S.pass_h, (unsigned long long)g_shadow_skipped);
+                        return 1;
+                    }
+                    dim->shadow_rendered_once = 1;
+                }
+            }
         }
-        S.skip_tiny_pp = 1;
-        P_cleared = 0;
-        if (++g_pp_skipped == 1 || g_pp_skipped == 300 || g_pp_skipped % 3000 == 0)
-            VKLOG("[low-end] low-cost post-process skipped bloom mip render pass %ux%u fmt=%d (count=%llu)",
-                  S.pass_orig_w, S.pass_orig_h, (int)S.cfmt[0], (unsigned long long)g_pp_skipped);
-        return 1;
+    }
+    // 2. Low-Cost Post-Process (DM_VK_LOW_COST_PP=auto|1, active on Low/Ultra-Low GPUs Tier 2-3):
+    //    Skips verified 16:9 Doraemon SoS bloom/blur/DoF mip chain passes (16x10..480x270, e.g. 320x180, 240x136,
+    //    160x90, 80x45, 40x22, single color target, samples==1, non-display, depth test & write OFF even if a prior
+    //    depth attachment remains bound, HDR float or R8G8B8A8 UNORM/SRGB fullscreen quad) — NEVER touches main 3D
+    //    scene (orig >= 640x360), characters (depth test ON), shadows (square / ncol==0), or UI/display targets!
+    {
+        uint32_t pp_ow = S.pass_orig_w ? S.pass_orig_w : S.pass_w;
+        uint32_t pp_oh = S.pass_orig_h ? S.pass_orig_h : S.pass_h;
+        int pp_no_depth_use = (!S.daspect) || (!S.ds.dt && !S.ds.dw);
+        int pp_hdr_fmt = (S.cfmt[0] == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                          S.cfmt[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+                          S.cfmt[0] == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                          S.cfmt[0] == VK_FORMAT_R16G16B16A16_UNORM);
+        int pp_ldr_quad = ((S.cfmt[0] == VK_FORMAT_R8G8B8A8_UNORM || S.cfmt[0] == VK_FORMAT_R8G8B8A8_SRGB) &&
+                           !S.ds.dt && !S.ds.dw &&
+                           (g_first_draw_cnt == 0 || g_first_draw_cnt == 3 || g_first_draw_cnt == 4 || g_first_draw_cnt == 6));
+        if (vk_low_cost_pp() && pp_no_depth_use && S.ncol == 1 &&
+            pp_ow >= 16u && pp_ow <= 480u && pp_oh >= 10u && pp_oh <= 270u &&
+            (pp_ow * 9u >= pp_oh * 14u && pp_ow * 9u <= pp_oh * 18u) &&
+            P_ca[0].imageView && vk_img_valid(P_att[0].im) && P_att[0].im->samples == 1 &&
+            !(P_att[0].im->flags & NVN_TEXTURE_FLAGS_DISPLAY) &&
+            (pp_hdr_fmt || pp_ldr_quad)) {
+            vkimg_t *bim = P_att[0].im;
+            if (!bim->pp_zeroed && (bim->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+                VkCommandBuffer cb = vk_cmd();
+                VkClearColorValue zc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+                VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+                vkCmdClearColorImage(cb, bim->img, VK_IMAGE_LAYOUT_GENERAL, &zc, 1, &rr);
+                VkImageMemoryBarrier pb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                    bim->img, rr};
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, 0, NULL, 0, NULL, 1, &pb);
+                bim->pp_zeroed = 1;
+                vk_tex_mark_written(bim);
+            }
+            S.skip_tiny_pp = 1;
+            P_cleared = 0;
+            if (++g_pp_skipped == 1 || g_pp_skipped == 300 || g_pp_skipped % 3000 == 0)
+                VKLOG("[low-end] low-cost post-process skipped bloom mip render pass %ux%u (scaled %ux%u) fmt=%d dasp=%u (count=%llu)",
+                      pp_ow, pp_oh, S.pass_w, S.pass_h, (int)S.cfmt[0], (unsigned)S.daspect, (unsigned long long)g_pp_skipped);
+            return 1;
+        }
     }
     pass_apply_fullscreen_load_opt();
     g_first_draw_cnt = 0; g_first_draw_inst = 0; g_first_draw_ind = 0;
@@ -557,6 +743,44 @@ static int pass_commit(void) {
         if (vk_img_valid(P_att[ci].im)) P_att[ci].im->pp_zeroed = 0;
     }
     pass_apply_discard_lookahead();
+    // Handheld 1920x1080 -> 1280x720 renderArea clamp (saves ~55% tile bandwidth on final composite/UI pass!):
+    // Only clamp when Handheld mode is active AND active scissor/viewport strictly fits inside 1280x720
+    // (preserves full imageless framebuffer extent fk.w/fk.h while narrowing VkRenderPassBeginInfo/VkRenderingInfo renderArea).
+    {
+        extern int dm_opmode(void);
+        if (dm_opmode() == 0 && S.pass_w == 1920u && S.pass_h == 1080u &&
+            P_ri.renderArea.offset.x == 0 && P_ri.renderArea.offset.y == 0 &&
+            P_ri.renderArea.extent.width == 1920u && P_ri.renderArea.extent.height == 1080u &&
+            S.ncol >= 1 && vk_img_valid(P_att[0].im) && (P_att[0].im->flags & NVN_TEXTURE_FLAGS_DISPLAY) &&
+            !P_cleared) {
+            int32_t rx = 0, ry = 0; uint32_t rw = 0, rh = 0;
+            if (S.sc_set && S.sc.w > 0 && S.sc.h > 0 && S.sc.w <= 1280 && S.sc.h <= 720) {
+                rx = S.sc.x < 0 ? 0 : S.sc.x;
+                ry = S.sc.y < 0 ? 0 : S.sc.y;
+                rw = (uint32_t)S.sc.w; rh = (uint32_t)S.sc.h;
+            } else {
+                float vx = S.vp[0][0], vy = S.vp[0][1], vw = S.vp[0][2], vh = S.vp[0][3];
+                float x0 = vw >= 0.f ? vx : vx + vw, x1 = vw >= 0.f ? vx + vw : vx;
+                float y0 = vh >= 0.f ? vy : vy + vh, y1 = vh >= 0.f ? vy + vh : vy;
+                float aw = x1 - x0, ah = y1 - y0;
+                if (aw >= 64.f && aw <= 1280.5f && ah >= 64.f && ah <= 720.5f) {
+                    rx = x0 > 0.f ? (int32_t)x0 : 0;
+                    ry = y0 > 0.f ? (int32_t)y0 : 0;
+                    rw = (uint32_t)(aw + 0.5f); rh = (uint32_t)(ah + 0.5f);
+                }
+            }
+            if (rw > 0 && rh > 0 && (uint32_t)rx + rw <= 1920u && (uint32_t)ry + rh <= 1080u) {
+                P_ri.renderArea.offset.x = rx;
+                P_ri.renderArea.offset.y = ry;
+                P_ri.renderArea.extent.width = rw;
+                P_ri.renderArea.extent.height = rh;
+                static uint64_t hh_crop_cnt;
+                if (++hh_crop_cnt == 1 || hh_crop_cnt == 300)
+                    VKLOG("[perf] Handheld composite renderArea clamped: 1920x1080 -> %dx%d+%u,%u (count=%llu)",
+                          rw, rh, (unsigned)rx, (unsigned)ry, (unsigned long long)hh_crop_cnt);
+            }
+        }
+    }
     vkimg_t *dim = S.daspect ? P_att[8].im : NULL;
     if ((g_lrz_touch & LRZ_SWITCH) && dim && g_lrz_prev && g_lrz_prev != dim) lrz_touch(g_lrz_prev, 1);
     if (dim) g_lrz_prev = dim;
@@ -584,13 +808,24 @@ static int pass_commit(void) {
             fk.a[na].fmt3 = (uint32_t)P_res_im->fmt_cls[0]; fk.a[na].fmt4 = (uint32_t)P_res_im->fmt_cls[1]; na++;
         }
         VkRenderPass rp = rp_get(&k);
-        fk.rp = rp_compat(k.ncol, k.cfmt, k.dfmt, k.samples, k.res_mask); fk.w = P_ri.renderArea.extent.width; fk.h = P_ri.renderArea.extent.height; fk.layers = P_ri.layerCount; fk.n = na;
-        VkFramebuffer fb = rp && fk.rp ? fb_get(&fk) : VK_NULL_HANDLE;
-        if (fb) { VkRenderPassAttachmentBeginInfo abi = {VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO, NULL, na, views};
-            VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, &abi, rp, fb, P_ri.renderArea, na, cv};
-            vkCmdBeginRenderPass(vk_cmd(), &rbi, VK_SUBPASS_CONTENTS_INLINE); S.rp_pass = 1; }
-        else if (V.has_dynrender) { vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
-        else { VKRED_ONCE(76, "render pass or framebuffer failed without dynamic rendering: pass skipped"); return 0; }   // (still pass_open 2: vk_end_pass drops it)
+        VkRenderPass crp = rp_compat(k.ncol, k.cfmt, k.dfmt, k.samples, k.res_mask);
+        if (V.use_classic_fb) {
+            VkFramebuffer fb = rp && crp ? cfb_get(crp, S.pass_w, S.pass_h, P_ri.layerCount, na, views) : VK_NULL_HANDLE;
+            if (fb) {
+                VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, P_ri.renderArea, na, cv};
+                vkCmdBeginRenderPass(vk_cmd(), &rbi, VK_SUBPASS_CONTENTS_INLINE); S.rp_pass = 1;
+            } else {
+                VKRED_ONCE(76, "classic VkRenderPass or VkFramebuffer failed: pass skipped"); return 0;
+            }
+        } else {
+            fk.rp = crp; fk.w = S.pass_w; fk.h = S.pass_h; fk.layers = P_ri.layerCount; fk.n = na;
+            VkFramebuffer fb = rp && fk.rp ? fb_get(&fk) : VK_NULL_HANDLE;
+            if (fb) { VkRenderPassAttachmentBeginInfo abi = {VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO, NULL, na, views};
+                VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, &abi, rp, fb, P_ri.renderArea, na, cv};
+                vkCmdBeginRenderPass(vk_cmd(), &rbi, VK_SUBPASS_CONTENTS_INLINE); S.rp_pass = 1; }
+            else if (V.has_dynrender) { vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
+            else { VKRED_ONCE(76, "render pass or framebuffer failed without dynamic rendering: pass skipped"); return 0; }   // (still pass_open 2: vk_end_pass drops it)
+        }
     } else { vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
     S.pass_open = 1; g_vkst.passes++; g_sub_pass++; g_pass_wmem = 0;
     for (int i = 0; i < 9; i++) { vkimg_t *a = P_att[i].im; if (a && a->rt_last != g_tex_frame + 1) { a->rt_frames = a->rt_last == g_tex_frame ? a->rt_frames + 1 : 1; a->rt_last = g_tex_frame + 1; } }   // (async_pipe)
@@ -959,6 +1194,19 @@ void vk_end_pass(void) {
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
             }
             if (nib) vkCmdPipelineBarrier(vk_cmd(), src_st, dst_st, 0, 0, NULL, 0, NULL, nib, ib);
+            // Full L0/L1 -> L2 Transform Feedback publication barrier (outside render pass) for AMD RDNA3 Xclipse & Mali.
+            if (g_tf_in_pass) {
+                VkMemoryBarrier tfb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
+                    VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT | VK_ACCESS_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT | VK_ACCESS_MEMORY_READ_BIT};
+                vkCmdPipelineBarrier(vk_cmd(),
+                    VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                    0, 1, &tfb, 0, NULL, 0, NULL);
+            }
         }
         if (S.pass_res_mask && P_res_op && g_cur_op_p == P_res_op) {
             g_inline_resolved_op = P_res_op;
@@ -1272,7 +1520,14 @@ static VkPipeline mc_pipeline(uint32_t mask) {
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, prp ? NULL : &rci, 0, 2, ss, &vin, &ia, NULL, &vs, &rs, &ms, &ds, &cb, &dy, g_mc.pl, prp, 0, VK_NULL_HANDLE, -1};
     VkPipeline p = VK_NULL_HANDLE;
     VkResult mr = VK_ERROR_INITIALIZATION_FAILED;
-    if (prp || V.has_dynrender) { vk_pipe_compile_lock(); mr = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p); vk_pipe_compile_unlock(); }
+    if (prp || V.has_dynrender) {
+        if (vk_mali_legacy_r32()) {
+            if (vk_pipe_compile_trylock()) { mr = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p); vk_pipe_compile_unlock(); }
+            else return VK_NULL_HANDLE;   // worker busy compiling on Mali <= 32.1.0: fall back to full clear without blocking!
+        } else {
+            vk_pipe_compile_lock(); mr = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p); vk_pipe_compile_unlock();
+        }
+    }
     if (mr) { VKRED_ONCE(32, "masked clear pipeline failed: cleared in full"); p = VK_NULL_HANDLE; }
     vk_pipeline_cache_changed();
     g_mc.k[g_mc.n] = k; g_mc.p[g_mc.n++] = p; return p;

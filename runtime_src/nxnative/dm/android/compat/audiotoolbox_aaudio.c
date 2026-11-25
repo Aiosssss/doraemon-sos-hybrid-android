@@ -10,7 +10,9 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
+#include <unistd.h>
 #include "audio_route_policy.h"
 
 struct dm_audio_component { int unused; };
@@ -56,7 +58,23 @@ OSStatus AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID id, AudioUnitScop
 OSStatus AudioUnitInitialize(AudioUnit u) { return u->have_fmt && u->cb.inputProc ? noErr : -50; }
 
 enum { HOLD_MAX_S = 60 };   // a stop longer than this (the app in the background) ends the stream: the next start opens a new one
+static int audio_is_low_ram(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    const char *e = getenv("DM_LOW_RAM");
+    if (e && *e && strcmp(e, "auto") != 0) { v = atoi(e) >= 1; return v; }
+    long pages = sysconf(_SC_PHYS_PAGES), psize = sysconf(_SC_PAGE_SIZE);
+    uint64_t mb = (pages > 0 && psize > 0) ? ((uint64_t)pages * (uint64_t)psize) >> 20 : 8192;
+    v = (mb <= 5632) ? 1 : 0;
+    return v;
+}
 static aaudio_data_callback_result_t on_data(AAudioStream *st, void *ud, void *audio, int32_t frames) {
+    static __thread int s_prio_set = 0;
+    if (!s_prio_set) {
+        s_prio_set = 1;
+        // ANDROID_PRIORITY_URGENT_AUDIO (-19) with -16 fallback prevents [RED] AudioUnit underrun storms under heavy 3D CPU/zRAM load.
+        if (setpriority(PRIO_PROCESS, 0, -19) != 0) setpriority(PRIO_PROCESS, 0, -16);
+    }
     AudioUnit u = ud;
     atomic_fetch_add(&u->in_cb, 1);
     if (atomic_load(&u->held)) {   // stopped: silence, and the host's output (which it may have freed) is not touched
@@ -119,12 +137,22 @@ OSStatus AudioOutputUnitStart(AudioUnit u) {
     // 5 ms callbacks unless the host asks otherwise, as the iOS front end sets its I/O buffer (docs/agents/03-bringup.md "Crackling on iOS only"): left to itself AAudio
     // on the Legion Y700 called back with 6-960 frames, more than Tales of Eternia Remastered's CRI output keeps queued (about 2 blocks), so 2600 of 2000 callbacks
     // underran and 11% of the sound was zero padding; with 240 frames, 0 underruns
-    AAudioStreamBuilder_setFramesPerDataCallback(b, u->frames_hint > 0 ? u->frames_hint : (int32_t)(u->fmt.mSampleRate / 200));
+    int32_t fpcb = u->frames_hint > 0 ? u->frames_hint : (int32_t)(u->fmt.mSampleRate / 200);
+    AAudioStreamBuilder_setFramesPerDataCallback(b, fpcb);
+    // Adaptive 4-block ring buffer on low-RAM / 4 GB devices (eliminates [RED] AudioUnit underrun storms!)
+    if (audio_is_low_ram() && fpcb > 0) {
+        AAudioStreamBuilder_setBufferCapacityInFrames(b, fpcb * 4);
+    }
     AAudioStreamBuilder_setDataCallback(b, on_data, u);
     AAudioStreamBuilder_setErrorCallback(b, on_error, u);
     r = AAudioStreamBuilder_openStream(b, &u->st);
     AAudioStreamBuilder_delete(b);
     if (r != AAUDIO_OK) { u->st = NULL; return r; }
+    if (audio_is_low_ram() && fpcb > 0) {
+        int32_t burst = AAudioStream_getFramesPerBurst(u->st);
+        int32_t target_buf = (burst > 0 && burst * 4 > fpcb * 4) ? burst * 4 : fpcb * 4;
+        AAudioStream_setBufferSizeInFrames(u->st, target_buf);
+    }
     __android_log_print(ANDROID_LOG_INFO, "dmhost", "AAudio requested device %d, opened device %d", u->requested_device, AAudioStream_getDeviceId(u->st));
     // the device's own rate and channel count must be ours: AAudio converts when they differ (it reports the requested format back)
     r = AAudioStream_requestStart(u->st);

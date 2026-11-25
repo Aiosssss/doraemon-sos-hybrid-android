@@ -65,9 +65,44 @@ static inline int ov_beside(const ov_ctl *L, const ov_ctl *c) { return c->ax != 
 // x window heights from its edge and 1 - y up from the bottom at scale 1; at scale s both distances are s times as far, so the whole side scales about
 // its bottom corner. The menu button (anchored to the middle) stays at the top middle, growing down from the top edge, and so do the controls beside it
 // (ov_beside: they scale about their side's top corner, y down from the top edge)
+int dm_overlay_adaptive_btn(void);
+// Mobile-native Story of Seasons Adaptive Button default placement & radius per Switch control.
+// Returns 1 if control has a dedicated adaptive default slot (all OV_BUTTON controls); sticks/dpad/menu keep layout defaults.
+static inline int ov_adaptive_btn_def(const ov_ctl *c, float W, float H, float s, float *ox, float *oy, float *orad) {
+    if (c->kind != OV_BUTTON) return 0;
+    float sc = fminf(s, 1.15f);
+    switch (c->btn) {
+        case DM_BTN_Y:     *ox = W - 0.185f * H * sc; *oy = H - 0.245f * H * sc; *orad = 0.098f * H * sc; return 1;
+        case DM_BTN_A:     *ox = W - 0.395f * H * sc; *oy = H - 0.195f * H * sc; *orad = 0.078f * H * sc; return 1;
+        case DM_BTN_B:     *ox = W - 0.335f * H * sc; *oy = H - 0.405f * H * sc; *orad = 0.072f * H * sc; return 1;
+        case DM_BTN_X:     *ox = W - 0.165f * H * sc; *oy = H - 0.480f * H * sc; *orad = 0.072f * H * sc; return 1;
+        case DM_BTN_L:     *ox = 0.125f * H * sc;     *oy = H - 0.560f * H * sc; *orad = 0.056f * H * sc; return 1;
+        case DM_BTN_R:     *ox = W - 0.140f * H * sc; *oy = H - 0.655f * H * sc; *orad = 0.056f * H * sc; return 1;
+        case DM_BTN_ZL:    *ox = 0.125f * H * sc;     *oy = H - 0.720f * H * sc; *orad = 0.056f * H * sc; return 1;
+        case DM_BTN_ZR:    *ox = W - 0.285f * H * sc; *oy = H - 0.655f * H * sc; *orad = 0.056f * H * sc; return 1;
+        case DM_BTN_MINUS: *ox = W * 0.5f - 0.26f * H * sc; *oy = 0.088f * H * sc; *orad = 0.048f * H * sc; return 1;
+        case DM_BTN_PLUS:  *ox = W * 0.5f + 0.26f * H * sc; *oy = 0.088f * H * sc; *orad = 0.048f * H * sc; return 1;
+        case DM_BTN_RS:    *ox = W - 0.425f * H * sc; *oy = H - 0.655f * H * sc; *orad = 0.048f * H * sc; return 1;
+        case DM_BTN_LS:    *ox = 0.265f * H * sc;     *oy = H - 0.720f * H * sc; *orad = 0.048f * H * sc; return 1;
+        default: return 0;
+    }
+}
 static inline void ov_box(const ov_ctl *c, float W, float H, float b[4]) {   // (c: in OV_LAYOUTS, whose index finds the player's own place and size)
     int l, i = ov_index(c, &l); float s = dm_overlay_scale(), mx, my, cs = 1;
-    if (dm_overlay_custom(l, i, &mx, &my, &cs)) { b[0] = mx * W; b[1] = my * H; }
+    int cust = dm_overlay_custom(l, i, &mx, &my, &cs);
+    if (dm_overlay_adaptive_btn()) {
+        float ax = 0, ay = 0, ar = 0;
+        if (ov_adaptive_btn_def(c, W, H, s, &ax, &ay, &ar)) {
+            if (cust) { b[0] = mx * W; b[1] = my * H; }
+            else {
+                b[0] = fminf(fmaxf(ax, ar + 8.0f), W - ar - 8.0f);
+                b[1] = fminf(fmaxf(ay, ar + 8.0f), H - ar - 8.0f);
+            }
+            b[2] = ar * cs; b[3] = ar * cs;
+            return;
+        }
+    }
+    if (cust) { b[0] = mx * W; b[1] = my * H; }
     else if (c->ax == 0.5f) { b[0] = c->ax * W + c->x * H; b[1] = c->y * H * s; }
     else if (ov_beside(OV_LAYOUTS[l], c)) { b[0] = c->ax * W + c->x * H * s; b[1] = c->y * H * s; }
     else { b[0] = c->ax * W + c->x * H * s; b[1] = H - (1 - c->y) * H * s; }
@@ -159,31 +194,61 @@ typedef struct { int layout, w, h; uint8_t *px; float dh, scale, travel, alpha; 
                                                                                                                        // scale: texels per CSS px; travel: the knob's, CSS px
 const ov_theme *dm_overlay_theme(int layout);   // the theme's sprites for a layout, NULL when the app has none (it keeps its pixels until dm_overlay_theme_done)
 void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: their memory can go
+uint8_t *dm_overlay_adaptive_atlas(int *w, int *h);   // overlay_theme.c: pure-SVG Adaptive Button Level 2 atlas (assets/overlay/adaptive.png)
+
+// ---- Flexible Analog & Adaptive Button Level 2 (100% optional, both default OFF) ----
+int dm_overlay_flex_analog(void);
+int dm_overlay_flex_stick(float *cx, float *cy, float *alpha);   // normalized [0..1] floating center + opacity multiplier (0.25..1.0)
+int dm_overlay_adaptive_drawer(void);
+float dm_overlay_adaptive_fade(void);   // idle auto-fade multiplier (0.38..1.0)
+int dm_menu_ext_ver(void);              // bumped whenever flex_analog, adaptive_btn, or cheats change
+
+// Map a Switch button bitmask to its tile index in assets/overlay/adaptive.png (1024x1024, 8x8 tiles of 128x128 = 32 icons x [idle, held])
+static inline int ov_adaptive_tile_for_btn(uint64_t btn, int tool_ctx, int interact_ctx) {
+    switch (btn) {
+        case DM_BTN_Y:     return (tool_ctx >= 0 && tool_ctx <= 10) ? tool_ctx : 0;
+        case DM_BTN_A:     return (interact_ctx >= 0 && interact_ctx <= 2) ? (11 + interact_ctx) : 11;
+        case DM_BTN_B:     return 14;
+        case DM_BTN_X:     return 15;
+        case DM_BTN_L:     return 16;
+        case DM_BTN_R:     return 17;
+        case DM_BTN_ZL:    return 18;
+        case DM_BTN_ZR:    return 19;
+        case DM_BTN_MINUS: return 20;
+        case DM_BTN_PLUS:  return 21;
+        case DM_BTN_RS:    return 22;
+        case DM_BTN_LS:    return 23;
+        default:           return -1;
+    }
+}
 
 // ---- the pause menu: a panel in the middle of the window: a row of tabs, the open tab's rows, and Resume. Everything is placed in a panel rectangle p
 // (x, y, width, height: the window's for touches, the raster's for drawing), so the touches and the drawing agree ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_PAD, OVM_AUDIO, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
-            // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
-            // OVM_PAD: a controller's face buttons by their position or by their label (front_android.c pad_labels)
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_FLEX_ANALOG, OVM_ADAPTIVE_BTN, OVM_EDIT, OVM_RUMBLE, OVM_CHEATS, OVM_SCREEN, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_PAD, OVM_AUDIO, OVM_RESUME, OVM_TAB, OVM_N };
 #define OVM_TABS 2
-#define OVM_PER_TAB 5
-static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PAD}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_AUDIO}};
+#define OVM_PER_TAB 7
+static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {
+    {OVM_OVERLAY, OVM_OPACITY, OVM_FLEX_ANALOG, OVM_ADAPTIVE_BTN, OVM_EDIT, OVM_RUMBLE, OVM_PAD},
+    {OVM_CHEATS,  OVM_SCREEN,  OVM_FPS,         OVM_MODE,         OVM_EXPORT, OVM_IMPORT, OVM_AUDIO}
+};
 static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Gamepad", "Game"};
 #define OVM_ROWS (OVM_PER_TAB + 2)   // the tabs, a tab's rows (as many for every tab: the panel keeps its size), Resume
 int dm_menu_audio_available(void);
+int dm_screen_mode(void);            // 0 = Normal 16:9, 1 = Full Screen (Stretch), 2 = Full Screen (Zoom/Crop)
 static inline int ov_menu_item(int tab, int row) {
     int item = row == 0 ? OVM_TAB : row == OVM_ROWS - 1 ? OVM_RESUME : row > 0 && row < OVM_ROWS - 1 ? OVM_TAB_ITEMS[tab & 1][row - 1] : -1;
     return item == OVM_AUDIO && !dm_menu_audio_available() ? -1 : item;
 }
-#define OV_MENU_ROW 0.115f   // row height, of the window's height
-#define OV_MENU_W 0.95f      // panel width, of the window's height
-#define OV_MENU_PAD 0.03f
+#define OV_MENU_ROW 0.105f   // row height, of the window's height (clean fit for 8 rows)
+#define OV_MENU_W 1.02f      // panel width, of the window's height
+#define OV_MENU_PAD 0.028f
 #define OV_OPACITY_MIN 20    // the gamepad's opacity, percent (the Opacity slider, settings.txt opacity=)
 #define OV_OPACITY_MAX 80
 // what the menu shows (-1 = closed): bit 0 the gamepad is on, bit 1 rumble is on, bit 2 docked, bit 3 the frame rate shown, bits 4..7 the highlighted row + 1
 // (0 = none), bit 8 the open tab, bits 9..15 the opacity in percent, bits 20..23 the last export's outcome (OVX_*), bits 24..27 a count of exports (its name
-// changes with each). Bit 16: the text entry's panel instead (its edit count below); bit 17: the layout editor (OVE_ST_* below); bit 18: the save picker (OVS_ST)
-#define OVT_ST 0x10000   // the mode bits of dm_menu_state, one each: OVT_ST the text entry, OVE_ST the layout editor, OVS_ST the save picker (tests/test_menu_bits.py)
+// changes with each). Bit 16: the text entry's panel instead (its edit count below); bit 17: the layout editor (OVE_ST_* below); bit 18: the save picker (OVS_ST); bit 19: cheats picker (OVC_ST)
+#define OVT_ST 0x10000
+#define OVC_ST 0x80000
 int dm_menu_state(void);
 enum { OVX_IDLE, OVX_BUSY, OVX_DONE, OVX_NOSAVE, OVX_FAILED };   // Export save: the button; copying; the export's name; the game has not saved yet; failed
 int dm_save_note(char *out, int cap);   // front_android.c: the outcome (OVX_*) and the last export's name, or why it failed
@@ -246,6 +311,7 @@ static inline int ov_ed_button_at(float x, float y, const float p[4], int first,
 enum { OVS_EMPTY, OVS_TITLE, OVS_ITEM, OVS_NOTE, OVS_BUTTON, OVS_BACK };   // a row: nothing; the title (left) and the page (right); a save (its name, its size);
 typedef struct { int style; char left[80], right[40]; } ov_srow;            // a line of text; a button (the import); Back or Cancel, centred as Resume is
 int dm_save_rows(ov_srow rows[OVM_ROWS]);   // front_android.c: the picker's rows, 0 when it is not open
+int dm_cheat_rows(ov_srow rows[OVM_ROWS]);  // front_android.c: the in-game cheats picker's rows, 0 when not open
 
 // ---- the text entry's keyboard (front_android.c front_text_input, drawn by gfx_vk_present.c ov_text_panel), in the pause menu's panel rectangle ----
 // Four rows of ten character keys and a row of four wide ones; p is the panel's rectangle (x, y, width, height: the window's for touches, the raster's for drawing).

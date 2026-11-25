@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="128" height="128" viewBox="0 0 128 128">
+<path fill-rule="nonzero" fill="rgb(100%, 97.254902%, 90.588235%)" fill-opacity="0.22" stroke-width="5.76" stroke-linecap="butt" stroke-linejoin="miter" stroke="rgb(55.294118%, 35.686275%, 20.392157%)" stroke-opacity="0.78" stroke-miterlimit="10" d="M 120.320312 64 C 120.320312 95.105469 95.105469 120.320312 64 120.320312 C 32.894531 120.320312 7.679688 95.105469 7.679688 64 C 7.679688 32.894531 32.894531 7.679688 64 7.679688 C 95.105469 7.679688 120.320312 32.894531 120.320312 64 "/>
+<path fill="none" stroke-width="2.816" stroke-linecap="butt" stroke-linejoin="miter" stroke="rgb(96.470588%, 81.568627%, 47.843137%)" stroke-opacity="0.85" stroke-miterlimit="10" d="M 115.25 64 C 115.25 92.304688 92.304688 115.25 64 115.25 C 35.695312 115.25 12.75 92.304688 12.75 64 C 12.75 35.695312 35.695312 12.75 64 12.75 C 92.304688 12.75 115.25 35.695312 115.25 64 "/>
+<path fill="none" stroke-width="3.072" stroke-linecap="round" stroke-linejoin="miter" stroke="rgb(96.470588%, 81.568627%, 47.843137%)" stroke-opacity="0.65" stroke-miterlimit="10" d="M 104.550781 64 L 111.308594 64 M 64 104.550781 L 64 111.308594 M 23.449219 64 L 16.691406 64 M 64 23.449219 L 64 16.691406 "/>
+</svg>

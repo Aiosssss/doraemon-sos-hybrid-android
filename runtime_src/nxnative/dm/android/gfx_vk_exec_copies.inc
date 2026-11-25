@@ -24,7 +24,8 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
     // by routing 1:1 buffer transfers through a temporary 1:1 VkImage + vkCmdBlitImage instead of permanently
     // unscaling im back to 1280x720! (Never-GPU-written >=1024x1024 square uploads still unscale 1:1 to protect font atlases.)
     if (!im->ds_shift && im->orig_w && im->orig_h && (im->orig_w != im->w || im->orig_h != im->h)) {
-        int maybe_font_atlas = to_texture && !im->gpu_w && im->orig_w == im->orig_h && im->orig_w >= 1024u;
+        // Never mistake a shadow-scaled RT (im->is_shadow == 1, e.g. 1024x1024 -> 512x512 fmt 0x25) for a font atlas!
+        int maybe_font_atlas = !im->is_shadow && to_texture && !im->gpu_w && im->orig_w == im->orig_h && im->orig_w >= 1024u;
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(V.pd, im->fmt, &fp);
         int can_blit = !maybe_font_atlas && (im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && !f->compressed && !f->dec &&

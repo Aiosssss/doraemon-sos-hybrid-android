@@ -258,10 +258,10 @@ void crash_thread_init(void) {
 }
 // Whether the crash handlers are still ours after a library loaded (Android: the Vulkan driver, gfx_vk_core.c). Issue #64's Adreno 750 died in its shader compiler
 // with a tombstone and no CRASH lines in log.txt; a handler the driver installs over ours would do that. Only logged, not undone: the library may rely on its own
-static const char *const g_sig_names[] = {[SIGSEGV] = "SIGSEGV", [SIGBUS] = "SIGBUS", [SIGILL] = "SIGILL", [SIGTRAP] = "SIGTRAP", [SIGABRT] = "SIGABRT"};
+static const char *const g_sig_names[] = {[SIGSEGV] = "SIGSEGV", [SIGBUS] = "SIGBUS", [SIGILL] = "SIGILL", [SIGTRAP] = "SIGTRAP", [SIGABRT] = "SIGABRT", [SIGFPE] = "SIGFPE"};
 void crash_handlers_check(const char *when) {
-    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT};
-    for (int i = 0; i < 5; i++) { struct sigaction o; if (sigaction(sigs[i], NULL, &o)) continue;
+    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT, SIGFPE};
+    for (int i = 0; i < 6; i++) { struct sigaction o; if (sigaction(sigs[i], NULL, &o)) continue;
         if (o.sa_flags & SA_SIGINFO && o.sa_sigaction == on_crash) continue;
         Dl_info di; void *h = o.sa_flags & SA_SIGINFO ? (void *)o.sa_sigaction : (void *)o.sa_handler;
         LOG("[RED] crash: the %s handler is not ours %s: %p (%s)", g_sig_names[sigs[i]], when, h, h && dladdr(h, &di) && di.dli_fname ? di.dli_fname : "?"); }
@@ -282,7 +282,7 @@ void crash_install(void) {
     }
     // abort() too (an assertion or an uncaught exception in the host or a framework): Big Brain Academy: Brain vs. Brain died once with SIGABRT 11 minutes into a run with nothing
     // in the log and no crash report, so where it came from was lost
-    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT};
-    for (int i = 0; i < 5; i++) { struct sigaction o; sigaction(sigs[i], &sa, &o);
+    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT, SIGFPE};
+    for (int i = 0; i < 6; i++) { struct sigaction o; sigaction(sigs[i], &sa, &o);
         if (!(o.sa_flags & SA_SIGINFO && o.sa_sigaction == on_crash)) { g_old_sa[sigs[i]] = o; g_old_ok[sigs[i]] = 1; } }   // (a second call keeps the first's)
 }

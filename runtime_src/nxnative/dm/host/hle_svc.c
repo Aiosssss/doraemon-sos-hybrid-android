@@ -23,6 +23,9 @@ int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintp
 static uint8_t *g_alias; static size_t g_alias_cap;
 static _Atomic uint64_t *g_alias_bits;   // alias region page bitmap (alias_pages)
 static uint8_t *g_stack; static size_t g_stack_cap;
+uint8_t *dm_guest_heap_base(size_t *out_cur) { if (out_cur) *out_cur = g_heap_cur; return g_heap; }
+uint8_t *dm_guest_alias_base(size_t *out_cap) { if (out_cap) *out_cap = g_alias_cap; return g_alias; }
+uint8_t *dm_guest_as_base(size_t *out_cap) { if (out_cap) *out_cap = RESERVE; return g_as; }
 // The address lies in the guest address block (every guest thread stack is here: the game's own heap or the stack region); the big-stack entry (hle_bigstack.c) uses it to decide whether to switch stacks
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < RESERVE; }
 

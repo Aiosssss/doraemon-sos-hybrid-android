@@ -48,10 +48,18 @@ VK_FNS(VK_DECL) VK_DEV_FNS(VK_DECL)
 
 // ---- device ----
 typedef struct {
+    uint64_t frame, fence;
+    uint32_t draws, passes, dispatches;
+    uint64_t last_vs, last_fs, last_gs, last_cs;
+    struct { uint64_t vs, fs, gs; } new_pipes[8];
+    uint32_t n_new_pipes;
+} vk_sub_diag_t;
+typedef struct {
     VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qf;
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mem;
     VkPipelineCache pcache;
     int has_bc, has_astc, has_gs, has_gs_pointsize, has_depth_clip_ctl, has_depth_bias_clamp, has_custom_border, has_robust2, has_xfb, has_imageless, has_dtiming, has_dynrender, has_timeline, has_draw_count, robust_buf;
+    int use_classic_fb;    // Vulkan 1.0/1.1 fallback (e.g. Adreno 650/618 1.1.128 without dynamicRendering or imagelessFramebuffer): classic vkCreateRenderPass + cached VkFramebuffer
     int has_divisor;       // vertexAttributeInstanceRateDivisor (VK_EXT_vertex_attribute_divisor or the KHR one): streams stepping per N instances (build_pipeline)
     int has_nonzero_first_inst; // VK_KHR_vertex_attribute_divisor supportsNonZeroFirstInstance (1 on EXT or when KHR reports true; 0 -> emulate via per-instance VBO offsets)
     float max_aniso;
@@ -60,8 +68,16 @@ typedef struct {
     uint32_t sg_size, sg_stages, sg_ops, sg_quad_all, sg_min, sg_max, sg_maxwgs, sg_pin_stages; VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg_pin;
     VkDeviceSize tbuf_align_uniform, tbuf_align_storage;
     int tbuf_single_uniform, tbuf_single_storage;
+    // Submission sequencing, non-blocking pool retire tracking, and last-submitted diagnostic snapshot (hybrid36):
+    uint64_t sub_seq, completed_seq;
+    int dev_lost_streak;
+    vk_sub_diag_t cur_sub_diag, last_sub_diag;
 } vkdev_t;
 extern vkdev_t V;
+void vk_diag_note_draw(uint64_t vs, uint64_t fs, uint64_t gs);
+void vk_diag_note_dispatch(uint64_t cs);
+void vk_diag_note_new_pipe(uint64_t vs, uint64_t fs, uint64_t gs);
+void vk_pool_retire_drain(void);
 const void *vk_sg_pin(VkShaderStageFlagBits stage, const uint32_t *local);   // DM_VK_SUBGROUP_PIN: a game pipeline stage's pNext, NULL when the driver picks its size (local: a compute shader's workgroup size)
 // gfx_vk_subgroup.c (no Vulkan): the module as subgroups of one invocation when it uses a subgroup class not in ops (its stage's; 0 when the device has none there).
 // NULL when there is nothing the stage lacks (why empty) or it uses something not covered (why names it); the module then stays as it is
@@ -80,7 +96,8 @@ void vk_pools_sync(VkCommandBuffer cb);
 int vk_pool_is_copied(const void *addr, size_t len);
 int vk_disable_msaa(void);   // DM_VK_DISABLE_MSAA: 1 disables MSAA (experimental; default 0 native MSAA on all GPUs)
 int vk_no_a2c(void);         // DM_VK_NO_A2C: 1 disables alphaToCoverageEnable (default on Mali via VQ_NO_A2C; 0 on Adreno)
-int vk_pool_safe_sync(void);   // DM_VK_POOL_SAFE_SYNC: 1 (default) Pipelined Zero-Stall Safe Sync; 2 = Hard Serial Debug fallback; 0 = Legacy overlap A/B
+int vk_pool_safe_sync(void);   // DM_VK_POOL_SAFE_SYNC: 2 (default) Serial Safe Sync + Safe Hot16 + Deferred Wait; 1 = Legacy Staged; 0 = Legacy
+int vk_deferred_wait(void);    // DM_VK_DEFERRED_WAIT (default 1): safe CPU+GPU pipelining via per-slot s->up staging in safe_sync=2
 int vk_safe1_hot_blocks(void);   // DM_VK_SAFE1_HOT_BLOCKS (default 1): 0 disables hot blocks in safe_sync=1 while keeping overlap=1
 int vk_safe1_rb_staged(void);    // DM_VK_SAFE1_RB_STAGED (default 1): 0 disables async rb_staged in safe_sync=1 while keeping overlap=1
 int vk_safe1_diff1k(void);       // DM_VK_SAFE1_DIFF1K (default 1): 0 uploads full dirty 64KB blocks via s->up + stamp0 while keeping overlap=1
@@ -97,18 +114,35 @@ int vk_gpu_pending(uint64_t a, uint64_t n);       // gfx_vk_core.c: 1 if an inco
 void vk_sub_timing_add(int idx, uint64_t ns);   // 0=pool_upload, 1=pool_readback, 2=dirty_rearm, 3=replay, 4=vk_submit, 5=fence_wait, 6=present
 void vk_sub_timing_snapshot(uint64_t out[7]);
 int vk_mali_legacy_compiler(void);   // ARM Mali Vulkan 1.1 or driver < 40.0 (e.g. Mali-G57 r32p1): serialize pipeline compile & skip bg warm
+int vk_mali_legacy_r32(void);        // ARM Mali driver <= 32.1.0 (0x08001000, e.g. Mali-G76/G57/G52 r32p1/r26p0): 100% non-blocking async pipe + bad-shader guard
 int vk_mali_bifrost_legacy(void);    // ARM Mali Bifrost driver < 32.0 (e.g. Mali-G52 r26p0 = 0x06800000): disable order_keep & force pass barriers
 int vk_mali_old_driver(void);        // ARM Mali driver < 49.0 (e.g. Mali-G615 44.1.0, G57 32.1.0, G52 26.0.0)
 int vk_mali_low_end(void);           // ARM Mali 2-core / entry tier (Mali-G52/G57/G68, Adreno 610..642, subgroups <= 8, or driver < 40.0)
 int vk_gpu_ultra_low_end(void);      // Ultra-low-end GPUs (Mali-G52/G51/G31, PowerVR, Adreno 610/612/5xx and below) -> default 30 FPS Stabil in auto mode
 int vk_gpu_tier(void);               // 0=Flagship/Upper-Mid, 1=Mid-Range (0.75x), 2=Low-End (0.67x), 3=Ultra Low-End (0.55x)
 int vk_low_cost_pp(void);            // DM_VK_LOW_COST_PP: auto (1 on Tier 2-3 low-end) | 1 | 0
-float vk_shadow_scale(void);         // DM_VK_SHADOW_SCALE: auto (0.5 on Tier 2-3 low-end, 1.0 Flagship/Mid) | 0.5 | 1.0
+int vk_samsung_safe(void);           // DM_VK_SAMSUNG_SAFE: auto (1 on vendorID 0x144D Xclipse) | 1 | 0
+int vk_shadow_rate(void);            // DM_VK_SHADOW_RATE: 1=60Hz full, 2=30Hz half-rate (auto on Tier >=2), 0=off (Turbo)
+float vk_shadow_scale(void);         // DM_VK_SHADOW_SCALE: auto (0.5 on Tier 1-3, 1.0 Flagship) | 0.5 | 1.0
+void vk_classic_fb_drop_view(VkImageView v);   // invalidate & defer-free cached classic VkFramebuffers referencing v
+enum {
+    VK_WD_IDLE = 0, VK_WD_ACQUIRE_IMAGE, VK_WD_POOL_UPLOAD, VK_WD_REPLAY_DRAW,
+    VK_WD_PIPELINE_COMPILE, VK_WD_VK_SUBMIT, VK_WD_FENCE_WAIT, VK_WD_PRESENT, VK_WD_POOL_READBACK
+};
+void vk_wd_enter(int phase, uint64_t vs, uint64_t fs);
+void vk_wd_leave(void);
+void vk_bad_pipes_init(void);
+int vk_bad_pipe_check(uint64_t vs, uint64_t fs);
+void vk_bad_pipe_add(uint64_t vs, uint64_t fs, const char *reason);
+void vk_pipe_worker_begin(uint64_t vs, uint64_t fs);
+void vk_pipe_worker_end(void);
 int vk_low_ram_tier(void);           // 0 = >=5.5 GiB, 1 = 4 GB Low-RAM (Anti-LMK), 2 = <=3.5 GB Ultra Low-RAM (DM_LOW_RAM=0|1|2 override)
 float vk_render_scale(void);         // DM_VK_RENDER_SCALE: 1.0 on high-end >=6 GB, 0.67 on tier 1 / Mali-G52..G68, 0.55 on tier 2
 int vk_tex_downscale(void);          // DM_VK_TEX_DOWNSCALE: 1 on high-end >=6 GB, 2 on tier 1 / Mali-G52..G68, 4 on tier 2
-void vk_pipe_compile_lock(void);     // serializes driver pipeline compiler calls on legacy Mali (<40.0 / Vulkan 1.1); no-op elsewhere
+void vk_pipe_compile_lock(void);     // serializes driver pipeline compiler calls across replay + async worker
+int vk_pipe_compile_trylock(void);   // non-blocking trylock (returns 1 if acquired, 0 if busy)
 void vk_pipe_compile_unlock(void);
+void vk_present_extent(int *w_out, int *h_out);   // active swapchain window extent (for 1:1 touch scaling)
 void vk_record_device_lost(const char *where, VkResult r);   // logs full context + writes last_launch_error.txt & .gpu_device_lost recovery marker
 
 // ---- submissions (gfx_vk_core.c) ----
@@ -143,7 +177,7 @@ struct vkimg {
     VkImageUsageFlags usage; VkImageCreateFlags cflags;   // as created (an imageless framebuffer names them)
     VkImage img; VkDeviceMemory mem; void *sub; VkFormat fmt; VkImageViewType vtype; VkImageAspectFlags aspect;
     uint32_t w, h, d, layers, levels, samples; int target, nvn_format;
-    uint32_t orig_w, orig_h; uint8_t ds_shift, no_scale, ever_sampled, pp_zeroed, depth_ever_loaded_across_sub; uint32_t depth_clear_frames; uint64_t depth_last_sub, vram_bytes;   // guest dims before render scale / BC downscale shift / unscale lock / ever sampled or copy-read / low-cost PP zeroed / proven 1x 3D depth clear tracking / actual VRAM accounting
+    uint32_t orig_w, orig_h; uint8_t ds_shift, no_scale, is_shadow, shadow_rendered_once, shadow_cleared_off, ever_sampled, pp_zeroed, depth_ever_loaded_across_sub; uint32_t depth_clear_frames; uint64_t depth_last_sub, vram_bytes;   // guest dims before render scale / BC downscale shift / unscale lock / shadow RT scale+rate tracking / ever sampled or copy-read / low-cost PP zeroed / proven 1x 3D depth clear tracking / actual VRAM accounting
     VkImageLayout layout;           // version 1 keeps every image in GENERAL after its first use
     uint8_t family_formats, family_closed;   // logical family members already shared; packaged metadata prevents adding new formats
     int packaged;                   // filled from guest memory (deswizzled upload), re-uploaded when its pages change

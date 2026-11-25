@@ -24,6 +24,7 @@
     <!-- Settings Panel Header & Tabs -->
     <string name="settings_title">Game Settings</string>
     <string name="tab_basic">General</string>
+    <string name="tab_cheats">Cheats</string>
     <string name="tab_advanced">Advanced &amp; Log</string>
 
     <!-- Quick Presets -->
@@ -55,7 +56,25 @@
     <string name="lbl_safe_sync_card_sub">Locked ON by default for 0% flicker across all GPUs. Change in Advanced tab.</string>
     <string name="lbl_audio_vol_fmt">Audio Volume: %1$d%%</string>
     <string name="lbl_virtual_gamepad">On-Screen Virtual Gamepad</string>
+    <string name="lbl_flex_analog">Flexible Analog (Floating)</string>
+    <string name="sub_flex_analog">OFF = Fixed stick • ON = Floating left analog follows your thumb</string>
+    <string name="lbl_adaptive_btn">Adaptive Button — Level 2 (SVG)</string>
+    <string name="sub_adaptive_btn">OFF = Classic pad • ON = Pure SVG mobile buttons + tool icons &amp; drawer</string>
     <string name="lbl_rumble_fps">Vibration &amp; FPS Counter</string>
+
+    <!-- Cheats Tab (Optional, ALL Default OFF) -->
+    <string name="sec_cheats_builtin">Built-in Cheats v1.1.2 (Default OFF)</string>
+    <string name="lbl_cheat_master">Master Cheat Engine</string>
+    <string name="sub_cheat_master">OFF by default (zero FPS impact). Toggle anytime in Pause Menu too.</string>
+    <string name="sec_cheats_atm">Atmosphere Cheat Files (.txt)</string>
+    <string name="sub_cheats_atm">Supports Switch Atmosphere .txt files (e.g. 306DFCFC9EBA4A1A.txt or 4EE6FFDA7267A6E0.txt). Active v1.1.2 Build ID: 306DFCFC9EBA4A1A.</string>
+    <string name="btn_import_cheat">Import Cheat (.txt)</string>
+    <string name="btn_clear_cheats">Clear Imported</string>
+    <string name="cheats_imported_empty">No Atmosphere .txt cheat files imported yet.</string>
+    <string name="toast_cheat_imported">Imported %1$s (%2$d cheats found)</string>
+    <string name="toast_cheat_imported_mismatch">Imported %1$s (%2$d cheats) — Note: filename build ID differs from v1.1.2 (306DFCFC9EBA4A1A)</string>
+    <string name="toast_cheat_import_fail">Failed to import cheat file: %1$s</string>
+    <string name="toast_cheats_cleared">Removed %1$d imported cheat file(s)</string>
     <string name="mod_status_original">Language / RomFS Mod: Original RomFS</string>
     <string name="mod_status_active_fmt">Active Mod: %1$s (%2$d files)</string>
     <string name="btn_install_mod">Install Mod (.zip)</string>
@@ -77,6 +96,7 @@
     <string name="sub_safe_sync_adv">Mode 2 is recommended (0% flicker). Mode 1 is experimental and may cause red/shadow flicker.</string>
     <string name="lbl_robust_access">Robust Buffer Access (Anti-Red Flicker)</string>
     <string name="lbl_inline_resolve">Inline TBDR MSAA Resolve (Saves GPU)</string>
+    <string name="lbl_deferred_wait">Safe Pipelining (Deferred Wait — 60 FPS Boost)</string>
     <string name="lbl_strict_barriers">Strict Vulkan Barriers (Diagnostic)</string>
     <string name="lbl_bc_cache">BC Texture Disk Cache (Mali)</string>
     <string name="lbl_low_ram">Memory / Anti-LMK Profile</string>
@@ -195,4 +215,25 @@
     <string name="dlg_restore_romfs_msg">Disables the mod and restores all original RomFS files in ~1 second without re-importing NSP.</string>
     <string name="toast_romfs_restored">Original RomFS restored (%1$d files)</string>
     <string name="toast_romfs_restore_fail">Failed to restore: %1$s</string>
+
+    <!-- hybrid34 Controls (Turbo Preset, Shadow Rate, Screen Mode, Xbox Layout, Samsung Safe, Native Surface) -->
+    <string name="preset_turbo">Turbo</string>
+    <string name="toast_preset_turbo">Turbo Potato preset applied (Max FPS: 50% scale, shadows OFF, 720p surface).</string>
+    <string name="lbl_shadow_rate">Shadow Update Rate</string>
+    <string name="sp_shadow_rate_auto">Auto (30Hz Low-End / 60Hz Flagship)</string>
+    <string name="sp_shadow_rate_full">Full (60Hz)</string>
+    <string name="sp_shadow_rate_half">Half-Rate 2× (30Hz, Fast)</string>
+    <string name="sp_shadow_rate_off">Off (Max Turbo FPS)</string>
+    <string name="lbl_screen_mode">Screen Mode (Aspect Ratio)</string>
+    <string name="sp_screen_16_9">Normal 16:9</string>
+    <string name="sp_screen_stretch">Full Screen (Stretch)</string>
+    <string name="sp_screen_zoom">Full Screen (Zoom / Crop)</string>
+    <string name="lbl_pad_layout">Controller Button Layout</string>
+    <string name="sp_pad_nintendo">Nintendo (Switch Position)</string>
+    <string name="sp_pad_xbox">Xbox (A=Confirm / B=Back)</string>
+    <string name="lbl_samsung_safe">Samsung Character Safe Mode (Xclipse)</string>
+    <string name="sp_samsung_safe_auto">Auto (ON on Samsung Xclipse)</string>
+    <string name="sp_samsung_safe_on">Force ON (Mali-Safe Path)</string>
+    <string name="sp_samsung_safe_off">Force OFF</string>
+    <string name="lbl_native_surface_res">Native Screen Surface (Disable WQHD+ Cap)</string>
 </resources>

@@ -24,6 +24,7 @@
     <!-- Header & Tab Panel Pengaturan -->
     <string name="settings_title">Pengaturan Permainan</string>
     <string name="tab_basic">Utama</string>
+    <string name="tab_cheats">Cheat</string>
     <string name="tab_advanced">Lanjutan &amp; Log</string>
 
     <!-- Preset Cepat -->
@@ -55,7 +56,25 @@
     <string name="lbl_safe_sync_card_sub">Terkunci aktif secara default untuk 0% kedip di semua GPU. Ubah di tab Lanjutan.</string>
     <string name="lbl_audio_vol_fmt">Volume Audio: %1$d%%</string>
     <string name="lbl_virtual_gamepad">Virtual Gamepad di Layar</string>
+    <string name="lbl_flex_analog">Analog Fleksibel (Floating)</string>
+    <string name="sub_flex_analog">OFF = Posisi tetap • ON = Analog kiri mengambang mengikuti jempol</string>
+    <string name="lbl_adaptive_btn">Adaptive Button — Level 2 (SVG)</string>
+    <string name="sub_adaptive_btn">OFF = Stik klasik • ON = Tombol mobile SVG tanpa teks + ikon alat &amp; drawer</string>
     <string name="lbl_rumble_fps">Getaran &amp; Penghitung FPS</string>
+
+    <!-- Tab Cheat (Opsional, SEMUA Default OFF) -->
+    <string name="sec_cheats_builtin">Cheat Bawaan v1.1.2 (Default OFF)</string>
+    <string name="lbl_cheat_master">Master Engine Cheat</string>
+    <string name="sub_cheat_master">OFF secara default (0% beban FPS). Bisa ON/OFF langsung saat main di Pause Menu.</string>
+    <string name="sec_cheats_atm">Import File Cheat Atmosphere (.txt)</string>
+    <string name="sub_cheats_atm">Mendukung file .txt Atmosphere Switch (mis. 306DFCFC9EBA4A1A.txt atau 4EE6FFDA7267A6E0.txt). Build ID v1.1.2: 306DFCFC9EBA4A1A.</string>
+    <string name="btn_import_cheat">Import Cheat (.txt)</string>
+    <string name="btn_clear_cheats">Hapus Impor</string>
+    <string name="cheats_imported_empty">Belum ada file cheat Atmosphere (.txt) yang diimpor.</string>
+    <string name="toast_cheat_imported">Berhasil import %1$s (%2$d cheat ditemukan)</string>
+    <string name="toast_cheat_imported_mismatch">Berhasil import %1$s (%2$d cheat) — Catatan: Build ID nama file berbeda dari v1.1.2 (306DFCFC9EBA4A1A)</string>
+    <string name="toast_cheat_import_fail">Gagal import file cheat: %1$s</string>
+    <string name="toast_cheats_cleared">%1$d file cheat impor dihapus</string>
     <string name="mod_status_original">Mod Bahasa Indonesia: RomFS Asli</string>
     <string name="mod_status_active_fmt">Mod Aktif: %1$s (%2$d file)</string>
     <string name="btn_install_mod">Pasang Mod (.zip)</string>
@@ -77,6 +96,7 @@
     <string name="sub_safe_sync_adv">Mode 2 disarankan (0% kedip). Mode 1 eksperimental dan dapat memicu kedip merah/bayangan.</string>
     <string name="lbl_robust_access">Robust Buffer Access (Anti Kedip Merah)</string>
     <string name="lbl_inline_resolve">Inline TBDR MSAA Resolve (Hemat GPU)</string>
+    <string name="lbl_deferred_wait">Pipelining Aman (Deferred Wait — Boost 60 FPS)</string>
     <string name="lbl_strict_barriers">Strict Vulkan Barriers (Diagnostik)</string>
     <string name="lbl_bc_cache">Disk Cache Tekstur BC (Mali)</string>
     <string name="lbl_low_ram">Profil Memori / Anti-LMK</string>
@@ -195,4 +215,25 @@
     <string name="dlg_restore_romfs_msg">Menonaktifkan mod dan mengembalikan seluruh file RomFS asli dalam ~1 detik tanpa perlu import ulang NSP.</string>
     <string name="toast_romfs_restored">RomFS asli dipulihkan (%1$d file)</string>
     <string name="toast_romfs_restore_fail">Gagal memulihkan: %1$s</string>
+
+    <!-- Kontrol hybrid34 (Turbo Kentang, Shadow Rate, Mode Layar, Xbox, Samsung Safe, Resolusi Native) -->
+    <string name="preset_turbo">Turbo</string>
+    <string name="toast_preset_turbo">Preset Turbo Kentang aktif (FPS Maksimal: 50% scale, bayangan MATI, surface 720p).</string>
+    <string name="lbl_shadow_rate">Kecepatan Update Bayangan</string>
+    <string name="sp_shadow_rate_auto">Otomatis (30Hz Low-End / 60Hz Flagship)</string>
+    <string name="sp_shadow_rate_full">Penuh (60Hz)</string>
+    <string name="sp_shadow_rate_half">Hemat 2× (30Hz, Ringan)</string>
+    <string name="sp_shadow_rate_off">Mati (Turbo FPS Maksimal)</string>
+    <string name="lbl_screen_mode">Mode Layar (Aspect Ratio)</string>
+    <string name="sp_screen_16_9">Normal 16:9</string>
+    <string name="sp_screen_stretch">Full Screen (Stretch)</string>
+    <string name="sp_screen_zoom">Full Screen (Zoom / Crop)</string>
+    <string name="lbl_pad_layout">Tata Letak Controller</string>
+    <string name="sp_pad_nintendo">Nintendo (Posisi Switch)</string>
+    <string name="sp_pad_xbox">Xbox (A=OK / B=Kembali)</string>
+    <string name="lbl_samsung_safe">Mode Aman Karakter Samsung (Xclipse)</string>
+    <string name="sp_samsung_safe_auto">Otomatis (Aktif di Samsung Xclipse)</string>
+    <string name="sp_samsung_safe_on">Paksa Aktif (Jalur Aman Mali)</string>
+    <string name="sp_samsung_safe_off">Paksa Mati</string>
+    <string name="lbl_native_surface_res">Resolusi Layar Native (Matikan Cap WQHD+)</string>
 </resources>

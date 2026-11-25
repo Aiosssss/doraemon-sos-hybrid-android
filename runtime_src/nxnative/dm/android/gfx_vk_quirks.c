@@ -12,6 +12,7 @@ vk_gpu g_vk_gpu;
 
 static int adreno(const vk_gpu *g) { return g->vendor == VENDOR_QUALCOMM; }   // both drivers: Qualcomm's own and Mesa's Turnip
 static int mali(const vk_gpu *g) { return g->vendor == VENDOR_ARM; }         // ARM Mali / Immortalis (0x13B5)
+static int mali_or_xclipse(const vk_gpu *g) { return g->vendor == VENDOR_ARM || g->vendor == VENDOR_SAMSUNG; }   // ARM Mali (0x13B5) & Samsung Xclipse RDNA (0x144D)
 static int mali_legacy_a2c(const vk_gpu *g) {
     // Only disable A2C by default on legacy Mali drivers (< 40.0 or Vulkan < 1.3).
     // Modern Mali Valhall/5th-gen (Vulkan 1.3, driver >= 40.0, e.g. Mali-G720 r49p1) supports native 2x MSAA A2C,
@@ -28,14 +29,14 @@ static const struct {
     // written for NieR:Automata
     {VQ_GS_SPLIT, "gs_split", "DM_VK_QUIRK_GS_SPLIT", adreno,
      "geometry-shader draws split into vertex and fragment passes: written and checked on Adreno only"},
-    // integrated from nx2android-mali (gfx_vk_core.c vendorID == 0x13b5)
-    {VQ_NO_ZEROCOPY, "no_zerocopy", "DM_VK_QUIRK_NO_ZEROCOPY", mali,
-     "ARM Mali gralloc AHardwareBuffer zero-copy causes faults/aborts; use cached copied pools with range readback instead"},
-    // hybrid6: Mali Valhall DDK AFBC / 2x MSAA MRT GENERAL-layout resolve + split-submit + 2x MSAA A2C fixes
-    {VQ_NO_UBWC, "no_ubwc", "DM_VK_QUIRK_NO_UBWC", mali,
-     "Adreno UBWC VkImageFormatListCreateInfo opts Mali Valhall GENERAL-layout 2x MSAA MRTs into AFBC hazards; default DM_VK_UBWC=0 on Mali"},
-    {VQ_NO_CB_SPLIT, "no_cb_split", "DM_VK_QUIRK_NO_CB_SPLIT", mali,
-     "Adreno 128-draw mid-frame vkQueueSubmit splits are unnecessary on Mali and cause UBO/tile flicker on copied pools; default DM_VK_CB_DRAWS=0 on Mali"},
+    // integrated from nx2android-mali + hybrid32 Samsung Xclipse 940 (0x144d) RDNA3 MMU hang fix
+    {VQ_NO_ZEROCOPY, "no_zerocopy", "DM_VK_QUIRK_NO_ZEROCOPY", mali_or_xclipse,
+     "ARM Mali & Samsung Xclipse gralloc AHardwareBuffer zero-copy + MAP_FIXED defrag causes GPU MMU hangs/faults; use cached copied pools instead"},
+    // hybrid6 + hybrid32: Adreno-only UBWC VkImageFormatListCreateInfo must be off on Mali & Samsung Xclipse RDNA
+    {VQ_NO_UBWC, "no_ubwc", "DM_VK_QUIRK_NO_UBWC", mali_or_xclipse,
+     "Adreno UBWC VkImageFormatListCreateInfo opts Mali & Samsung Xclipse into non-Adreno compression/view hazards; default DM_VK_UBWC=0"},
+    {VQ_NO_CB_SPLIT, "no_cb_split", "DM_VK_QUIRK_NO_CB_SPLIT", mali_or_xclipse,
+     "Adreno 128-draw mid-frame vkQueueSubmit splits are unnecessary on Mali/Xclipse and cause UBO/tile stalls on copied pools; default DM_VK_CB_DRAWS=0"},
     {VQ_NO_A2C, "no_a2c", "DM_VK_QUIRK_NO_A2C", mali_legacy_a2c,
      "Legacy Mali (<40.0 / Vulkan <1.3) 2x MSAA alphaToCoverageEnable dither workaround; off by default on modern Mali Vulkan 1.3+ (driver >= 40.0)"},
 };

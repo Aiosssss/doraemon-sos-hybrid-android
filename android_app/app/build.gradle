@@ -12,7 +12,7 @@ android {
         applicationId 'org.nx2a.doraemon'
         minSdk 29
         targetSdk 35
-        versionCode 30
+        versionCode 37
         versionName '1.1.2'
 
         ndk {

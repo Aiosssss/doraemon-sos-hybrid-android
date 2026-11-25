@@ -54,6 +54,22 @@
             android:textStyle="bold" />
 
         <TextView
+            android:id="@+id/tab_btn_cheats"
+            android:layout_width="wrap_content"
+            android:layout_height="30dp"
+            android:layout_marginEnd="6dp"
+            android:background="@drawable/bg_preset_idle"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:text="@string/tab_cheats"
+            android:textColor="#5C3919"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
             android:id="@+id/tab_btn_advanced"
             android:layout_width="wrap_content"
             android:layout_height="30dp"
@@ -129,17 +145,36 @@
             android:id="@+id/btn_preset_low"
             android:layout_width="0dp"
             android:layout_height="30dp"
-            android:layout_marginStart="6dp"
-            android:layout_weight="1.1"
+            android:layout_marginStart="5dp"
+            android:layout_weight="1.05"
             android:background="@drawable/bg_preset_idle"
             android:clickable="true"
             android:focusable="true"
             android:ellipsize="end"
             android:gravity="center"
             android:maxLines="1"
-            android:paddingStart="6dp"
-            android:paddingEnd="6dp"
+            android:paddingStart="5dp"
+            android:paddingEnd="5dp"
             android:text="@string/preset_low"
+            android:textColor="#5C3919"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/btn_preset_turbo"
+            android:layout_width="0dp"
+            android:layout_height="30dp"
+            android:layout_marginStart="5dp"
+            android:layout_weight="1.05"
+            android:background="@drawable/bg_preset_idle"
+            android:clickable="true"
+            android:focusable="true"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:paddingStart="5dp"
+            android:paddingEnd="5dp"
+            android:text="@string/preset_turbo"
             android:textColor="#5C3919"
             android:textSize="11sp"
             android:textStyle="bold" />
@@ -248,6 +283,44 @@
 
                 <Spinner
                     android:id="@+id/sp_shadow_scale"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <!-- Shadow Update Rate (Auto / 60Hz / 30Hz / Off) -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:text="@string/lbl_shadow_rate"
+                    android:textColor="#4A2E14"
+                    android:textSize="11.5sp"
+                    android:textStyle="bold" />
+
+                <Spinner
+                    android:id="@+id/sp_shadow_rate"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <!-- Screen Aspect Ratio Mode (16:9 / Stretch / Zoom) -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:text="@string/lbl_screen_mode"
+                    android:textColor="#4A2E14"
+                    android:textSize="11.5sp"
+                    android:textStyle="bold" />
+
+                <Spinner
+                    android:id="@+id/sp_screen_mode"
                     android:layout_width="match_parent"
                     android:layout_height="32dp"
                     android:layout_marginTop="2dp"
@@ -446,6 +519,78 @@
                         android:layout_height="wrap_content" />
                 </LinearLayout>
 
+                <!-- Optional: Flexible Analog (Floating, Default OFF) -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/lbl_flex_analog"
+                            android:textColor="#4A2E14"
+                            android:textSize="11.5sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/sub_flex_analog"
+                            android:textColor="#8A6A4A"
+                            android:textSize="9sp" />
+                    </LinearLayout>
+
+                    <Switch
+                        android:id="@+id/sw_flex_analog"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <!-- Optional: Adaptive Button Level 2 (Pure SVG, Default OFF) -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/lbl_adaptive_btn"
+                            android:textColor="#4A2E14"
+                            android:textSize="11.5sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/sub_adaptive_btn"
+                            android:textColor="#8A6A4A"
+                            android:textSize="9sp" />
+                    </LinearLayout>
+
+                    <Switch
+                        android:id="@+id/sw_adaptive_btn"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -472,6 +617,25 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content" />
                 </LinearLayout>
+
+                <!-- Controller Layout (Nintendo vs Xbox) -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/lbl_pad_layout"
+                    android:textColor="#4A2E14"
+                    android:textSize="11.5sp"
+                    android:textStyle="bold" />
+
+                <Spinner
+                    android:id="@+id/sp_pad_layout"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
 
                 <!-- RomFS / Language Mod Strip -->
                 <View
@@ -531,7 +695,165 @@
         </ScrollView>
     </LinearLayout>
 
-    <!-- Tab 2: Advanced & Diagnostics (2-Column Landscape Layout) -->
+    <!-- Tab 2: Cheats (Optional, ALL Default OFF — Built-in v1.1.2 + Atmosphere .txt) -->
+    <LinearLayout
+        android:id="@+id/tab_settings_cheats"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="horizontal"
+        android:paddingStart="14dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="10dp"
+        android:visibility="gone">
+
+        <!-- Left Column: Master Switch + Built-in Verified v1.1.2 Cheats -->
+        <ScrollView
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginEnd="8dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card_inner"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/sec_cheats_builtin"
+                    android:textColor="#7A481D"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:background="#F7ECD8"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:padding="8dp">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/lbl_cheat_master"
+                            android:textColor="#4A2E14"
+                            android:textSize="12sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="@string/sub_cheat_master"
+                            android:textColor="#7D5E3F"
+                            android:textSize="9.5sp" />
+                    </LinearLayout>
+
+                    <Switch
+                        android:id="@+id/sw_cheat_master"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/box_builtin_cheats"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:orientation="vertical" />
+            </LinearLayout>
+        </ScrollView>
+
+        <!-- Right Column: Atmosphere .txt Cheat Importer & Imported Cheats List -->
+        <ScrollView
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card_inner"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/sec_cheats_atm"
+                    android:textColor="#7A481D"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/sub_cheats_atm"
+                    android:textColor="#7D5E3F"
+                    android:textSize="9.5sp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:id="@+id/btn_import_cheat"
+                        android:layout_width="0dp"
+                        android:layout_height="34dp"
+                        android:layout_weight="1.3"
+                        android:background="@drawable/bg_btn_leaf"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:gravity="center"
+                        android:text="@string/btn_import_cheat"
+                        android:textColor="#FFFDF5"
+                        android:textSize="11.5sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/btn_clear_cheats"
+                        android:layout_width="0dp"
+                        android:layout_height="34dp"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="0.9"
+                        android:background="@drawable/bg_btn_parchment"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:gravity="center"
+                        android:text="@string/btn_clear_cheats"
+                        android:textColor="#9B2C1F"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/box_imported_cheats"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="vertical" />
+            </LinearLayout>
+        </ScrollView>
+    </LinearLayout>
+
+    <!-- Tab 3: Advanced & Diagnostics (2-Column Landscape Layout) -->
     <LinearLayout
         android:id="@+id/tab_settings_advanced"
         android:layout_width="match_parent"
@@ -744,6 +1066,25 @@
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
+                        android:text="@string/lbl_deferred_wait"
+                        android:textColor="#4A2E14"
+                        android:textSize="11sp" />
+                    <Switch
+                        android:id="@+id/sw_deferred_wait"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="3dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
                         android:text="@string/lbl_strict_barriers"
                         android:textColor="#4A2E14"
                         android:textSize="11sp" />
@@ -807,6 +1148,43 @@
                     android:background="@drawable/bg_spinner_wood"
                     android:paddingStart="8dp"
                     android:paddingEnd="8dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:text="@string/lbl_samsung_safe"
+                    android:textColor="#4A2E14"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <Spinner
+                    android:id="@+id/sp_samsung_safe"
+                    android:layout_width="match_parent"
+                    android:layout_height="32dp"
+                    android:layout_marginTop="2dp"
+                    android:background="@drawable/bg_spinner_wood"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/lbl_native_surface_res"
+                        android:textColor="#4A2E14"
+                        android:textSize="11sp" />
+                    <Switch
+                        android:id="@+id/sw_native_surface_res"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
             </LinearLayout>
         </ScrollView>
     </LinearLayout>

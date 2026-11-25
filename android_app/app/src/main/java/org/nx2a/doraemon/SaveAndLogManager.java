@@ -63,13 +63,57 @@ public final class SaveAndLogManager {
         }
     }
 
+    public static final String JAVA_CRASH_LOG_FILE = "crash_java.log";
+    private static volatile boolean sCrashHandlerInstalled = false;
+
     /**
-     * Exports diagnostics header + launcher_extract.log + last_launch_error.txt + log.txt + log.prev.txt
+     * Installs a process-wide Java UncaughtExceptionHandler that persists full stack traces
+     * to game_data/crash_java.log before delegating to the system handler (zero silent Java FCs).
+     */
+    public static void installJavaCrashHandler(final Context ctx) {
+        if (sCrashHandlerInstalled || ctx == null) return;
+        sCrashHandlerInstalled = true;
+        final Context appCtx = ctx.getApplicationContext();
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            try {
+                File gameDir = CoreAssetSync.getGameDataDir(appCtx);
+                if (!gameDir.exists()) gameDir.mkdirs();
+                File out = new File(gameDir, JAVA_CRASH_LOG_FILE);
+                String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date());
+                StringBuilder sb = new StringBuilder();
+                sb.append("=== JAVA UNCAUGHT EXCEPTION ===\n");
+                sb.append("Time: ").append(ts).append("\n");
+                sb.append("APK: ").append(BuildConfig.APPLICATION_ID)
+                        .append(" v").append(BuildConfig.VERSION_NAME)
+                        .append(" (").append(BuildConfig.VERSION_CODE).append(")\n");
+                sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL)
+                        .append(" (Android ").append(Build.VERSION.RELEASE)
+                        .append(", API ").append(Build.VERSION.SDK_INT).append(")\n");
+                sb.append("Thread: ").append(thread != null ? thread.getName() : "unknown").append("\n");
+                java.io.StringWriter sw = new java.io.StringWriter();
+                throwable.printStackTrace(new java.io.PrintWriter(sw));
+                sb.append(sw.toString()).append("\n");
+                try (FileOutputStream fos = new FileOutputStream(out, false)) {
+                    fos.write(sb.toString().getBytes(StandardCharsets.UTF_8));
+                    fos.getFD().sync();
+                }
+            } catch (Throwable ignored) {
+            }
+            if (prev != null) {
+                prev.uncaughtException(thread, throwable);
+            }
+        });
+    }
+
+    /**
+     * Exports diagnostics header + launcher_extract.log + crash_java.log + last_launch_error.txt + log.txt + log.prev.txt
      * to a SAF destination URI. Always succeeds even before game_data/log.txt exists.
      */
     public static int exportRuntimeLogs(Context ctx, Uri destUri, String vulkanProbeJson) throws IOException {
         File gameDir = CoreAssetSync.getGameDataDir(ctx);
         File launcherLog = new File(ctx.getFilesDir(), LAUNCHER_LOG_FILE);
+        File javaCrashLog = new File(gameDir, JAVA_CRASH_LOG_FILE);
         File lastErr = new File(gameDir, "last_launch_error.txt");
         File curLog = new File(gameDir, "log.txt");
         File prevLog = new File(gameDir, "log.prev.txt");
@@ -94,6 +138,10 @@ public final class SaveAndLogManager {
 
             totalBytes += appendLogSection(out, "=== LAUNCHER & EXTRACT LOG (launcher_extract.log) ===", launcherLog,
                     "(no extraction/launcher events recorded yet)\n");
+            if (javaCrashLog.isFile() && javaCrashLog.length() > 0) {
+                totalBytes += appendLogSection(out, "\n=== JAVA CRASH LOG (game_data/crash_java.log) ===", javaCrashLog,
+                        "(none)\n");
+            }
             if (lastErr.isFile() && lastErr.length() > 0) {
                 totalBytes += appendLogSection(out, "\n=== LAST LAUNCH ERROR (game_data/last_launch_error.txt) ===", lastErr,
                         "(none)\n");

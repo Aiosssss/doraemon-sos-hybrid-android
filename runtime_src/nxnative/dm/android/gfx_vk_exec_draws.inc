@@ -439,6 +439,7 @@ static int prepare_draw(int prim, int indexed) {
         for (uint32_t i = 0; i < k.nbind; i++) VKLOG("  binding %u stride %u rate %u divisor %u", k.bind[i].binding, k.bind[i].stride, k.bind[i].rate, k.bind[i].divisor);
     }
     crumb_draw(k.key[0], k.key[1], k.key[2]);
+    vk_diag_note_draw(k.key[0], k.key[1], k.key[2]);
     VkPipeline p = graphics_pipeline(&k, layout);
     uint64_t t1 = tick(); g_vkst.ns_pipe += t1 - t0 - tdesc;
     if (!p) {

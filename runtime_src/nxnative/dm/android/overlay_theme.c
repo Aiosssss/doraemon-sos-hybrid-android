@@ -117,3 +117,12 @@ void dm_overlay_theme_done(const ov_theme *t) {
     for (int i = 0; i < 2; i++) if (t == &g_th[i]) { free(g_th[i].px); g_th[i].px = NULL; }
     pthread_mutex_unlock(&g_mu);
 }
+uint8_t *dm_overlay_adaptive_atlas(int *w, int *h) {
+    size_t n = 0;
+    uint8_t *pf = asset("overlay/adaptive.png", &n);
+    if (!pf) return NULL;
+    uint8_t *px = png_rgba(pf, n, w, h);
+    free(pf);
+    if (px) LOG("[overlay] Adaptive Button Level 2 SVG atlas loaded (%dx%d)", *w, *h);
+    return px;
+}

@@ -214,6 +214,7 @@ void vk_dump_3d_frame_present(void) {
     g_d3d_fdisp = 0; g_d3d_fdraws = 0;
 }
 static void d3d_log_dispatch(const vkshader_t *cs, uint32_t x, uint32_t y, uint32_t z, int ind) {
+    vk_diag_note_dispatch(cs ? cs->key : 0);
     g_d3d_fdisp++;
     if (g_d3d_state != 1) return;
     uint32_t sm = 0, im = 0;

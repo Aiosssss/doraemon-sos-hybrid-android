@@ -145,8 +145,8 @@ static void hint_threads_scan(int32_t self) {
     closedir(d);
     int32_t pick[8]; int npick = 0; pick[npick++] = self;
     if (secs > 0) {
-        long hz = sysconf(_SC_CLK_TCK); double need = 0.15 * secs * (double)(hz > 0 ? hz : 100);
-        for (int k = 0; k < 5; k++) {   // the busiest first
+        long hz = sysconf(_SC_CLK_TCK); double need = 0.10 * secs * (double)(hz > 0 ? hz : 100);
+        for (int k = 0; k < 6; k++) {   // the busiest main + worker threads first (up to 7 total with presenting thread)
             int best = -1; uint64_t bu = 0;
             for (int i = 0; i < nc; i++) {
                 if (cur[i].tid == self) continue;
@@ -286,21 +286,35 @@ static void hint_report(int64_t w, int64_t pq, int64_t pace, int64_t now, int64_
         AWorkDuration *d = g_wd;
         H.wd_start(d, now - w); H.wd_total(d, w); H.wd_cpu(d, w > pq ? w - pq : 0); H.wd_gpu(d, g_frame_gpu > 0 ? g_frame_gpu : 0); if (H.report2(g_hint, d)) H.report(g_hint, w);
     } else H.report(g_hint, w);
-    static int over; static int64_t last;
+    static int over, boosted; static int64_t last, boost_until;
     int64_t cpu_work = w > pace ? w - pace : 0;
-    int64_t worst = cpu_work > g_frame_gpu ? cpu_work : g_frame_gpu;
-    // Responsive yet thermal-friendly ADPF (v1.1.2-hybrid24): ignore loading/menu frames (GPU < 3 ms or CPU > 50 ms);
-    // at 60 FPS (<= 17 ms target) catch Mali DVFS clock-drops early (GPU > 92% = 15.3 ms for 4 frames, 2.5 s cooldown)
-    // so 60 FPS stays rock-steady without 20-22 ms GPU spikes while keeping thermals cool.
-    int is_load = (g_frame_gpu < 3000000ll) || (cpu_work > 50000000ll);
+    // Dual-trigger ADPF boost (v1.1.2-hybrid34):
+    //   Triggers on EITHER CPU-bound (frame_work > 80% target) OR GPU-bound (GPU > 75% target)!
+    int is_load = (g_frame_gpu < 2000000ll && cpu_work > 50000000ll) || (cpu_work > 80000000ll);
     int high_fps = (target > 0 && target <= 17000000ll);
-    int need_boost = !is_load && (high_fps
-        ? (g_frame_gpu > target * 92 / 100 || worst > target * 105 / 100)
-        : (worst > target * 110 / 100));
+    int cpu_over = target > 0 && (cpu_work > target * 80 / 100);
+    int gpu_over = target > 0 && (g_frame_gpu > target * 75 / 100);
+    int need_boost = !is_load && (cpu_over || gpu_over);
     over = need_boost ? over + 1 : 0;
-    if (H.increase && over >= 4 && now - last > 2500000000ll) {
-        last = now; int r = H.increase(g_hint, cpu_work > target * 94 / 100, g_frame_gpu > target * 90 / 100, high_fps ? "60fps sustained load" : "frame over its period");
-        static int n; if (n++ < 8) LOG("[perf] ADPF load increase signalled (work %.1f ms, GPU %.1f ms, target %.1f ms)%s", w / 1e6, g_frame_gpu / 1e6, target / 1e6, r ? " refused" : "");
+    if (over >= 3 && now - last > 1500000000ll) {
+        last = now;
+        if (H.increase) {
+            int r = H.increase(g_hint, cpu_over, gpu_over,
+                cpu_over && gpu_over ? "cpu+gpu load" : (cpu_over ? "cpu frame_work load" : (high_fps ? "60fps gpu load" : "gpu load")));
+            static int n; if (n++ < 16) LOG("[perf] ADPF load increase signalled (cpu=%d gpu=%d, work %.1f ms, GPU %.1f ms, target %.1f ms)%s",
+                cpu_over, gpu_over, cpu_work / 1e6, g_frame_gpu / 1e6, target / 1e6, r ? " refused" : "");
+        } else if (H.update && target > 8000000ll) {
+            int64_t tight = target * 84 / 100;
+            if (tight < 8000000ll) tight = 8000000ll;
+            H.update(g_hint, tight);
+            boosted = 1;
+            boost_until = now + 2000000000ll;
+            static int n2; if (n2++ < 12) LOG("[perf] ADPF target-pressure boost (cpu=%d gpu=%d, work %.1f ms, GPU %.1f ms, target %.1f -> %.1f ms)",
+                cpu_over, gpu_over, cpu_work / 1e6, g_frame_gpu / 1e6, target / 1e6, tight / 1e6);
+        }
+    } else if (boosted && now > boost_until && !need_boost && H.update && target > 0) {
+        H.update(g_hint, target);
+        boosted = 0;
     }
 }
 // The frames' time on screen (hle_nvn.c, 8 presents late; ms, -1 = discarded by the system, 0 = no reading): a frame shown longer than 1.5 periods of the step,
@@ -370,6 +384,8 @@ static int64_t g_prev_present, g_pace, g_pq;
 void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { g_work_start = perf_now(); g_pace = (int64_t)pace_ns; g_pq = (int64_t)pq_ns; }
 // Called on the presenting thread right before a present; period in seconds (1/60, 1/30, ...).
 void dm_perf_frame(double period) {
+    static int render_prio_done;
+    if (!render_prio_done) { render_prio_done = 1; setpriority(PRIO_PROCESS, 0, -4); }   // ANDROID_PRIORITY_DISPLAY (-4)
     game_mode_sync();   // reset the step before deciding which part of the previous wait was adaptive pacing
     int64_t p = period > 0 && period < 1 ? (int64_t)(period * 1e9) : 16666667, t = perf_now();
     // the CPU hint's target is the game's own period, not the adaptive one: with the longer target the CPU clocks drop until the work fills it,

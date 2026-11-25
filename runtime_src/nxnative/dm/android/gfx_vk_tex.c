@@ -460,10 +460,11 @@ int vk_disable_msaa(void) {
         if (e && *e && strcmp(e, "auto") != 0) {
             v = atoi(e) != 0;
         } else {
-            v = (vk_mali_low_end() || vk_low_ram_tier() >= 1) ? 1 : 0;
+            v = (vk_mali_low_end() || vk_low_ram_tier() >= 1 || vk_samsung_safe()) ? 1 : 0;
         }
         if (v) VKLOG("MSAA disabled (%s): multisample targets forced to 1x & resolve bypassed",
-                     (e && *e && strcmp(e, "auto") != 0) ? "DM_VK_DISABLE_MSAA=1" : "auto low-end Mali / Low-RAM");
+                     (e && *e && strcmp(e, "auto") != 0) ? "DM_VK_DISABLE_MSAA=1"
+                     : (vk_samsung_safe() ? "auto Samsung Xclipse safe path" : "auto low-end Mali / Low-RAM"));
     }
     return v;
 }
@@ -472,9 +473,10 @@ static uint8_t tex_downscale_shift(const tex_t *t, const vkfmt_t *f, uint32_t or
     int ds = vk_tex_downscale();
     if (ds <= 1) return 0;
     const nvn_texdesc *d = &t->d;
-    // Strict whitelist: only mipmapped (>=3 levels) >=256x256 3D world BC textures.
-    // Never downscale UI/HUD/fonts/sprites (<3 mips or <256x256), LUTs (1024x32), render targets, or storage images.
+    // Strict whitelist: only mipmapped (>=3 levels) >=256x256 3D world BC textures (aspect ratio < 4:1).
+    // Never downscale UI/HUD/fonts/sprites (<3 mips or <256x256), LUTs (1024x32), toon ramps, thin strips, render targets, or storage images.
     if (orig_levels < 3u || orig_w < 256u || orig_h < 256u) return 0;
+    if (orig_w >= orig_h * 4u || orig_h >= orig_w * 4u) return 0;
     if (d->target != NVN_TEXTURE_TARGET_2D && d->target != NVN_TEXTURE_TARGET_2D_ARRAY && d->target != NVN_TEXTURE_TARGET_CUBEMAP) return 0;
     if (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE)) return 0;
     uint8_t shift = (ds >= 4) ? 2u : 1u;
@@ -537,6 +539,7 @@ static vkimg_t *img_new_ex(const tex_t *t, const vkfmt_t *f, int allow_scale) {
                 uint32_t sw = ((uint32_t)(orig_w * ssc + 1.0f)) & ~1u;
                 if (sw < 256u) sw = 256u;
                 im->w = sw; im->h = sw;
+                im->is_shadow = 1;
                 static uint64_t ss_cnt;
                 if (++ss_cnt <= 8) VKLOG("[low-end] shadow target scaled %.2fx: %ux%u -> %ux%u fmt %#x (vk %d) flags=%#x",
                                          ssc, orig_w, orig_h, im->w, im->h, d->format, f->vk, d->flags);
@@ -970,7 +973,11 @@ static void alias_check(vkimg_t *im) {   // im is about to be sampled
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 900 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { if (im->bc_draw) { vkimg_t *d = im->bc_draw; vk_lrz_forget(d); vk_tex_view_drop_all(d); if (d->sub) vk_defer_free_image_sub(d->img, d->sub); else vk_defer_free_image(d->img, d->mem); free(d); }
+static int tex_is_registered_in_pool(uint64_t pool, int64_t off);
+static void img_drop(vkimg_t *im) {
+    extern uint64_t g_tex_gen;
+    __atomic_add_fetch(&g_tex_gen, 1, __ATOMIC_RELEASE);   // Always invalidate cached descriptor sets & view caches on ANY image drop/eviction!
+    if (im->bc_draw) { vkimg_t *d = im->bc_draw; vk_lrz_forget(d); vk_tex_view_drop_all(d); if (d->sub) vk_defer_free_image_sub(d->img, d->sub); else vk_defer_free_image(d->img, d->mem); free(d); }
     if (im->fb_copy) { vkimg_t *fb = im->fb_copy; vk_lrz_forget(fb); vk_tex_view_drop_all(fb); if (fb->sub) vk_defer_free_image_sub(fb->img, fb->sub); else vk_defer_free_image(fb->img, fb->mem); free(fb); }
     vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem && !vk_pool_is_copied(im->pkg_mem, im->pkg_len)) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; uint64_t vb = im->vram_bytes ? im->vram_bytes : (im->size > 0 ? (uint64_t)im->size : 0); g_img_bytes = g_img_bytes >= vb ? g_img_bytes - vb : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
@@ -1086,10 +1093,11 @@ void vk_tex_sweep(void) {
     int low_ram = vk_low_ram_tier();
     uint64_t done_f = vk_fence_done();
     if (low_ram >= 1) {
-        // Aggressive anti-LMK texture eviction on 3-4 GB RAM devices: keep live VRAM compact (96 MB / 64 MB)
-        // and release stale area textures after 5-10 s of disuse once GPU fence completes.
-        uint64_t budget = (low_ram >= 2) ? (64ull << 20) : (96ull << 20);
-        uint64_t max_age = (low_ram >= 2) ? 240ull : 300ull;
+        // Safe Anti-LMK texture eviction on 3-4 GB RAM devices:
+        // NEVER evict textures still registered in NVN TexturePool (g_treg) — cached descriptor sets reuse them
+        // without updating pkg_used! Only evict unregistered/stale packaged textures idle >= max_age & >= 180 frames.
+        uint64_t budget = (low_ram >= 2) ? (64ull << 20) : (128ull << 20);
+        uint64_t max_age = (low_ram >= 2) ? 300ull : 480ull;
         if (g_img_bytes > budget) {
             akey ev[64]; int nev = 0;
             for (uint32_t i = 0; i < g_by_key.cap && nev < 64; i++) {
@@ -1097,34 +1105,36 @@ void vk_tex_sweep(void) {
                 if (!im || !im->packaged || im->gpu_w || im->rt_last) continue;
                 if (im->orig_w == 1024u && im->orig_h == 32u) continue;
                 if (im->last_use > done_f) continue;   // never evict textures still referenced by in-flight GPU work
-                if (g_tex_frame > im->pkg_used && g_tex_frame - im->pkg_used >= max_age) {
-                    memcpy(&ev[nev++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof ev[0]);
-                }
+                if (g_tex_frame <= im->used || g_tex_frame - im->used < 180ull) continue;
+                if (g_tex_frame <= im->pkg_used || g_tex_frame - im->pkg_used < max_age) continue;
+                if (tex_is_registered_in_pool(im->pool, im->off)) continue;   // actively bound in TexturePool (may be reused by cached VkDescriptorSets!)
+                memcpy(&ev[nev++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof ev[0]);
             }
             for (int i = 0; i < nev; i++) {
                 vkimg_t *im = nvn_hm_del(&g_by_key, &ev[i]);
                 if (im) { img_drop(im); g_img_evicted++; }
             }
-            if (nev) VKLOG("[low-ram] evicted %d stale packaged textures (live %.0f MB, tier %d)", nev, g_img_bytes / 1048576.0, low_ram);
+            if (nev) VKLOG("[low-ram] evicted %d stale unregistered packaged textures (live %.0f MB, tier %d)", nev, g_img_bytes / 1048576.0, low_ram);
         }
     } else if (g_img_bytes > (600ull << 20)) {
-        // Tier 0 (>=6 GB RAM): never run aggressive 128 MB low-RAM eviction (even on Mali-G52/G57);
-        // only trim truly stale packaged textures (>60 s unused and GPU-idle) if live VRAM exceeds 600 MB.
+        // Tier 0 (>=6 GB RAM): never run aggressive low-RAM eviction;
+        // only trim truly stale unregistered packaged textures (>60 s unused and GPU-idle) if live VRAM exceeds 600 MB.
         akey ev[32]; int nev = 0;
         for (uint32_t i = 0; i < g_by_key.cap && nev < 32; i++) {
             vkimg_t *im = g_by_key.vals[i];
             if (!im || !im->packaged || im->gpu_w || im->rt_last) continue;
             if (im->orig_w == 1024u && im->orig_h == 32u) continue;
             if (im->last_use > done_f) continue;
-            if (g_tex_frame > im->pkg_used && g_tex_frame - im->pkg_used >= 3600ull) {
-                memcpy(&ev[nev++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof ev[0]);
-            }
+            if (g_tex_frame <= im->used || g_tex_frame - im->used < 180ull) continue;
+            if (g_tex_frame <= im->pkg_used || g_tex_frame - im->pkg_used < 3600ull) continue;
+            if (tex_is_registered_in_pool(im->pool, im->off)) continue;
+            memcpy(&ev[nev++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof ev[0]);
         }
         for (int i = 0; i < nev; i++) {
             vkimg_t *im = nvn_hm_del(&g_by_key, &ev[i]);
             if (im) { img_drop(im); g_img_evicted++; }
         }
-        if (nev) VKLOG("[vram-guard] trimmed %d stale packaged textures (live %.0f MB, tier 0)", nev, g_img_bytes / 1048576.0);
+        if (nev) VKLOG("[vram-guard] trimmed %d stale unregistered packaged textures (live %.0f MB, tier 0)", nev, g_img_bytes / 1048576.0);
     }
     pthread_mutex_unlock(&g_img_mu);
     free(v);
@@ -1270,8 +1280,8 @@ static pthread_mutex_t g_view_mu = PTHREAD_MUTEX_INITIALIZER;
 extern uint64_t g_tex_gen;
 static void vk_tex_view_drop_all(vkimg_t *im) {
     pthread_mutex_lock(&g_view_mu);
-    vview *v = nvn_hm_get(&g_views, &im); g_tex_gen++;
-    while (v) { vview *n = v->next; vk_defer_free_view(v->v); free(v); v = n; }
+    vview *v = nvn_hm_get(&g_views, &im); __atomic_add_fetch(&g_tex_gen, 1, __ATOMIC_RELEASE);
+    while (v) { vview *n = v->next; if (V.use_classic_fb) vk_classic_fb_drop_view(v->v); vk_defer_free_view(v->v); free(v); v = n; }
     nvn_hm_del(&g_views, &im);
     pthread_mutex_unlock(&g_view_mu);
 }
@@ -1494,6 +1504,19 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     }
     r->cur.ok = t != NULL; if (t) r->cur.t = *t; r->cur.has_v = v != NULL; if (v) r->cur.v = *v; r->cur.seq = seq;
     pthread_mutex_unlock(&g_rmu);
+}
+static int tex_is_registered_in_pool(uint64_t pool, int64_t off) {
+    if (!pool) return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_rmu);
+    for (int i = 0; i < g_ntreg; i++) {
+        if (g_treg[i].cur.ok && (uint64_t)(uintptr_t)g_treg[i].cur.t.pool == pool && g_treg[i].cur.t.off == off) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_rmu);
+    return found;
 }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 static __thread treg_ver t_treg;   // the version a lookup found, copied (the table may be rewritten or grow meanwhile)

@@ -17,6 +17,7 @@ DM_AUDREN_CATCHUP_FRAMES	int		profile	start	hle_audren.c	catch-up frames (a fram
 DM_AUDREN_DUMP	str		debug	start	hle_audren.c	writes every block the renderer hands to the output, in play order (stereo int16, 48 kHz), to this file; logs the blocks that rendered nothing and those from the catch-up queue (`audren dump:`); devtools/pcm_glitches.py finds clicks, gaps and clipping in it
 DM_AUDREN_TRACE	str		debug	live	hle_audren.c	logs the first 200 renderer updates with the frames rendered since the previous one, and the next 300 catch-up frames (`audren: catch-up at update …`): the calling thread, the time since the previous update and the frames queued ahead. Animal Crossing: New Horizons: 14-25 catch-ups a second with or 
 DM_BOOTPROF	str		debug	?	nvn_mtl.m main.c	
+DM_CHEATS	bool	0	app	live	cheat_engine.c	optional Atmosphere cheat engine + built-in v1.1.2 cheats master switch (0 = off by default)
 DM_CRASH_TOMBSTONE	str		debug	?	crash.c	
 DM_CTL	str		app	?	hle_hid.c	the control file of a development build (ctl.txt: key presses, env lines, shots); release builds ignore it
 DM_DBG	str		debug	?	main.c	
@@ -235,7 +236,9 @@ DM_TEST_UP_LOST	int		debug,ios	?	nvn_mtl.m
 DM_THR	str		debug	?	main.c	
 DM_THRCPU	str		debug,ios	?	memstat.m	
 DM_TIME_OFFSET	str		debug	start	hle_time.c	the user clocks run that many seconds from the device's time (a test jumps to the next day or hour without changing the device's clock); the steady clock is unchanged
+DM_TOUCH_ADAPTIVE_BTN	bool	0	app	live	front_android.c	optional Adaptive Button Level 2 (pure SVG vector mobile-native buttons, 0 = off by default)
 DM_TOUCH_DOCKED	str		profile	start	hle_touch.c	touch in docked mode: "screen" = the screen's points, "pixels" = the game's pixels; unset = no touch when docked
+DM_TOUCH_FLEXIBLE_ANALOG	bool	0	app	live	front_android.c	optional floating/flexible left analog stick capture zone (0 = off by default)
 DM_TOUCH_HAPTICS	int		debug,ios	?	DmGamepad.m	
 DM_TOUCH_LOG	str		debug	?	hle_touch.c	DM_TOUCH_LOG=1 also logs each gesture entry (up to 500 lines)
 DM_UDC_SELFTEST	str		debug,ios	?	nvn_mtl.m	
@@ -250,6 +253,7 @@ DM_VK_COMPUTE_WARM_MAX	int		debug	?	gfx_vk_exec.c
 DM_VK_CPU_READY	bool		debug	?	gfx_vk_exec.c	
 DM_VK_CRUMBS	bool		debug	start	gfx_vk_exec.c	for a device lost (GPU hang): each pass end and dispatch writes its number into host-visible memory after a full barrier; when the device is lost the log names the last work the GPU finished and the passes after it, with their shaders. Slows the GPU
 DM_VK_DBG_DRAW	int		debug	live	gfx_vk_exec.c	bisection aids: skip command kinds; 1 no draw calls, 2 no vertex buffers, 4 no descriptor sets
+DM_VK_DEFERRED_WAIT	bool	1	app	start	gfx_vk_core.c	1 = safe CPU+GPU pipelining via per-slot s->up staging in pool_safe_sync=2 (default 1 on modern GPUs; auto 0 on legacy Mali driver <= 32.1.0)
 DM_VK_DRIVER	str		porter	start	gfx_vk_core.c	the Vulkan driver library in the APK (porter --vulkan-driver, e.g. Turnip)
 DM_VK_DUMP_3D_FRAME	bool	0	debug	start	gfx_vk_core.c gfx_vk_exec.c gfx_vk_present.c	1 = once in 3D gameplay (dispatches > 50 and draws > 80), dump exactly 1 frame of compute dispatches, render passes (targets/formats/samples/load+store/folded-clear), and fullscreen/post-process or instanced draws with bound texture formats+swizzles
 DM_VK_DYN_UBO	bool		debug	start	gfx_vk_shader.c	no dynamic uniform-buffer offsets (descriptor reuse drops)
@@ -260,8 +264,12 @@ DM_VK_FRONT	int		debug	start	gfx_vk_exec.c	2`
 DM_VK_GS_SPLIT	bool	0	profile	live	gfx_vk_exec.c	1 = split geometry-shader draws (gfx_vk_gs_split.c)
 DM_VK_IMG_BLOCKS	bool		debug	start	gfx_vk_core.c	small images take a slot of a shared memory block (default); 0: every image gets memory of its own (A/B)
 DM_VK_INLINE_RESOLVE	bool	1	profile	start	gfx_vk_core.c gfx_vk_exec.c	1 = fuse CommandBufferDownsample immediately following a 1-target MSAA render pass into TBDR inline pResolveAttachments + STORE_OP_DONT_CARE (default 1)
-DM_VK_LOW_COST_PP	str	auto	profile	start	gfx_vk_core.c gfx_vk_exec.c	auto (1 on low-end/ultra-low GPU Tier 2-3) | 1 | 0: clear & skip tiny <=160x90 HDR bloom mip passes to save TBDR fillrate
-DM_VK_SHADOW_SCALE	str	auto	profile	start	gfx_vk_core.c gfx_vk_tex.c	auto (0.5 on Tier 2-3 low-end, 0.75 on Tier 1 mid, 1.0 on Flagship) | 0.5 | 0.75 | 1.0: downscale >=1024x1024 depth shadow maps
+DM_VK_LOW_COST_PP	str	auto	profile	start	gfx_vk_core.c gfx_vk_exec.c	auto (1 on low-end/ultra-low GPU Tier 2-3) | 1 | 0: clear & skip verified <=320x180 bloom/blur/DoF mip passes to save TBDR fillrate
+DM_VK_SAMSUNG_SAFE	str	auto	app	start	gfx_vk_core.c gfx_vk_tex.c	auto (1 on Samsung Xclipse 0x144d) | 1 | 0: force Mali-safe render path (disable MSAA, depth_clip_control, robustness2 nullDescriptor, dynamicRendering)
+DM_VK_SHADOW_RATE	str	auto	app	start	gfx_vk_core.c gfx_vk_exec.c	auto (2 on Tier 2-3 low-end, 1 on Tier 0-1) | 1 (60Hz full) | 2 (30Hz half-rate) | 0 (off / Turbo FPS)
+DM_VK_SHADOW_SCALE	str	auto	profile	start	gfx_vk_core.c gfx_vk_tex.c	auto (0.5 on Tier 1-3, 1.0 on Flagship) | 0.5 | 0.75 | 1.0: downscale >=1024x1024 depth shadow maps
+DM_SCREEN_MODE	int	0	app	live	front_android.c gfx_vk_present.c	display aspect mode: 0 = Normal 16:9, 1 = Full Screen (Stretch), 2 = Full Screen (Zoom/Crop)
+DM_SURFACE_MAX_SHORT	int	0	app	start	GameActivity.java	max short edge resolution for Android SurfaceHolder.setFixedSize (0 = native, 1080 = WQHD+ cap, 720 = low-end/Turbo cap)
 DM_VK_LIN_BACK	bool		debug	live	gfx_vk_exec.c	what the GPU draws into a linear render target (NVN `LINEAR_RENDER_TARGET`) stays in the Vulkan image, as before (default: copied back to the texture's pool memory after the pass, so the CPU can read it; Super Mario Odyssey's ground fog reads its wave surface this way)
 DM_VK_LIST_AT	str		debug	live	gfx_vk_exec.c	DM_VK_LIST_AT=<present>[#n]: the pass list of every submission over n (2) presents from there; now[#n] starts at the current present (once a run)
 DM_VK_LOG	str		debug,ios	?	hle_vk.m	

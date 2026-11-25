@@ -163,11 +163,15 @@ Java_org_nx2a_doraemon_NativeBridge_nativeProbeVulkan(JNIEnv *env, jclass clazz)
         VkFormatProperties fp_bc7; memset(&fp_bc7, 0, sizeof fp_bc7);
         if (p_fmt) p_fmt(pd, VK_FORMAT_BC7_UNORM_BLOCK, &fp_bc7);
         int bc7_sampled = (feats.textureCompressionBC && (fp_bc7.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) ? 1 : 0;
+        int bc_hw = (feats.textureCompressionBC && bc7_sampled) ? 1 : 0;
         const char *vendor_tag =
-            props.vendorID == 0x13B5 ? "ARM Mali (Unified M1-M4 Path: VQ_NO_ZEROCOPY + BC Cache)" :
-            props.vendorID == 0x5143 ? "Qualcomm Adreno (Native BCn + ZeroCopy Path)" :
-            props.vendorID == 0x144D ? "Samsung Xclipse" :
-            props.vendorID == 0x1010 ? "Imagination PowerVR" : "Other GPU";
+            props.vendorID == 0x13B5 ? "ARM Mali (Unified M1-M4 Path: VQ_NO_ZEROCOPY + CPU BC Decode + Cache)" :
+            props.vendorID == 0x5143 ? (bc_hw ? "Qualcomm Adreno (Native BCn + ZeroCopy Path)"
+                                              : "Qualcomm Adreno (CPU BC Decode + Cache)") :
+            props.vendorID == 0x144D ? (bc_hw ? "Samsung Xclipse (Safe Path + Native BCn)"
+                                              : "Samsung Xclipse (Safe Path + CPU BC Decode + Cache)") :
+            props.vendorID == 0x1010 ? "Imagination PowerVR (CPU BC Decode + Cache)" :
+            (bc_hw ? "Other GPU (Native BCn)" : "Other GPU (CPU BC Decode + Cache)");
         /* Escape quotes in deviceName just in case */
         char safe_name[256];
         size_t j = 0;

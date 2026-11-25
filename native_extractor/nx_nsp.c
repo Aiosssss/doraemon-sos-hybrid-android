@@ -99,12 +99,33 @@ static int open_hfs0_at(int fd, uint64_t base_off, nx_nsp *nsp, char *err, size_
     return 0;
 }
 
+#include <sys/stat.h>
+
+static const char *detect_magic_hint(const uint8_t hdr[4], size_t got) {
+    if (got < 4) return "file terlalu kecil / kosong";
+    if (hdr[0] == 'P' && hdr[1] == 'K' && (hdr[2] == 0x03 || hdr[2] == 0x05 || hdr[2] == 0x07)) return "arsip ZIP — ekstrak dulu ke .nsp/.xci";
+    if (hdr[0] == 'R' && hdr[1] == 'a' && hdr[2] == 'r' && hdr[3] == '!') return "arsip RAR — ekstrak dulu ke .nsp/.xci";
+    if (hdr[0] == 0x37 && hdr[1] == 0x7A && hdr[2] == 0xBC && hdr[3] == 0xAF) return "arsip 7Z — ekstrak dulu ke .nsp/.xci";
+    if ((hdr[0] == '<' && (hdr[1] == '!' || hdr[1] == 'h' || hdr[1] == 'H')) ||
+        (hdr[0] == 0xEF && hdr[1] == 0xBB && hdr[2] == 0xBF)) return "halaman HTML / teks (unduhan gagal / bukan ROM)";
+    if (hdr[0] == 0x1F && hdr[1] == 0x8B) return "arsip GZIP — ekstrak dulu ke .nsp/.xci";
+    if (hdr[0] == 0 && hdr[1] == 0 && hdr[2] == 0 && hdr[3] == 0) return "header berisi nol (korup / terpotong)";
+    return "format tidak dikenali (bukan PFS0/XCI)";
+}
+
 int nx_nsp_open(int fd, nx_nsp *nsp, char *err, size_t errcap) {
     memset(nsp, 0, sizeof *nsp);
     if (fd < 0) { snprintf(err, errcap, "invalid NSP/XCI file descriptor"); return -1; }
+    struct stat fst;
+    int64_t fsz = (fstat(fd, &fst) == 0) ? (int64_t)fst.st_size : -1;
     uint8_t hdr[16];
+    memset(hdr, 0, sizeof hdr);
     if (pread_all(fd, hdr, 16, 0) != 0) {
-        snprintf(err, errcap, "cannot read NSP/XCI header");
+        if (fsz == 0) {
+            snprintf(err, errcap, "invalid NSP/XCI header: file kosong (0 bytes) — pilih file .nsp/.xci yang utuh");
+        } else {
+            snprintf(err, errcap, "cannot read NSP/XCI header (size=%lld bytes)", (long long)fsz);
+        }
         return -2;
     }
     /* Check for XCI cartridge image ("HEAD" at +0x100 -> Root HFS0 -> "secure" HFS0) */
@@ -145,7 +166,9 @@ int nx_nsp_open(int fd, nx_nsp *nsp, char *err, size_t errcap) {
             *nsp = root_hfs;
             return 0;
         }
-        snprintf(err, errcap, "invalid NSP/XCI header (expected PFS0 or XCI HEAD)");
+        snprintf(err, errcap,
+                 "invalid NSP/XCI header (expected PFS0 or XCI HEAD; size=%lld bytes, magic=%02X %02X %02X %02X: %s)",
+                 (long long)fsz, hdr[0], hdr[1], hdr[2], hdr[3], detect_magic_hint(hdr, 4));
         return -2;
     }
     uint32_t nfiles = rd32(hdr + 4);

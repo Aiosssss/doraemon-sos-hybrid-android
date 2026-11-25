@@ -31,8 +31,8 @@ static pthread_mutex_t g_pcache_io=PTHREAD_MUTEX_INITIALIZER;
 // its own (vk_pipeline_cache_changed, which each pipeline built calls), so a force-kill soon after a scene's first load keeps them. The rule is droidplay-core c3c723280's.
 // Each save rewrites the whole file (vkGetPipelineCacheData, SHA-256, write and fsync), so the gap grows with the cache: 15 s for each whole PCACHE_GAP_MB of the
 // last loaded or saved cache, at least once and at most PCACHE_GAP_STEPS times (120 s), so the burst saves write about 2 MB/s at most. Caches seen on an Odin 3: 12 to 138 MB
-enum { PCACHE_BURST=10, PCACHE_GAP_MB=16, PCACHE_GAP_STEPS=8 };
-static int64_t g_pcache_gap_ns=10000000000ll;   // 10 s step (saves >=10 new pipelines promptly in background)
+enum { PCACHE_BURST=30, PCACHE_GAP_MB=16, PCACHE_GAP_STEPS=8 };
+static int64_t g_pcache_gap_ns=10000000000ll;   // 10 s step (saves every +30 new pipelines in background)
 static _Atomic size_t g_pcache_size;           // the cache's size at the last load or save
 static int64_t pcache_gap(void) {
     int64_t steps=(int64_t)((atomic_load_explicit(&g_pcache_size,memory_order_relaxed)>>20)/PCACHE_GAP_MB);
